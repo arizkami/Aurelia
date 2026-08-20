@@ -1,0 +1,24 @@
+[package]
+name = "sphere-text"
+description = "Font loading, shaping and MTSDF glyph rendering for SphereGraphicEngine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+sphere-core.workspace = true
+ttf-parser.workspace = true
+rustybuzz.workspace = true
+fontdb.workspace = true
+unicode-bidi.workspace = true
+unicode-script.workspace = true
+unicode-linebreak.workspace = true
+unicode-segmentation.workspace = true
+smallvec.workspace = true
+rustc-hash.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytemuck.workspace = true

@@ -1,0 +1,3 @@
+# Sphere keeps hot-path types small; warn when a type is copied around by value needlessly.
+too-many-arguments-threshold = 10
+type-complexity-threshold = 400

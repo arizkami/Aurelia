@@ -1,0 +1,19 @@
+[package]
+name = "sphere-render"
+description = "Scene, display list, canvas and batching for SphereGraphicEngine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+sphere-core.workspace = true
+bitflags.workspace = true
+bytemuck.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rustc-hash.workspace = true
+lyon.workspace = true

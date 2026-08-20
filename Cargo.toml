@@ -1,0 +1,82 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sphere-core",
+    "crates/sphere-render",
+    "crates/sphere-wgpu",
+    "crates/sphere-text",
+    "crates/sphere-layout",
+    "crates/sphere-svg",
+    "crates/sphere-image",
+    "crates/sphere-platform",
+    "crates/sphere-ui",
+    "crates/sphere-audio-ui",
+    "crates/sphere",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/arizkami/sphere_graphicengine"
+authors = ["SphereGraphicEngine contributors"]
+
+[workspace.dependencies]
+# --- internal ---
+sphere-core     = { path = "crates/sphere-core",     version = "0.1.0" }
+sphere-render   = { path = "crates/sphere-render",   version = "0.1.0" }
+sphere-wgpu     = { path = "crates/sphere-wgpu",     version = "0.1.0" }
+sphere-text     = { path = "crates/sphere-text",     version = "0.1.0" }
+sphere-layout   = { path = "crates/sphere-layout",   version = "0.1.0" }
+sphere-svg      = { path = "crates/sphere-svg",      version = "0.1.0" }
+sphere-image    = { path = "crates/sphere-image",    version = "0.1.0" }
+sphere-platform = { path = "crates/sphere-platform", version = "0.1.0" }
+sphere-ui       = { path = "crates/sphere-ui",       version = "0.1.0" }
+sphere-audio-ui = { path = "crates/sphere-audio-ui", version = "0.1.0" }
+
+# --- foundation ---
+bitflags   = "2.13"
+bytemuck   = { version = "1.25", features = ["derive"] }
+thiserror  = "2.0"
+tracing    = "0.1"
+smallvec   = "1.15"
+slotmap    = "1.0"
+rustc-hash = "2.1"
+parking_lot = "0.12"
+crossbeam-utils = "0.8"
+
+# --- gpu / platform ---
+wgpu = { version = "30.0", default-features = false, features = ["wgsl", "dx12", "vulkan", "metal", "webgpu"] }
+raw-window-handle = "0.6"
+winit = "0.30.13"
+pollster = "1.0"
+
+# --- geometry / text / assets ---
+lyon        = "1.0"
+taffy       = { version = "0.13", default-features = false, features = ["std", "flexbox", "grid", "block_layout", "content_size"] }
+ttf-parser  = "0.25"
+rustybuzz   = "0.20"
+fontdb      = "0.24"
+swash       = "0.2"
+unicode-bidi        = "0.3"
+unicode-script      = "0.5"
+unicode-linebreak   = "0.1"
+unicode-segmentation = "1.12"
+image  = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+usvg   = { version = "0.48", default-features = false }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1

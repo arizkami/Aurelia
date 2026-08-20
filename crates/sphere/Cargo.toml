@@ -1,0 +1,23 @@
+[package]
+name = "sphere"
+description = "SphereGraphicEngine: a GPU-first graphics and UI engine in pure Rust."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+sphere-core.workspace = true
+sphere-render.workspace = true
+sphere-wgpu.workspace = true
+sphere-text.workspace = true
+sphere-layout.workspace = true
+sphere-svg.workspace = true
+sphere-image.workspace = true
+sphere-platform.workspace = true
+sphere-ui.workspace = true
+sphere-audio-ui.workspace = true
+tracing.workspace = true
+pollster.workspace = true
