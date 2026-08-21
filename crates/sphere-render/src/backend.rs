@@ -65,6 +65,17 @@ pub struct SurfaceConfig {
     pub vsync: VsyncMode,
     /// Whether the surface should composite with what is behind the window.
     pub transparent: bool,
+    /// Multisample count for path geometry.
+    ///
+    /// Rectangles, rounded rectangles and glyphs are antialiased analytically in
+    /// their shaders and gain nothing here. Tessellated paths — icons, curves,
+    /// waveform outlines — have hard triangle edges and nothing else smooths
+    /// them, so this is what keeps them from looking jagged.
+    ///
+    /// `1` disables it. `4` is the default and the only count every backend is
+    /// required to support; anything unsupported falls back to the highest that
+    /// is.
+    pub msaa_samples: u32,
 }
 
 impl Default for SurfaceConfig {
@@ -75,9 +86,13 @@ impl Default for SurfaceConfig {
             present: PresentPreference::default(),
             vsync: VsyncMode::default(),
             transparent: false,
+            msaa_samples: DEFAULT_MSAA_SAMPLES,
         }
     }
 }
+
+/// The default multisample count. See [`SurfaceConfig::msaa_samples`].
+pub const DEFAULT_MSAA_SAMPLES: u32 = 4;
 
 /// Timing and workload figures for one submitted frame.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -137,6 +152,8 @@ pub struct BackendCapabilities {
     pub compute: bool,
     /// Maximum number of instances in a single draw call.
     pub max_instances_per_draw: u32,
+    /// The highest multisample count the surface format actually supports.
+    pub max_msaa_samples: u32,
 }
 
 impl Default for BackendCapabilities {
@@ -147,6 +164,7 @@ impl Default for BackendCapabilities {
             offscreen_targets: true,
             compute: false,
             max_instances_per_draw: u32::MAX,
+            max_msaa_samples: 1,
         }
     }
 }

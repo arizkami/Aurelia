@@ -31,6 +31,8 @@ pub struct Label {
     raster: TextRasterMode,
     /// Synthetic outline, for text over a busy backdrop such as a waveform.
     outline: Option<(Px, Color)>,
+    /// Perceptual coverage exponent; see [`sphere_render::GlyphRun::coverage_gamma`].
+    coverage_gamma: f32,
 }
 
 /// Creates a [`Label`].
@@ -44,6 +46,7 @@ pub fn label(text: impl Into<String>) -> Label {
         color: None,
         raster: TextRasterMode::Auto,
         outline: None,
+        coverage_gamma: sphere_render::DEFAULT_COVERAGE_GAMMA,
     }
 }
 
@@ -131,6 +134,17 @@ impl Label {
         self
     }
 
+    /// Overrides the perceptual coverage exponent.
+    ///
+    /// Above `1.0` thins the strokes, which is what light text on a dark
+    /// surface wants; below `1.0` fattens them, which suits dark text on a
+    /// light one. `1.0` leaves coverage physically linear. See
+    /// [`sphere_render::GlyphRun::coverage_gamma`].
+    pub fn coverage_gamma(mut self, gamma: f32) -> Self {
+        self.coverage_gamma = gamma;
+        self
+    }
+
     /// Replaces the whole text style.
     pub fn text_style(mut self, style: TextStyle) -> Self {
         self.text_style = style;
@@ -162,7 +176,12 @@ impl Element for Label {
         self.style.clone()
     }
 
-    fn measure(&mut self, request: &MeasureRequest<'_>, text: &mut TextSystem) -> Option<Size<Px>> {
+    fn measure(
+        &mut self,
+        request: &MeasureRequest<'_>,
+        text: &mut TextSystem,
+        _theme: &crate::theme::Theme,
+    ) -> Option<Size<Px>> {
         if self.text.is_empty() {
             return Some(Size::ZERO);
         }
@@ -189,6 +208,7 @@ impl Element for Label {
         let layout = cx.text.layout(&self.text, &self.text_style, Some(cx.bounds.width()));
         let origin = cx.bounds.origin;
         let (outline_width, outline_color) = self.outline.unwrap_or((Px::ZERO, Color::TRANSPARENT));
+        let coverage_gamma = self.coverage_gamma;
 
         for line in &layout.lines {
             for run in &line.runs {
@@ -218,6 +238,7 @@ impl Element for Label {
                         raster: self.raster,
                         outline_width,
                         outline_color,
+                        coverage_gamma,
                     },
                     Brush::Solid(color),
                 );

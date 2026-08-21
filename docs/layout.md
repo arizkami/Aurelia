@@ -134,6 +134,19 @@ the shaping cache, so the second call for the same string is a lookup rather tha
 The callback fires for *every* leaf, not only text, because the layout crate cannot know which
 leaves have content. A plain box returns `None`.
 
+### A widget that paints its own text has to measure it too
+
+`Element::measure` is also handed the theme, which looks redundant until you notice what a widget
+like `Button` actually does: it paints its label as a *leaf*, inside its own `paint`, rather than
+adding it as a child element. Nothing else in the tree knows that label exists, so nothing else can
+report its size — and a button that returns `None` here has no intrinsic width at all. In an
+auto-width slot it collapses to its own padding and its label spills over whatever is beside it.
+
+The theme is what makes the answer correct rather than merely nonzero. `Button` measures and paints
+through one `label_style(theme)` function precisely so the two cannot drift: measuring at 14 px and
+painting at the theme's 13 px reserves a box the text does not fit, and centring it in that box puts
+it in the wrong place. Any widget that draws text without a child element owes the same pair.
+
 ## Geometry
 
 ```rust

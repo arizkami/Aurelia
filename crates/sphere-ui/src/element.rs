@@ -203,10 +203,17 @@ pub trait Element: 'static {
     /// determined entirely by its style and children. The layout engine calls
     /// this for every childless node, so a plain box must return `None` rather
     /// than doing work.
+    ///
+    /// The theme is passed because a widget that paints its own text — a button
+    /// draws its label as a leaf rather than laying it out as a child — has to
+    /// measure with exactly the tokens it will paint with. Measuring at one size
+    /// and painting at another puts the text outside the box that was reserved
+    /// for it.
     fn measure(
         &mut self,
         _request: &MeasureRequest<'_>,
         _text: &mut sphere_text::TextSystem,
+        _theme: &crate::theme::Theme,
     ) -> Option<Size<Px>> {
         None
     }

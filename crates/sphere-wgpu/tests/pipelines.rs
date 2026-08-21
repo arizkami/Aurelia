@@ -94,14 +94,18 @@ fn every_pipeline_builds_for_the_surface_and_layer_formats() {
     // Bgra8UnormSrgb is the usual swapchain format; Rgba8UnormSrgb is what
     // offscreen layers use. A pipeline is bound to one colour target format,
     // so both have to build.
-    for format in [wgpu::TextureFormat::Bgra8UnormSrgb, wgpu::TextureFormat::Rgba8UnormSrgb] {
-        for kind in ALL_KINDS {
-            let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-            cache
-                .get(&device, PipelineKey { kind: *kind, format })
-                .unwrap_or_else(|e| panic!("{kind:?} / {format:?}: {e}"));
-            if let Some(err) = pollster::block_on(scope.pop()) {
-                panic!("{kind:?} for {format:?} failed validation:\n{err}");
+    // Both sample counts must build: a machine with no MSAA support still has
+    // to render, and one with it must not hit a pipeline-layout mismatch.
+    for samples in [1u32, 4] {
+        for format in [wgpu::TextureFormat::Bgra8UnormSrgb, wgpu::TextureFormat::Rgba8UnormSrgb] {
+            for kind in ALL_KINDS {
+                let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                cache
+                    .get(&device, PipelineKey { kind: *kind, format, samples })
+                    .unwrap_or_else(|e| panic!("{kind:?} / {format:?}: {e}"));
+                if let Some(err) = pollster::block_on(scope.pop()) {
+                    panic!("{kind:?} for {format:?} failed validation:\n{err}");
+                }
             }
         }
     }
@@ -112,7 +116,7 @@ fn every_pipeline_builds_for_the_surface_and_layer_formats() {
         panic!("blur pipeline failed validation:\n{err}");
     }
 
-    assert!(cache.built() >= ALL_KINDS.len() as u32, "expected pipelines to actually build");
+    assert!(cache.built() >= ALL_KINDS.len() as u32 * 2, "expected pipelines to actually build");
 }
 
 #[test]
@@ -122,7 +126,11 @@ fn pipelines_are_cached_not_rebuilt() {
         return;
     };
     let mut cache = PipelineCache::new(&device);
-    let key = PipelineKey { kind: PipelineKind::Quad, format: wgpu::TextureFormat::Rgba8UnormSrgb };
+    let key = PipelineKey {
+        kind: PipelineKind::Quad,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        samples: 1,
+    };
     cache.get(&device, key).unwrap();
     let after_first = cache.built();
     for _ in 0..10 {
@@ -141,14 +149,22 @@ fn a_different_target_format_gets_its_own_pipeline() {
     cache
         .get(
             &device,
-            PipelineKey { kind: PipelineKind::Quad, format: wgpu::TextureFormat::Rgba8UnormSrgb },
+            PipelineKey {
+                kind: PipelineKind::Quad,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                samples: 1,
+            },
         )
         .unwrap();
     let after_first = cache.built();
     cache
         .get(
             &device,
-            PipelineKey { kind: PipelineKind::Quad, format: wgpu::TextureFormat::Bgra8UnormSrgb },
+            PipelineKey {
+                kind: PipelineKind::Quad,
+                format: wgpu::TextureFormat::Bgra8UnormSrgb,
+                samples: 1,
+            },
         )
         .unwrap();
     assert_eq!(cache.built(), after_first + 1, "format is part of the cache key");

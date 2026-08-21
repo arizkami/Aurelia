@@ -7,7 +7,7 @@ than against intent.
 
 ## Where v0.1 stands
 
-**50,636 lines** of Rust and WGSL. **1,005 unit tests + 11 doctests**, zero warnings, clippy clean,
+**50,636 lines** of Rust and WGSL. **1,020 tests**, zero warnings, clippy clean,
 `cargo fmt` clean.
 
 | Crate | Tests | Status |
@@ -49,7 +49,10 @@ compatible rectangles merge into a single draw call.
 Font loading, font database, fallback, shaping, glyph runs, MTSDF generation, paged atlas, GPU text
 shader, HiDPI, multilingual text.
 
-*Success criterion — text renders correctly at common DAW UI sizes.* Met. The MTSDF generator is a
+*Success criterion — text renders correctly at common DAW UI sizes.* Met. Glyph quads are snapped
+to the device pixel grid — the baseline always, and a bitmap glyph's origin and extent as well, so
+the atlas's edge-aligned UV convention actually holds — and coverage carries a perceptual gamma so
+light-on-dark text does not bloom in linear light. The MTSDF generator is a
 pure-Rust implementation of Chlumsky's method including edge colouring, pseudo-distance and error
 correction; the small-size bitmap fallback is an analytic-coverage rasteriser selected on physical
 size. The demo renders Latin, Thai, Japanese, Chinese, Korean and Arabic through one path.
@@ -132,6 +135,7 @@ parsing and `SvgError::Unsupported` is returned rather than handing back a silen
 | Box shadow (analytic) | Done |
 | Inner shadow | Done |
 | Saturation filter | Done |
+| Multisample antialiasing for paths | Done — 4× by default, on the surface and every layer |
 | Gaussian blur shader | Written and validated, **not yet wired to the layer pipeline** |
 | Backdrop blur | Not started |
 | Colour matrix | Type exists, shader path not written |
@@ -159,7 +163,7 @@ yet run the two-pass blur between a layer's render and its composite.
 | A realtime meter updates without full relayout | Yes — tested |
 | The public API is not tied to WGPU | Yes — `RendererBackend` is the only seam |
 | No Skia/C++ rendering dependency remains | Yes — pure Rust throughout |
-| Examples and documentation demonstrate the architecture | Partial — one example, eight documents |
+| Examples and documentation demonstrate the architecture | Yes — two examples, eight documents |
 | Workspace builds and tests cleanly | Yes |
 
 ## Known gaps, in the order they should be closed
@@ -167,8 +171,8 @@ yet run the two-pass blur between a layer's render and its composite.
 1. **Text input.** The largest functional hole. Everything it depends on exists.
 2. **Benchmarks.** No Criterion suite. The engine reports counters and the demo measures itself, but
    there is no regression harness.
-3. **More examples.** One demo covers everything at once; small focused examples would teach the
-   pieces better.
+3. **More examples.** Two exist — a desktop settings window and a plug-in editor. Small focused
+   examples for individual subsystems would still teach the pieces better.
 4. **Blur wiring.** The shader and pipeline exist and are GPU-validated; the pass is not run.
 5. **Remaining widgets.** Menu, tabs, tooltip, modal, list, tree.
 6. **Accessibility bridge.** Every element already reports role, value, state and actions. No

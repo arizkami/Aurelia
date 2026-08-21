@@ -130,9 +130,42 @@ impl Button {
     }
 }
 
+impl Button {
+    /// The style the label is measured *and* painted with.
+    ///
+    /// One function so the two can never drift apart. `measure` reserves the
+    /// box and `paint` fills it; if they disagree on the font size the text
+    /// ends up outside the box the layout engine agreed to.
+    fn label_style(theme: &crate::theme::Theme) -> sphere_text::TextStyle {
+        sphere_text::TextStyle {
+            font_size: theme.typography.md,
+            wrap: sphere_text::WrapMode::None,
+            ..Default::default()
+        }
+    }
+}
+
 impl Element for Button {
     fn id(&self) -> Option<ElementId> {
         self.id
+    }
+
+    /// A button's label is painted as a leaf, not laid out as a child, so
+    /// nothing else reports its size. Without this the button has no intrinsic
+    /// width at all: in an `Auto`-width slot it collapses to its own padding
+    /// and the label spills over whatever is beside it.
+    fn measure(
+        &mut self,
+        _request: &sphere_layout::MeasureRequest<'_>,
+        text: &mut sphere_text::TextSystem,
+        theme: &crate::theme::Theme,
+    ) -> Option<Size<Px>> {
+        if self.text.is_empty() {
+            return Some(Size::ZERO);
+        }
+        // Content size only: taffy adds the padding and border from
+        // `layout_style` on top of whatever comes back from here.
+        Some(text.layout(&self.text, &Self::label_style(theme), None).size)
     }
 
     fn layout_style(&self) -> Style {
@@ -184,12 +217,16 @@ impl Element for Button {
             return;
         }
         let color = if self.disabled { c.text_muted } else { text };
-        let mut content =
-            label(self.text.clone()).text_size(cx.theme.typography.md).text_color(color).no_wrap();
+        let style_for_text = Self::label_style(cx.theme);
+        let mut content = label(self.text.clone())
+            .text_size(style_for_text.font_size)
+            .text_color(color)
+            .no_wrap();
         // Centre the label in the button's box. The label is a leaf here rather
-        // than a child element, so its box is computed rather than laid out.
-        let layout = cx.text.layout(&self.text, &Default::default(), None);
-        let size = layout.size;
+        // than a child element, so its box is computed rather than laid out --
+        // with the same style `measure` used, or the centring is off by the
+        // difference between the two sizes.
+        let size = cx.text.layout(&self.text, &style_for_text, None).size;
         let origin = Point::new(
             cx.bounds.min_x() + Px((cx.bounds.width().get() - size.width.get()) * 0.5),
             cx.bounds.min_y() + Px((cx.bounds.height().get() - size.height.get()) * 0.5),
@@ -632,6 +669,35 @@ impl ValueControl {
     }
 }
 
+impl ValueControl {
+    /// The box the focus ring is drawn around, and its corner radius.
+    ///
+    /// Each shape returns the moving part rather than its layout box: the
+    /// slider's handle, the fader's cap, the knob's dial. `t` is the
+    /// normalised value, so the ring follows the control.
+    fn focus_ring_box(&self, b: Rect<Px>, t: f32) -> (Rect<Px>, Px) {
+        match self.shape {
+            ValueShape::HorizontalSlider => {
+                let r = px(7.0);
+                let centre = Point::new(b.min_x() + b.width() * t, b.center().y);
+                (Rect::new(Point::new(centre.x - r, centre.y - r), Size::new(r * 2.0, r * 2.0)), r)
+            }
+            ValueShape::VerticalFader => {
+                let cap_h = px(12.0);
+                let y = b.max_y() - b.height() * t - cap_h * 0.5;
+                (Rect::new(Point::new(b.min_x(), y), Size::new(b.width(), cap_h)), px(2.0))
+            }
+            ValueShape::Knob => {
+                let centre = b.center();
+                // Matches the dial radius in `paint`, plus the stroke's half
+                // width so the ring clears the track rather than sitting on it.
+                let r = Px(b.width().get().min(b.height().get()) * 0.42) + px(2.0);
+                (Rect::new(Point::new(centre.x - r, centre.y - r), Size::new(r * 2.0, r * 2.0)), r)
+            }
+        }
+    }
+}
+
 impl Element for ValueControl {
     fn id(&self) -> Option<ElementId> {
         self.id
@@ -784,13 +850,20 @@ impl Element for ValueControl {
         }
 
         if cx.state.focused {
+            // Ring the part that actually moves, not the whole row. A slider's
+            // hit box is full width and only a few pixels of it carry any
+            // graphics, so a ring around `b` draws a large empty rectangle that
+            // reads as a text field and collides with whatever label sits above
+            // it. Ringing the handle is both smaller and more informative: it
+            // says where the arrow keys will act.
+            let (ring_box, radius) = self.focus_ring_box(b, t);
             let ring = FocusRing { color: c.focus, ..FocusRing::default() };
             let style = PaintStyle {
                 focus_ring: Some(ring),
-                corner_radii: Corners::all(cx.theme.radii.sm),
+                corner_radii: Corners::all(radius),
                 ..Default::default()
             };
-            style.paint_box(cx.canvas, b, cx.state);
+            style.paint_box(cx.canvas, ring_box, cx.state);
         }
     }
 
@@ -1090,6 +1163,63 @@ mod tests {
 
     fn viewport() -> Size<Px> {
         size(px(400.0), px(300.0))
+    }
+
+    /// A text system with a real face, or `None` on a machine with no fonts.
+    fn text_system() -> Option<sphere_text::TextSystem> {
+        let mut system = sphere_text::TextSystem::with_system_fonts();
+        system.fonts_mut().resolve(&sphere_text::FontRequest::default())?;
+        Some(system)
+    }
+
+    #[test]
+    fn a_button_is_wide_enough_for_its_label() {
+        // A button paints its label as a leaf, so nothing but `measure` reports
+        // its width. Without one it collapses to its 12 px padding either side
+        // and the label spills over its neighbours -- which is what a row of
+        // auto-width buttons in a header actually looked like.
+        let Some(mut system) = text_system() else {
+            eprintln!("no system font; skipping");
+            return;
+        };
+        let mut tree = UiTree::new();
+        tree.build(button("Apply").into_element());
+        tree.compute_layout_with_text(viewport(), &mut system).unwrap();
+
+        let node = tree.layout().roots()[0];
+        let bounds = tree.layout().layout(node).unwrap().bounds;
+        // 24 px is the horizontal padding alone: anything at or below it means
+        // the label contributed nothing.
+        assert!(bounds.width() > px(24.0), "button collapsed to {bounds:?}");
+    }
+
+    #[test]
+    fn a_longer_button_label_makes_a_wider_button() {
+        let Some(mut system) = text_system() else {
+            eprintln!("no system font; skipping");
+            return;
+        };
+        let mut width_of = |text: &str| {
+            let mut tree = UiTree::new();
+            tree.build(button(text).into_element());
+            tree.compute_layout_with_text(viewport(), &mut system).unwrap();
+            let node = tree.layout().roots()[0];
+            tree.layout().layout(node).unwrap().bounds.width()
+        };
+        assert!(width_of("Apply") < width_of("Apply and close"));
+    }
+
+    #[test]
+    fn an_empty_button_still_has_its_padding_and_height() {
+        // An icon-only button is a real case; it must not measure to nothing.
+        let mut system = sphere_text::TextSystem::new();
+        let mut tree = UiTree::new();
+        tree.build(button("").into_element());
+        tree.compute_layout_with_text(viewport(), &mut system).unwrap();
+
+        let node = tree.layout().roots()[0];
+        let bounds = tree.layout().layout(node).unwrap().bounds;
+        assert_eq!(bounds.height(), px(28.0), "default button height");
     }
 
     fn press_at(x: f32, y: f32, count: u8) -> UiEvent {

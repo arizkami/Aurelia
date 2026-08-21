@@ -202,3 +202,95 @@ not at a fixed offset from it — a median-derived outline varies in width aroun
 
 Atlas pages are stored `Rgba8Unorm`, **not** sRGB. A distance field is geometry, not colour;
 gamma-decoding it on sample would corrupt every glyph edge.
+
+## Three things that make text look soft, and what is done about them
+
+The distance-field maths above is correct and still produces mushy text if any of these is wrong.
+All three were, and all three are fixed.
+
+### The quad has to cover the whole field, not the ink
+
+`generate_mtsdf` writes the glyph's ink box **outset by `range_em` on every side**, and says so at
+the point of definition: the caller must draw `bounds_em.outset(range_em)`, not `bounds_em`.
+
+The batch compiler drew `bounds_em`. The UVs still spanned the full padded image, so the whole
+field was squeezed into the smaller ink box — every glyph rendered *smaller than its own advance*,
+by a factor that depends on how wide the glyph is:
+
+```text
+font: Segoe UI 14 px, "Preferences"
+glyph     advance     ink w    quad w ink/quad
+P           9.338     7.649     9.983    0.766
+r           4.662     3.944     6.278    0.628
+e           7.786     6.692     9.026    0.741
+```
+
+A line came out about a quarter too small with correct spacing, which reads as text that is both
+tiny and tracked out — and because the ratio varies per glyph, narrow letters shrank more than wide
+ones, so the letterforms were distorted rather than merely scaled.
+
+```bash
+cargo run -p sphere-text --example glyph_quad_probe --release -- out.png
+```
+
+prints that table for the fonts on the machine it runs on, and writes a side-by-side render of one
+line under both quad rules. The probe re-implements `text.wgsl` on the CPU, so it demonstrates that
+the geometry handed to the GPU is right; it is not a capture of what the GPU drew, and it says so at
+the top of the file. There are still no golden-image tests — see the gaps in `performance.md`.
+
+`range_em` is zero on the bitmap path, so the outset is unconditional. A test asserts that, because
+the correctness of the snapping below depends on a bitmap quad staying exactly 1:1 with its texels.
+
+### Subpixel placement
+
+The atlas's UV convention is *edge-aligned*: `uv_rect` bounds the outer edge of the texel block, and
+the documented promise is that interpolating across a quad covering exactly `texels.size` device
+pixels lands on texel centres.
+
+Nothing was arranging for the quad to do either, so a bitmap glyph was sampled off its own texel
+grid and came out as a blurred copy of itself. `snap_glyph_quad` in the batch compiler fixes it,
+with a different answer per axis:
+
+| Axis | MTSDF | Bitmap |
+|---|---|---|
+| Vertical | Snapped | Snapped |
+| Horizontal | **Not** snapped | Snapped |
+| Extent | Exact | Snapped to the atlas texel count |
+
+The baseline is always snapped, because a fractional device y softens every glyph in the run
+identically and nothing is gained by leaving it. Horizontal is where they differ: a distance field
+reconstructs correctly at any subpixel x, and quantising it would visibly quantise letter spacing at
+small sizes — but a bitmap has no such property, so its origin *and* its extent are snapped.
+
+**The correction is derived from the pen, not from the quad.** This is the part that is easy to get
+wrong, and getting it wrong is worse than not snapping at all. Every glyph has a different ink top —
+an `x`, an `l` and a `g` all begin at different heights, at fractional offsets — so rounding each
+quad's own top edge hands every glyph in the line a *different* sub-pixel shift and tears the shared
+baseline apart. The pen is the one coordinate they have in common, so that is what gets rounded, and
+the whole run moves by a single delta. A test builds a run from two glyphs with deliberately
+different ink tops and asserts they move together.
+
+A bitmap is the exception that may be snapped directly: `rasterize_shape` snaps its ink box outwards
+to whole device pixels on purpose, so the box is already an integer number of pixels from the pen and
+rounding it is both grid-exact and run-consistent.
+
+Snapping only happens when the transform is a translation. Under rotation there is no pixel grid to
+snap to, and forcing one would make text crawl as the transform animates.
+
+### Coverage in linear light
+
+Everything in this engine blends in linear light, which is physically correct and is what makes
+gradients and translucent overlaps come out right. Applied to *text coverage* it has a side effect:
+half coverage of white on black is linear 0.5, which is sRGB 0.735 — visibly heavier than the 0.5 a
+traditional gamma-space rasteriser produces. Light-on-dark text blooms, and blooming reads as
+blurry.
+
+[`GlyphRun::coverage_gamma`] is an exponent applied to coverage before compositing.
+`DEFAULT_COVERAGE_GAMMA` is 1.25, a modest correction tuned for the light-on-dark case that
+dominates this engine's target applications. `1.0` disables it.
+
+It is a knob rather than a constant on purpose: dark text on a light background wants the opposite
+adjustment, and text over an image wants neither. `Label::coverage_gamma` sets it per label.
+
+This is a *perceptual* correction, not a physical one, and the documentation says so where the
+constant is defined rather than leaving it to be discovered.

@@ -17,6 +17,22 @@ const CLIP_ROUNDED: u32 = 4u;
 @group(1) @binding(0) var glyph_atlas: texture_2d<f32>;
 @group(1) @binding(1) var glyph_sampler: sampler;
 
+/// Applies the perceptual coverage correction.
+///
+/// Coverage is a geometric fraction, and compositing it in linear light — which
+/// is physically right and what every other primitive here does — makes
+/// light-on-dark text bloom: half coverage of white on black is linear 0.5,
+/// which is sRGB 0.735, visibly heavier than a gamma-space rasteriser would
+/// produce. An exponent above one pulls the midtones back and restores the
+/// intended stroke weight. See `GlyphRun::coverage_gamma` for why this is a
+/// knob and not a constant.
+fn apply_coverage_gamma(coverage: f32, gamma: f32) -> f32 {
+    if (abs(gamma - 1.0) < 0.001) {
+        return coverage;
+    }
+    return pow(clamp(coverage, 0.0, 1.0), gamma);
+}
+
 struct GlyphIn {
     /// `[x, y, w, h]` of the glyph quad in local logical pixels.
     @location(0) bounds: vec4<f32>,
@@ -26,8 +42,8 @@ struct GlyphIn {
     @location(2) color: vec4<f32>,
     /// Linear premultiplied outline colour.
     @location(3) outline_color: vec4<f32>,
-    /// `[px_range, outline_width]`.
-    @location(4) params: vec2<f32>,
+    /// `[px_range, outline_width, coverage_gamma, unused]`.
+    @location(4) params: vec4<f32>,
     /// `[flags, atlas_page, transform_index, clip_index]`.
     @location(5) indices: vec4<u32>,
 }
@@ -38,7 +54,7 @@ struct GlyphOut {
     @location(1) world: vec2<f32>,
     @location(2) @interpolate(flat) color: vec4<f32>,
     @location(3) @interpolate(flat) outline_color: vec4<f32>,
-    /// `[screen_px_range, outline_width, unused, unused]`.
+    /// `[screen_px_range, outline_width, coverage_gamma, unused]`.
     @location(4) @interpolate(flat) params: vec4<f32>,
     @location(5) @interpolate(flat) indices: vec4<u32>,
 }
@@ -61,7 +77,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, inst: GlyphIn) -> GlyphOut 
     // glyph's nominal size. Folding in the transform's scale here is what keeps
     // zoomed text as sharp as unzoomed text without a second rasterisation.
     let screen_range = max(inst.params.x * transform_scale(inst.indices.z), 1.0);
-    out.params = vec4<f32>(screen_range, inst.params.y, 0.0, 0.0);
+    out.params = vec4<f32>(screen_range, inst.params.y, inst.params.z, 0.0);
     out.indices = inst.indices;
     return out;
 }
@@ -74,15 +90,16 @@ fn fs_main(in: GlyphOut) -> @location(0) vec4<f32> {
 
     if ((flags & BITMAP) != 0u) {
         // The bitmap fallback stores coverage in red. It is already
-        // size-specific, so it needs no distance reconstruction at all.
-        return in.color * sample.r * clip;
+        // size-specific, so it needs no distance reconstruction at all — but it
+        // wants the same perceptual correction the field path gets.
+        return in.color * apply_coverage_gamma(sample.r, in.params.z) * clip;
     }
 
     // Median of the three channels reconstructs the true signed distance while
     // preserving the sharp corners that a single-channel field rounds off.
     let sd = median3(sample.r, sample.g, sample.b) - 0.5;
     let screen_range = in.params.x;
-    let fill_alpha = clamp(sd * screen_range + 0.5, 0.0, 1.0);
+    let fill_alpha = apply_coverage_gamma(clamp(sd * screen_range + 0.5, 0.0, 1.0), in.params.z);
 
     if ((flags & OUTLINE) != 0u) {
         // The alpha channel carries the *true* distance, which is what makes a

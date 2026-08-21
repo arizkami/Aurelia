@@ -311,6 +311,7 @@ impl GlyphProvider for TextSystem {
             bounds_em: [b.min_x(), b.min_y(), b.width(), b.height()],
             range_em: placement.range_em,
             is_bitmap: placement.format == GlyphFormat::Grayscale,
+            texel_size: [placement.texels.size.width, placement.texels.size.height],
         })
     }
 }

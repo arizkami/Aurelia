@@ -43,6 +43,13 @@ pub struct SurfaceOptions {
     pub transparent: bool,
     /// Byte budget for decoded images.
     pub image_budget_bytes: usize,
+    /// Multisample count for tessellated path geometry.
+    ///
+    /// Quads and glyphs are antialiased analytically and gain nothing from it;
+    /// paths have hard triangle edges and nothing else smooths them. `1`
+    /// disables it, `4` is the default and falls back automatically on an
+    /// adapter that cannot manage it.
+    pub msaa_samples: u32,
     /// Whether to load the platform's fonts at start-up.
     ///
     /// Scanning the system font directory takes a noticeable fraction of a
@@ -57,6 +64,7 @@ impl Default for SurfaceOptions {
             vsync: VsyncMode::On,
             transparent: false,
             image_budget_bytes: 64 * 1024 * 1024,
+            msaa_samples: sphere_render::DEFAULT_MSAA_SAMPLES,
             load_system_fonts: true,
         }
     }
@@ -75,6 +83,31 @@ pub struct SurfaceStats {
     pub cpu_ms: f32,
     /// Atlas texels uploaded this frame.
     pub glyph_texels_uploaded: u64,
+}
+
+/// Where start-up time went.
+///
+/// Start-up is the one part of the frame budget that cannot be amortised, and
+/// it is the part a user sees as "the window took a moment to appear". Reported
+/// rather than guessed at, because the two costs below are very different
+/// things and only one of them is avoidable.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct InitTiming {
+    /// Adapter selection, device creation and the first surface configuration.
+    pub gpu_ms: f32,
+    /// Scanning and indexing the platform's fonts.
+    ///
+    /// Usually the larger of the two. [`SurfaceOptions::load_system_fonts`]
+    /// turns it off for an application that ships its own faces.
+    pub fonts_ms: f32,
+}
+
+impl InitTiming {
+    /// Total start-up cost in milliseconds.
+    #[inline]
+    pub fn total_ms(&self) -> f32 {
+        self.gpu_ms + self.fonts_ms
+    }
 }
 
 /// Resolves image handles to GPU textures for the batch compiler.
@@ -102,6 +135,8 @@ pub struct SphereSurface {
     tree: UiTree,
     size: Size<DevicePx>,
     scale_factor: ScaleFactor,
+    /// Multisample count requested at construction.
+    msaa_samples: u32,
     /// GPU texture for each glyph atlas page.
     atlas_textures: FxHashMap<u32, TextureId>,
     /// The atlas generation the textures were built against. A bump means every
@@ -113,6 +148,15 @@ pub struct SphereSurface {
     pending_uploads: Vec<ImageId>,
     stats: SurfaceStats,
     start: std::time::Instant,
+    /// Where start-up time went.
+    init_timing: InitTiming,
+    /// Whether a frame has actually reached the screen.
+    ///
+    /// Distinct from "render was called": `render` returns `Ok(None)` for a
+    /// zero-area viewport and for a transiently unavailable surface, and
+    /// revealing a window on either would show the blank frame that creating it
+    /// hidden was meant to avoid.
+    presented: bool,
 }
 
 impl SphereSurface {
@@ -132,6 +176,7 @@ impl SphereSurface {
             + raw_window_handle::HasDisplayHandle
             + 'static,
     {
+        let gpu_start = std::time::Instant::now();
         let renderer = WgpuRenderer::new(
             window,
             size,
@@ -139,14 +184,18 @@ impl SphereSurface {
             options.present,
             options.vsync,
             options.transparent,
+            options.msaa_samples,
         )
         .await?;
+        let gpu_ms = gpu_start.elapsed().as_secs_f32() * 1000.0;
 
+        let fonts_start = std::time::Instant::now();
         let mut text = if options.load_system_fonts {
             TextSystem::with_system_fonts()
         } else {
             TextSystem::new()
         };
+        let fonts_ms = fonts_start.elapsed().as_secs_f32() * 1000.0;
         // The atlas must not be configured larger than the adapter can hold, or
         // the failure appears at upload time rather than at allocation time.
         text.set_max_texture_size(renderer.capabilities().max_texture_size);
@@ -163,12 +212,15 @@ impl SphereSurface {
             tree: UiTree::new(),
             size,
             scale_factor,
+            msaa_samples: options.msaa_samples,
             atlas_textures: FxHashMap::default(),
             atlas_generation: 0,
             expand_scratch: Vec::new(),
             pending_uploads: Vec::new(),
             stats: SurfaceStats::default(),
             start: std::time::Instant::now(),
+            init_timing: InitTiming { gpu_ms, fonts_ms },
+            presented: false,
         })
     }
 
@@ -176,6 +228,24 @@ impl SphereSurface {
     #[inline]
     pub fn adapter_name(&self) -> &str {
         self.renderer.adapter_name()
+    }
+
+    /// Where start-up time went.
+    #[inline]
+    pub fn init_timing(&self) -> InitTiming {
+        self.init_timing
+    }
+
+    /// Whether a frame has reached the screen yet.
+    ///
+    /// The condition for revealing a window that was created hidden. Waiting on
+    /// this rather than on "`render` returned" is the difference between showing
+    /// a painted window and showing the blank one that opening hidden was meant
+    /// to avoid: `render` reports `Ok(None)` for a zero-area viewport and for a
+    /// surface that is transiently unavailable, and neither has drawn anything.
+    #[inline]
+    pub fn has_presented(&self) -> bool {
+        self.presented
     }
 
     /// The UI tree.
@@ -268,6 +338,7 @@ impl SphereSurface {
             present: PresentPreference::LowLatency,
             vsync: VsyncMode::On,
             transparent: false,
+            msaa_samples: self.msaa_samples,
         })
     }
 
@@ -342,6 +413,7 @@ impl SphereSurface {
         let compiled = self.compiler.frame().clone();
         self.renderer.render(&mut handle, &compiled, clear)?;
         let frame_stats = self.renderer.end_frame(handle)?;
+        self.presented = true;
 
         self.tree.end_frame();
         self.stats = SurfaceStats {
@@ -472,6 +544,13 @@ use sphere_core::Px;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_timing_totals_its_parts() {
+        let t = InitTiming { gpu_ms: 700.0, fonts_ms: 20.0 };
+        assert_eq!(t.total_ms(), 720.0);
+        assert_eq!(InitTiming::default().total_ms(), 0.0);
+    }
 
     #[test]
     fn default_options_favour_latency() {

@@ -34,6 +34,13 @@ pub struct PipelineKey {
     pub kind: PipelineKind,
     /// The colour target format it writes.
     pub format: wgpu::TextureFormat,
+    /// Multisample count of the attachment it writes.
+    ///
+    /// Part of the key because a pipeline is bound to one sample count. The
+    /// analytic primitives — quads, glyphs — are already antialiased by their
+    /// own shaders and gain nothing from multisampling, but *tessellated paths*
+    /// have no analytic edge at all and are the reason this exists.
+    pub samples: u32,
 }
 
 /// The layouts every Sphere pipeline shares.
@@ -197,8 +204,8 @@ pub const GLYPH_ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
     1 => Float32x4,  // uv
     2 => Float32x4,  // color
     3 => Float32x4,  // outline_color
-    4 => Float32x2,  // px_range, outline_width
-    5 => Uint32x4,   // flags, atlas_page, transform_index, clip_index
+    4 => Float32x4,  // px_range, outline_width, coverage_gamma, flags(bitcast)
+    5 => Uint32x4,   // atlas_page, transform_index, clip_index, pad
 ];
 
 /// Vertex attribute layout for [`MeshVertex`].
@@ -399,7 +406,14 @@ impl PipelineCache {
                 conservative: false,
             },
             depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: key.samples.max(1),
+                mask: !0,
+                // Alpha-to-coverage would quantise every translucent primitive
+                // to the sample count, which is far worse than the analytic
+                // alpha the shaders already produce.
+                alpha_to_coverage_enabled: false,
+            },
             multiview_mask: None,
             cache: None,
         });
@@ -495,6 +509,18 @@ mod tests {
     #[test]
     fn mesh_attributes_exactly_cover_the_vertex() {
         assert_eq!(attr_span(&MESH_ATTRS), core::mem::size_of::<MeshVertex>() as u64);
+    }
+
+    #[test]
+    fn glyph_attribute_offsets_match_the_rust_field_order() {
+        // Four vec4s, then the float block, then the index block. A silent
+        // drift here shows as garbled text rather than a compile error.
+        assert_eq!(GLYPH_ATTRS[0].offset, 0);
+        assert_eq!(GLYPH_ATTRS[1].offset, 16);
+        assert_eq!(GLYPH_ATTRS[2].offset, 32);
+        assert_eq!(GLYPH_ATTRS[3].offset, 48);
+        assert_eq!(GLYPH_ATTRS[4].offset, 64);
+        assert_eq!(GLYPH_ATTRS[5].offset, 80);
     }
 
     #[test]

@@ -102,8 +102,27 @@ eight hours is not a performance problem, it is a crash.
 | Shaping | text + style + width | Bytes, LRU |
 | Glyph atlas | `GlyphKey` | Page count, LRU page eviction, idle-frame eviction |
 | Image | Content hash | Bytes, LRU, with a this-frame guard |
-| Pipeline | kind + target format | Bounded by construction — a fixed set |
+| Pipeline | kind + target format + sample count | Bounded by construction — a fixed set |
 | SVG geometry | id + size + scale | Bytes, LRU |
+
+## What multisampling costs
+
+The surface and every offscreen layer are multisampled 4× so that tessellated paths have smooth
+edges. That is not free:
+
+- The surface's multisampled attachment is `width × height × 4 bytes × samples`. At 1180×720 that is
+  roughly 13 MB; at 4K it is roughly 130 MB.
+- Every layer allocates a second texture, because a multisampled texture cannot be sampled and has
+  to resolve into a plain one before compositing.
+- `WgpuRenderer::memory_usage` accounts for both, so the cost is visible rather than inferred.
+
+Two things keep it from being worse than it needs to be. The multisampled attachment stores
+`Discard` on any pass that will not be resumed, so the 4× buffer is never written back to memory —
+only the resolve is. And the count is chosen once at startup from what the formats actually support,
+so a device that cannot manage 4× silently runs at the highest it can rather than failing.
+
+`SurfaceOptions::msaa_samples = 1` turns it off entirely. Everything except tessellated paths is
+antialiased analytically and looks identical either way.
 
 ## Culling and batching
 
@@ -168,6 +187,10 @@ Honesty about the gaps:
   bounded run is the only end-to-end measurement. A benchmark crate is on the roadmap.
 - GPU frame time is not measured. `FrameStats::gpu_ms` is `None`; timestamp queries are detected as
   a capability but not yet used.
-- No golden-image or screenshot tests exist. Visual regressions are currently caught by eye.
+- No golden-image or screenshot tests exist, and there is no GPU readback path to build them on.
+  `sphere-text`'s `glyph_quad_probe` example renders text to a PNG, but it re-implements the glyph
+  shader on the CPU rather than capturing a frame, so it can check geometry and not the GPU. The
+  two examples print a measured report under `SPHERE_DEMO_FRAMES`, which catches *structural*
+  regressions — a jump in draw calls, a nonzero `nodes_laid_out` — but not visual ones.
 - The figures above come from one discrete NVIDIA GPU. Integrated graphics, Metal and a software
   adapter are architecturally supported and untested for performance.

@@ -85,7 +85,28 @@ pub struct GlyphRun {
     pub outline_width: Px,
     /// Outline color, ignored when `outline_width` is zero.
     pub outline_color: Color,
+    /// Exponent applied to glyph coverage before compositing.
+    ///
+    /// Antialiasing coverage is a geometric quantity, and blending it in linear
+    /// light — which is physically correct and what this engine does everywhere
+    /// else — makes light-on-dark text bloom and read as soft. Fifty per cent
+    /// coverage of white on black is linear 0.5, which is sRGB 0.735, noticeably
+    /// heavier than the 0.5 a traditional gamma-space rasteriser produces.
+    ///
+    /// An exponent above 1.0 pulls the midtones back down and restores the
+    /// weight the rasteriser intended. This is a *perceptual* correction, not a
+    /// physical one, which is why it is a knob rather than a constant: dark text
+    /// on a light background wants the opposite adjustment, and text over an
+    /// image wants neither.
+    ///
+    /// [`DEFAULT_COVERAGE_GAMMA`] is a modest correction tuned for the
+    /// light-on-dark case that dominates this engine's target applications.
+    /// `1.0` disables it.
+    pub coverage_gamma: f32,
 }
+
+/// The default glyph coverage exponent. See [`GlyphRun::coverage_gamma`].
+pub const DEFAULT_COVERAGE_GAMMA: f32 = 1.25;
 
 /// One glyph placed at a baseline-relative position.
 #[derive(Copy, Clone, Debug, PartialEq)]

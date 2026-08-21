@@ -75,6 +75,56 @@ exiting all need the running loop, which only exists there.
 a GPU surface still references it is undefined behaviour in the driver. The caller drops the
 surface first.
 
+## Start-up, and the blank window
+
+A window is mapped by the OS the moment it is created. Everything that happens next — choosing an
+adapter, creating a device, configuring a swapchain, scanning the system fonts, building the first
+element tree — happens with an empty rectangle already on screen, and the user sees a white flash
+for the whole of it.
+
+Measured on one machine, an NVIDIA GTX 1060 on Windows 11:
+
+```text
+init: gpu 706 ms, fonts 22 ms
+first frame: 46 ms
+```
+
+Three quarters of a second of blank window, and **the GPU is the cost, not the fonts** — which is
+the opposite of what the `load_system_fonts` doc comment would lead you to guess. Restricting
+`WGPU_BACKEND` to a single backend saves only 50-70 ms of it; the rest is the driver creating a
+device and is not something this engine can shorten.
+
+So the fix is not to make start-up fast. It is to not show anything until there is something to
+show:
+
+```rust
+// 1. Create hidden.
+let attrs = WindowAttributes::new("...").with_visible(false);
+let window = cx.create_window(&attrs)?;
+
+// 2. Initialise. Nothing is on screen while this runs.
+let surface = SphereSurface::new(...).await?;
+
+// 3. Draw one frame into the hidden window.
+self.draw();
+
+// 4. Reveal, now that the swapchain holds a painted frame.
+window.set_visible(true);
+window.request_redraw();
+```
+
+[`SphereSurface::has_presented`] is the condition to test at step 4, and it is deliberately not the
+same as "`render` returned". `render` reports `Ok(None)` for a zero-area viewport and for a surface
+that is transiently unavailable, and neither of those has drawn anything — revealing on either would
+show exactly the blank window the sequence exists to avoid.
+
+Reveal anyway if it is false. A surface that is not ready at start-up recovers on the next redraw;
+an application whose window never appears does not, and that is the worse failure. Both examples do
+this and print a warning when it happens.
+
+The `request_redraw` at the end is insurance rather than necessity: mapping a window invalidates it,
+and on some compositors the present at step 3 went to a surface that was not mapped yet.
+
 ## Frame scheduling
 
 ```rust

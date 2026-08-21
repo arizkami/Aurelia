@@ -61,8 +61,8 @@ pub mod scene;
 pub mod tessellate;
 
 pub use backend::{
-    BackendCapabilities, FrameHandle, FrameStats, PresentPreference, RendererBackend,
-    SceneCompiler, SurfaceConfig, VsyncMode,
+    BackendCapabilities, DEFAULT_MSAA_SAMPLES, FrameHandle, FrameStats, PresentPreference,
+    RendererBackend, SceneCompiler, SurfaceConfig, VsyncMode,
 };
 pub use batch::{
     Batch, BatchCompiler, BatchKind, CompiledFrame, Composite, GlyphPlacement, GlyphProvider,
@@ -74,8 +74,8 @@ pub use primitives::{
     QuadInstance, glyph_flags, gradient_kind, quad_flags,
 };
 pub use scene::{
-    Clip, ClipKind, DrawCommand, Filter, GlyphRun, Layer, Mesh, MeshVertex, PositionedGlyph,
-    QuadCommand, Scene, SceneIndex, SceneStats, TextRasterMode,
+    Clip, ClipKind, DEFAULT_COVERAGE_GAMMA, DrawCommand, Filter, GlyphRun, Layer, Mesh, MeshVertex,
+    PositionedGlyph, QuadCommand, Scene, SceneIndex, SceneStats, TextRasterMode,
 };
 pub use tessellate::{TessellationError, TessellationOptions, Tessellator};
 

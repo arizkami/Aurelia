@@ -534,9 +534,14 @@ impl AppHandler for Demo {
         if self.surface.is_some() {
             return;
         }
+        // Created hidden: bringing up the GPU and scanning the system fonts
+        // takes a few hundred milliseconds, and a window mapped before that is
+        // a blank rectangle for the whole of it. Revealed at the bottom of this
+        // function, once a frame has actually been drawn.
         let attrs = WindowAttributes::new("SphereGraphicEngine — Compressor")
             .with_inner_size(size(px(1180.0), px(720.0)))
-            .with_min_inner_size(size(px(640.0), px(420.0)));
+            .with_min_inner_size(size(px(640.0), px(420.0)))
+            .with_visible(false);
         let window = match cx.create_window(&attrs) {
             Ok(w) => w,
             Err(e) => {
@@ -554,8 +559,10 @@ impl AppHandler for Demo {
         ));
         match surface {
             Ok(s) => {
+                let t = s.init_timing();
                 println!("adapter: {}", s.adapter_name());
                 println!("scale factor: {}", window.scale_factor().get());
+                println!("init: gpu {:.0} ms, fonts {:.0} ms", t.gpu_ms, t.fonts_ms);
                 self.surface = Some(s);
             }
             Err(e) => {
@@ -568,6 +575,23 @@ impl AppHandler for Demo {
         // The meters must show every audio buffer, so the loop runs free rather
         // than sleeping until the next input event.
         cx.scheduler_mut().begin_realtime();
+
+        // Paint before the window is mapped, so the first thing the compositor
+        // is ever handed is a finished frame.
+        let first = std::time::Instant::now();
+        self.draw();
+        let first_ms = first.elapsed().as_secs_f32() * 1000.0;
+
+        if let Some(window) = self.window.as_ref() {
+            if !self.surface.as_ref().is_some_and(SphereSurface::has_presented) {
+                // Reveal anyway: a surface that is not ready at start-up
+                // recovers on the next redraw, an invisible application does not.
+                eprintln!("first frame did not present; showing the window regardless");
+            }
+            window.set_visible(true);
+            window.request_redraw();
+            println!("first frame: {first_ms:.0} ms");
+        }
     }
 
     fn window_event(&mut self, cx: &mut AppContext<'_>, _id: WindowId, event: WindowEvent) {

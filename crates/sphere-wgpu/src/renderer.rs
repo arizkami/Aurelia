@@ -56,6 +56,12 @@ struct CompositeUniforms {
 struct LayerTarget {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+    /// The multisampled attachment, when MSAA is on.
+    ///
+    /// A layer is sampled after it is drawn, and a multisampled texture cannot
+    /// be sampled, so the layer needs both: render into `msaa`, resolve into
+    /// `texture`, sample `texture`.
+    msaa: Option<(wgpu::Texture, wgpu::TextureView)>,
     size: (u32, u32),
     /// Frame index this target was last used on, so stale sizes can be reaped.
     last_used: u64,
@@ -98,6 +104,10 @@ pub struct WgpuRenderer {
 
     layer_pool: Vec<LayerTarget>,
     linear_sampler: wgpu::Sampler,
+    /// Active multisample count. `1` means MSAA is off.
+    samples: u32,
+    /// The multisampled colour attachment for the surface, and its size.
+    surface_msaa: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
 
     frame_index: u64,
     /// Scratch, reused each frame so a resize does not allocate.
@@ -119,6 +129,7 @@ impl WgpuRenderer {
         present: PresentPreference,
         vsync: VsyncMode,
         transparent: bool,
+        msaa_samples: u32,
     ) -> Result<Self, InitError>
     where
         W: wgpu::WasmNotSendSync
@@ -199,12 +210,40 @@ impl WgpuRenderer {
         let limits = device.limits();
         let uniform_alignment = limits.min_uniform_buffer_offset_alignment.max(16) as u64;
 
+        // A pipeline is bound to one sample count, and a layer has to resolve
+        // into a sampleable texture, so the surface and every layer share one
+        // count. It is chosen once, from what both formats actually support.
+        let surface_flags = adapter.get_texture_format_features(format).flags;
+        let layer_flags = adapter.get_texture_format_features(LAYER_FORMAT).flags;
+        let max_msaa = [16u32, 8, 4, 2]
+            .into_iter()
+            .find(|n| {
+                surface_flags.sample_count_supported(*n) && layer_flags.sample_count_supported(*n)
+            })
+            .unwrap_or(1);
+        let samples = if msaa_samples <= 1 {
+            1
+        } else {
+            // Round the request down to something supported rather than
+            // failing: a machine that cannot do 4x should still open a window.
+            [16u32, 8, 4, 2].into_iter().find(|n| *n <= msaa_samples && *n <= max_msaa).unwrap_or(1)
+        };
+        if samples != msaa_samples.max(1) {
+            tracing::info!(
+                target: "sphere_wgpu",
+                requested = msaa_samples,
+                using = samples,
+                "multisample count reduced to what the adapter supports"
+            );
+        }
+
         let capabilities = BackendCapabilities {
             max_texture_size: limits.max_texture_dimension_2d,
             timestamp_queries: timestamps,
             offscreen_targets: true,
             compute: limits.max_compute_workgroup_size_x > 0,
             max_instances_per_draw: u32::MAX,
+            max_msaa_samples: max_msaa,
         };
 
         let linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -294,6 +333,8 @@ impl WgpuRenderer {
             frame_bind_dirty: true,
             layer_pool: Vec::new(),
             linear_sampler,
+            samples,
+            surface_msaa: None,
             frame_index: 0,
             pending_view: None,
             pending_surface: None,
@@ -462,6 +503,54 @@ impl WgpuRenderer {
         self.frame_bind_dirty = false;
     }
 
+    /// The multisample count actually in use. `1` means MSAA is off.
+    #[inline]
+    pub fn sample_count(&self) -> u32 {
+        self.samples
+    }
+
+    /// Creates a multisampled colour attachment.
+    fn create_msaa(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+        samples: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sphere.msaa"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: samples,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            // Never TEXTURE_BINDING: a multisampled texture cannot be sampled,
+            // which is exactly why it resolves into a separate one.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
+    }
+
+    /// Ensures the surface's multisampled attachment matches the current size.
+    fn ensure_surface_msaa(&mut self) {
+        if self.samples <= 1 {
+            self.surface_msaa = None;
+            return;
+        }
+        let (w, h) = (self.surface_config.width, self.surface_config.height);
+        if self.surface_msaa.as_ref().is_some_and(|(_, _, size)| *size == (w, h)) {
+            return;
+        }
+        if let Some((old, _, _)) = self.surface_msaa.take() {
+            old.destroy();
+        }
+        let (texture, view) =
+            Self::create_msaa(&self.device, self.surface_config.format, w, h, self.samples);
+        self.surface_msaa = Some((texture, view, (w, h)));
+    }
+
     /// Acquires an offscreen target of the requested size from the pool.
     fn acquire_layer(&mut self, width: u32, height: u32) -> usize {
         let (w, h) = (width.max(1), height.max(1));
@@ -482,9 +571,12 @@ impl WgpuRenderer {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let msaa = (self.samples > 1)
+            .then(|| Self::create_msaa(&self.device, LAYER_FORMAT, w, h, self.samples));
         self.layer_pool.push(LayerTarget {
             texture,
             view,
+            msaa,
             size: (w, h),
             last_used: self.frame_index,
         });
@@ -505,6 +597,9 @@ impl WgpuRenderer {
             if current.saturating_sub(self.layer_pool[i].last_used) >= KEEP_FOR_FRAMES {
                 let t = self.layer_pool.swap_remove(i);
                 t.texture.destroy();
+                if let Some((msaa, _)) = t.msaa {
+                    msaa.destroy();
+                }
             } else {
                 i += 1;
             }
@@ -579,6 +674,7 @@ impl RendererBackend for WgpuRenderer {
         self.surface_config.alpha_mode = caps_alpha;
         self.surface_config.desired_maximum_frame_latency = config.present.max_frame_latency();
         self.surface.configure(&self.device, &self.surface_config);
+        self.ensure_surface_msaa();
         Ok(())
     }
 
@@ -646,6 +742,8 @@ impl RendererBackend for WgpuRenderer {
         }
 
         let surface_format = self.surface_config.format;
+        let samples = self.samples;
+        self.ensure_surface_msaa();
         let pass_stride =
             align_up(core::mem::size_of::<PassUniforms>() as u64, self.uniform_alignment) as u32;
         let composite_stride =
@@ -664,15 +762,26 @@ impl RendererBackend for WgpuRenderer {
         // window does not show uninitialised memory.
         let passes: Vec<&Pass> = compiled.passes.iter().collect();
         if passes.is_empty() {
+            let (attach, resolve) = match self.surface_msaa.as_ref() {
+                Some((_, msaa_view, _)) => (msaa_view, Some(&surface_view)),
+                None => (&surface_view, None),
+            };
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("sphere.clear_only"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &surface_view,
+                    view: attach,
                     depth_slice: None,
-                    resolve_target: None,
+                    resolve_target: resolve,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(to_wgpu_color(clear)),
-                        store: wgpu::StoreOp::Store,
+                        // The multisampled attachment is transient: it exists
+                        // only to be resolved, so discarding it saves the
+                        // write-back of a 4x buffer every frame.
+                        store: if samples > 1 {
+                            wgpu::StoreOp::Discard
+                        } else {
+                            wgpu::StoreOp::Store
+                        },
                     },
                 })],
                 depth_stencil_attachment: None,
@@ -700,22 +809,32 @@ impl RendererBackend for WgpuRenderer {
                 if let Some(batch) = compiled.batches.get(bi as usize) {
                     let kind = pipeline_kind_for(batch);
                     self.pipelines
-                        .get(&self.device, PipelineKey { kind, format })
+                        .get(&self.device, PipelineKey { kind, format, samples })
                         .map_err(RenderError::Shader)?;
                 }
             }
             if pass.composite.is_some() {
                 self.pipelines
-                    .get(&self.device, PipelineKey { kind: PipelineKind::Composite, format })
+                    .get(
+                        &self.device,
+                        PipelineKey { kind: PipelineKind::Composite, format, samples },
+                    )
                     .map_err(RenderError::Shader)?;
             }
 
             {
-                let view = if is_surface {
-                    &surface_view
+                let (attach, resolve) = if is_surface {
+                    match self.surface_msaa.as_ref() {
+                        Some((_, msaa_view, _)) => (msaa_view, Some(&surface_view)),
+                        None => (&surface_view, None),
+                    }
                 } else {
                     let slot = layer_slots[pass.target as usize].expect("offscreen slot");
-                    &self.layer_pool[slot].view
+                    let target = &self.layer_pool[slot];
+                    match target.msaa.as_ref() {
+                        Some((_, msaa_view)) => (msaa_view, Some(&target.view)),
+                        None => (&target.view, None),
+                    }
                 };
 
                 let load = if pass.clear {
@@ -729,13 +848,22 @@ impl RendererBackend for WgpuRenderer {
                     wgpu::LoadOp::Load
                 };
 
+                // A pass resumed after a nested layer must reload what it
+                // already drew, and a multisampled attachment that was
+                // discarded has nothing to reload — so a resumed pass keeps its
+                // samples rather than discarding them.
+                let store = if samples > 1 && pass.composite.is_none() && pass.clear {
+                    wgpu::StoreOp::Discard
+                } else {
+                    wgpu::StoreOp::Store
+                };
                 let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("sphere.pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view,
+                        view: attach,
                         depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+                        resolve_target: resolve,
+                        ops: wgpu::Operations { load, store },
                     })],
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
@@ -756,7 +884,7 @@ impl RendererBackend for WgpuRenderer {
                     let kind = pipeline_kind_for(batch);
                     let pipeline = self
                         .pipelines
-                        .get(&self.device, PipelineKey { kind, format })
+                        .get(&self.device, PipelineKey { kind, format, samples })
                         .expect("pipeline was precompiled above");
                     if last_kind != Some(kind) {
                         rp.set_pipeline(pipeline);
@@ -856,15 +984,22 @@ impl RendererBackend for WgpuRenderer {
                     .pipelines
                     .get(
                         &self.device,
-                        PipelineKey { kind: PipelineKind::Composite, format: dest_format },
+                        PipelineKey { kind: PipelineKind::Composite, format: dest_format, samples },
                     )
                     .map_err(RenderError::Shader)?;
 
-                let dest_view = if dest_is_surface {
-                    &surface_view
+                let (dest_attach, dest_resolve) = if dest_is_surface {
+                    match self.surface_msaa.as_ref() {
+                        Some((_, msaa_view, _)) => (msaa_view, Some(&surface_view)),
+                        None => (&surface_view, None),
+                    }
                 } else {
                     let slot = layer_slots[c.destination as usize].expect("composite destination");
-                    &self.layer_pool[slot].view
+                    let target = &self.layer_pool[slot];
+                    match target.msaa.as_ref() {
+                        Some((_, msaa_view)) => (msaa_view, Some(&target.view)),
+                        None => (&target.view, None),
+                    }
                 };
 
                 // Find which pass writes the destination next so the dynamic
@@ -875,9 +1010,9 @@ impl RendererBackend for WgpuRenderer {
                 let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("sphere.composite"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: dest_view,
+                        view: dest_attach,
                         depth_slice: None,
-                        resolve_target: None,
+                        resolve_target: dest_resolve,
                         ops: wgpu::Operations {
                             // Never clear: the destination already holds the
                             // content this layer composites on top of.

@@ -69,7 +69,7 @@
 
 pub mod surface;
 
-pub use surface::{SphereSurface, SurfaceOptions, SurfaceStats};
+pub use surface::{InitTiming, SphereSurface, SurfaceOptions, SurfaceStats};
 
 /// Realtime audio visualisation and the lock-free audio-thread boundary.
 pub use sphere_audio_ui as audio;

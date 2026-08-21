@@ -50,6 +50,11 @@ or ring buffer. Everything on the far side of it — allocation, GPU upload, tex
 is forbidden on the audio callback, and the architecture documents say so in the place you would
 look before breaking it.
 
+**Vector paths are antialiased too.** Rectangles, rounded rectangles and glyphs are smoothed
+analytically by their own shaders. A tessellated path has no analytic edge at all, so the surface
+and every offscreen layer are multisampled 4× — that is what keeps SVG icons, EQ curves and waveform
+outlines from looking jagged.
+
 **Colour is linear, and that is not optional.** `Color` is sRGB with straight alpha; `LinearColor`
 is linear-light and premultiplied and is what reaches the GPU. Mixing happens in linear space, so a
 black-to-white midpoint is the perceptually correct `0.735`, not a naive `0.5`.
@@ -112,7 +117,7 @@ Measured on an NVIDIA GTX 1060 (Vulkan), running
 
 | | |
 |---|---|
-| Tests | 972 unit + 10 doc, zero warnings, clippy clean |
+| Tests | 1,020 total, zero warnings, clippy clean, `cargo fmt` clean |
 | Quad instances per frame | 10,018 |
 | Glyph instances per frame | 178 (Latin, Thai, Japanese, Chinese, Korean, Arabic) |
 | Mesh triangles per frame | 1,980 |
@@ -122,6 +127,25 @@ Measured on an NVIDIA GTX 1060 (Vulkan), running
 | CPU per frame | 1.1 ms typical, 2.2 ms worst |
 
 The zero is the point. See [`docs/architecture.md`](docs/architecture.md).
+
+## Examples
+
+```bash
+cargo run -p sphere --example desktop_app   --release   # a conventional settings window
+cargo run -p sphere --example plugin_ui_demo --release   # a compressor plug-in editor
+
+# Diagnostic: writes a side-by-side PNG of one line of text under both glyph
+# quad rules, and prints the ink-to-quad ratio per glyph.
+cargo run -p sphere-text --example glyph_quad_probe --release -- out.png
+```
+
+`desktop_app` is the shape most applications are: header, sidebar, scrolling settings pane, status
+bar, runtime theme switching, SVG icons and keyboard navigation. `plugin_ui_demo` is the audio case:
+ten thousand instanced rectangles, multilingual text, and meters driven from a simulated audio
+thread through the lock-free boundary.
+
+Both accept `SPHERE_DEMO_FRAMES=<n>` to run for a bounded number of frames and print what they
+measured, which makes them usable as smoke tests.
 
 ## Documentation
 
@@ -138,4 +162,4 @@ The zero is the point. See [`docs/architecture.md`](docs/architecture.md).
 
 ## Licence
 
-Dual-licensed under Apache 2.0 or MIT, at your option.
+BSD 3-Clause. Copyright (c) 2026 Futureboard Digital Technologies. See [`LICENSE`](LICENSE).

@@ -192,9 +192,35 @@ than silently miscolouring a frame.
 
 ### Antialiasing
 
-`coverage_from_distance` divides the signed distance by `fwidth(d)`. A fixed threshold would break
-the moment a shape is scaled or zoomed; `fwidth` measures how much the distance changes across one
-actual pixel, so the antialiasing band is always exactly one pixel wide regardless of transform.
+There are two mechanisms, because there are two kinds of edge.
+
+**Analytic, for the shapes with an equation.** `coverage_from_distance` divides the signed distance
+by `fwidth(d)`. A fixed threshold would break the moment a shape is scaled or zoomed; `fwidth`
+measures how much the distance changes across one actual pixel, so the antialiasing band is always
+exactly one pixel wide regardless of transform. Rectangles, rounded rectangles, borders, circles,
+shadows and glyphs all take this path and are smooth at any size for free.
+
+**Multisampling, for the shapes without one.** A tessellated path is a bag of triangles and has no
+analytic edge at all — nothing in the fragment shader knows where the outline was. Those edges are
+therefore *hard*, and an icon, a curve or a waveform outline is visibly jagged without help.
+
+So the surface and every offscreen layer are multisampled, 4× by default
+([`SurfaceConfig::msaa_samples`]). The count is chosen once at startup from what the surface format
+*and* the layer format both support, and rounds down rather than failing — a machine that cannot do
+4× still opens a window.
+
+Three details worth stating:
+
+- A pipeline is bound to one sample count, so the count is part of the pipeline cache key. The GPU
+  test builds every pipeline at both 1× and 4× so a mismatch cannot ship.
+- A multisampled texture cannot be sampled, which is why a layer allocates *two* textures: render
+  into the multisampled one, resolve into the plain one, sample that.
+- The multisampled attachment is transient. A pass that clears and does not need to be resumed
+  stores `Discard`, so the 4× buffer is never written back to memory. A pass resumed after a nested
+  layer keeps its samples, because a discarded attachment has nothing to reload.
+
+`alpha_to_coverage` is deliberately **off**: it would quantise every translucent primitive to the
+sample count, which is far worse than the analytic alpha the shaders already produce.
 
 ### Box shadows
 

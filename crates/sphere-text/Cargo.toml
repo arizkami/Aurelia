@@ -23,3 +23,6 @@ rustc-hash.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytemuck.workspace = true
+
+[dev-dependencies]
+image.workspace = true

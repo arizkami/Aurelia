@@ -370,10 +370,11 @@ impl UiTree {
         // while the engine holds the layout tree.
         let built = &mut self.built;
         let index_for_node = &self.index_for_node;
+        let theme = &self.theme;
         let mut measure = |request: sphere_layout::MeasureRequest<'_>| -> Size<Px> {
             let Some(index) = index_for_node.get(&request.node) else { return Size::ZERO };
             let Some(node) = built.get_mut(*index) else { return Size::ZERO };
-            node.element.measure(&request, text).unwrap_or(Size::ZERO)
+            node.element.measure(&request, text, theme).unwrap_or(Size::ZERO)
         };
         self.engine.compute_with_measure(&mut self.layout, viewport, &mut measure)?;
         self.stats.nodes_laid_out = self.engine.stats().nodes_laid_out as u32;

@@ -137,6 +137,14 @@ pub struct GlyphInstance {
     pub px_range: f32,
     /// Outline half-width in distance-field units.
     pub outline_width: f32,
+    /// Exponent applied to coverage; see [`crate::GlyphRun::coverage_gamma`].
+    pub coverage_gamma: f32,
+    /// Reserved float, keeping the four `u32`s below contiguous.
+    ///
+    /// The vertex layout reads the floats as one `vec4` and the indices as one
+    /// `vec4<u32>`; interleaving them would mean a `u32` arriving in the shader
+    /// reinterpreted as a float.
+    pub _pad_f: f32,
     /// Bit set from [`glyph_flags`].
     pub flags: u32,
     /// Which atlas page to sample.
@@ -145,8 +153,6 @@ pub struct GlyphInstance {
     pub transform_index: u32,
     /// Index into the frame's clip table.
     pub clip_index: u32,
-    /// Reserved, keeps the struct at a 16-byte multiple.
-    pub _pad: [u32; 2],
 }
 
 const _: () = assert!(core::mem::size_of::<GlyphInstance>() == 96);
