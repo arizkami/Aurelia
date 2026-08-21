@@ -814,7 +814,7 @@ impl Element for CaptionButton {
             colour,
             sphere::render::TextRasterMode::Auto,
             (Px::ZERO, Color::TRANSPARENT),
-            sphere::render::coverage_gamma_for(colour, background),
+            sphere::render::coverage_contrast_for(colour, background),
         );
     }
 

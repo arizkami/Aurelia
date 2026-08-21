@@ -340,7 +340,7 @@ impl Element for TextField {
                     c.text_muted,
                     TextRasterMode::Auto,
                     (Px::ZERO, Color::TRANSPARENT),
-                    sphere_render::coverage_gamma_for(c.text_muted, c.background),
+                    sphere_render::coverage_contrast_for(c.text_muted, c.background),
                 );
             }
             if cx.state.focused && !self.disabled {
@@ -382,7 +382,7 @@ impl Element for TextField {
             if self.disabled { c.text_muted } else { c.text },
             TextRasterMode::Auto,
             (Px::ZERO, Color::TRANSPARENT),
-            sphere_render::coverage_gamma_for(
+            sphere_render::coverage_contrast_for(
                 if self.disabled { c.text_muted } else { c.text },
                 c.background,
             ),

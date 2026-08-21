@@ -288,6 +288,17 @@ pub struct FontDatabase {
     /// Memoised fallback decisions, including negative ones so that a codepoint
     /// no installed font covers is only searched for once.
     fallbacks: FxHashMap<FallbackKey, Option<FontId>>,
+    /// Memoised grid-fitting zones, including negative results.
+    ///
+    /// Reading them costs 5 to 12 microseconds — seventeen glyph lookups plus
+    /// two `OS/2` reads, measured on this machine — and a glyph rasterisation
+    /// would otherwise pay it every time. That is invisible for a screen of
+    /// text, and it is tens of milliseconds across a long document, so it is
+    /// memoised rather than argued about.
+    ///
+    /// Survives `invalidate_matching` for the same reason `coverage` does: it
+    /// is a property of bytes already loaded, and those cannot change.
+    zones: FxHashMap<FontId, Option<crate::hint::VerticalZones>>,
 }
 
 impl Default for FontDatabase {
@@ -329,6 +340,7 @@ impl FontDatabase {
             exact: FxHashMap::default(),
             coverage: FxHashMap::default(),
             fallbacks: FxHashMap::default(),
+            zones: FxHashMap::default(),
         }
     }
 
@@ -489,6 +501,20 @@ impl FontDatabase {
     /// particular face is 1000 or 2048 units per em.
     pub fn face_metrics(&self, font: FontId) -> Option<FontMetrics> {
         self.faces.get(font).map(|e| e.metrics)
+    }
+
+    /// The vertical grid-fitting zones for a face, measured once.
+    ///
+    /// `None` means the face carries no usable `OS/2` metrics and must not be
+    /// fitted; see [`crate::hint::VerticalZones::from_face`].
+    pub fn vertical_zones(&mut self, font: FontId) -> Option<crate::hint::VerticalZones> {
+        if let Some(cached) = self.zones.get(&font) {
+            return *cached;
+        }
+        let measured =
+            self.with_face(font, |face| crate::hint::VerticalZones::from_face(face)).flatten();
+        self.zones.insert(font, measured);
+        measured
     }
 
     /// The face's primary family name.

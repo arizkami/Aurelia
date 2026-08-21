@@ -74,9 +74,9 @@ pub use primitives::{
     QuadInstance, glyph_flags, gradient_kind, quad_flags,
 };
 pub use scene::{
-    Clip, ClipKind, DEFAULT_COVERAGE_GAMMA, DrawCommand, Filter, GlyphRun,
-    LIGHT_MODE_COVERAGE_GAMMA, Layer, Mesh, MeshVertex, PositionedGlyph, QuadCommand, Scene,
-    SceneIndex, SceneStats, TextRasterMode, coverage_gamma_for,
+    Clip, ClipKind, DrawCommand, FULL_COVERAGE_CONTRAST, Filter, GlyphRun, Layer, Mesh, MeshVertex,
+    PositionedGlyph, QuadCommand, Scene, SceneIndex, SceneStats, TextRasterMode,
+    alpha_from_coverage, coverage_contrast_for,
 };
 pub use tessellate::{TessellationError, TessellationOptions, Tessellator};
 

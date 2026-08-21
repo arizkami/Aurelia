@@ -17,20 +17,35 @@ const CLIP_ROUNDED: u32 = 4u;
 @group(1) @binding(0) var glyph_atlas: texture_2d<f32>;
 @group(1) @binding(1) var glyph_sampler: sampler;
 
-/// Applies the perceptual coverage correction.
+/// Bends the coverage ramp so the linear blend and the sRGB encode downstream
+/// reproduce a gamma-space blend.
 ///
-/// Coverage is a geometric fraction, and compositing it in linear light — which
-/// is physically right and what every other primitive here does — makes
-/// light-on-dark text bloom: half coverage of white on black is linear 0.5,
-/// which is sRGB 0.735, visibly heavier than a gamma-space rasteriser would
-/// produce. An exponent above one pulls the midtones back and restores the
-/// intended stroke weight. See `GlyphRun::coverage_gamma` for why this is a
-/// knob and not a constant.
-fn apply_coverage_gamma(coverage: f32, gamma: f32) -> f32 {
-    if (abs(gamma - 1.0) < 0.001) {
-        return coverage;
+/// Coverage is a geometric fraction of a pixel. Sphere blends in linear light,
+/// which is right for every other primitive and wrong for this one: half
+/// coverage of white on black lands in the buffer as linear 0.5, which the sRGB
+/// surface shows as 0.735. The grey pixel beside a stem comes out nearly as
+/// bright as the stem, and a one-pixel edge reads as a two-pixel glow. That glow
+/// is what soft text is.
+///
+/// `contrast` carries both the strength and the direction, because the two
+/// directions need mirrored curves rather than reciprocal exponents — the blend
+/// is linear in the *destination*, so it is always the end of the ramp nearest
+/// the background that has to bend. See `GlyphRun::coverage_contrast`, and
+/// `sphere_render::scene::alpha_from_coverage`, which is this function on the
+/// CPU and must not drift from it.
+fn apply_coverage_contrast(coverage: f32, contrast: f32) -> f32 {
+    let c = clamp(coverage, 0.0, 1.0);
+    let k = abs(contrast);
+    if (k <= 1.0) {
+        return c;
     }
-    return pow(clamp(coverage, 0.0, 1.0), gamma);
+    if (contrast > 0.0) {
+        // Light text on dark: steepen the low end, which is the end that the
+        // encode lifts.
+        return pow(c, k);
+    }
+    // Dark text on light: the mirror image, steepening the high end.
+    return 1.0 - pow(1.0 - c, k);
 }
 
 struct GlyphIn {
@@ -42,7 +57,7 @@ struct GlyphIn {
     @location(2) color: vec4<f32>,
     /// Linear premultiplied outline colour.
     @location(3) outline_color: vec4<f32>,
-    /// `[px_range, outline_width, coverage_gamma, unused]`.
+    /// `[px_range, outline_width, coverage_contrast, unused]`.
     @location(4) params: vec4<f32>,
     /// `[flags, atlas_page, transform_index, clip_index]`.
     @location(5) indices: vec4<u32>,
@@ -54,7 +69,7 @@ struct GlyphOut {
     @location(1) world: vec2<f32>,
     @location(2) @interpolate(flat) color: vec4<f32>,
     @location(3) @interpolate(flat) outline_color: vec4<f32>,
-    /// `[screen_px_range, outline_width, coverage_gamma, unused]`.
+    /// `[screen_px_range, outline_width, coverage_contrast, unused]`.
     @location(4) @interpolate(flat) params: vec4<f32>,
     @location(5) @interpolate(flat) indices: vec4<u32>,
 }
@@ -91,15 +106,15 @@ fn fs_main(in: GlyphOut) -> @location(0) vec4<f32> {
     if ((flags & BITMAP) != 0u) {
         // The bitmap fallback stores coverage in red. It is already
         // size-specific, so it needs no distance reconstruction at all — but it
-        // wants the same perceptual correction the field path gets.
-        return in.color * apply_coverage_gamma(sample.r, in.params.z) * clip;
+        // wants the same blend-space correction the field path gets.
+        return in.color * apply_coverage_contrast(sample.r, in.params.z) * clip;
     }
 
     // Median of the three channels reconstructs the true signed distance while
     // preserving the sharp corners that a single-channel field rounds off.
     let sd = median3(sample.r, sample.g, sample.b) - 0.5;
     let screen_range = in.params.x;
-    let fill_alpha = apply_coverage_gamma(clamp(sd * screen_range + 0.5, 0.0, 1.0), in.params.z);
+    let fill_alpha = apply_coverage_contrast(clamp(sd * screen_range + 0.5, 0.0, 1.0), in.params.z);
 
     if ((flags & OUTLINE) != 0u) {
         // The alpha channel carries the *true* distance, which is what makes a
@@ -109,8 +124,19 @@ fn fs_main(in: GlyphOut) -> @location(0) vec4<f32> {
         // The outline width is authored in logical pixels; convert into the
         // same normalised distance units the field uses.
         let half_width = in.params.y * 0.5 * screen_range;
-        let outline_alpha = clamp(true_sd * screen_range + 0.5 + half_width, 0.0, 1.0);
-        // Fill over outline, both premultiplied.
+        // Corrected on the same curve as the fill, and for the same reason the
+        // ring below is a difference of two alphas: subtracting a bent value
+        // from a raw one is not a coverage at all, and it shows up as the
+        // outline colour bleeding inside the glyph's own edge. Both ends of the
+        // subtraction have to sit on one scale. The fill's exponent is reused
+        // rather than derived for the outline colour, because there is one
+        // parameter and the ring is at most a couple of pixels wide.
+        let outline_alpha = apply_coverage_contrast(
+            clamp(true_sd * screen_range + 0.5 + half_width, 0.0, 1.0),
+            in.params.z,
+        );
+        // Fill over outline, both premultiplied. The correction is monotonic, so
+        // the ring stays non-negative wherever it was before.
         let outline = in.outline_color * max(outline_alpha - fill_alpha, 0.0);
         let fill = in.color * fill_alpha;
         return (fill + outline * (1.0 - in.color.a * fill_alpha)) * clip;

@@ -278,6 +278,13 @@ struct OpenTarget {
     layer: SceneIndex,
     /// Where the parent's pass should resume from.
     parent_target: u32,
+    /// The layer's bounds snapped to the device grid, in logical pixels.
+    ///
+    /// Both the target's origin and the composite's destination come from this
+    /// rather than from `Layer::bounds`, so the offscreen texture's texel (0, 0)
+    /// is a whole device pixel and the blit back is one texel to one pixel. See
+    /// [`BatchCompiler::begin_layer`].
+    snapped: Rect<Px>,
 }
 
 #[derive(Clone, Debug)]
@@ -467,16 +474,33 @@ impl BatchCompiler {
             DevicePx(h.min(max_h.saturating_mul(2)) as i32),
         );
 
+        // The target's origin is what every vertex stage subtracts, so it has to
+        // name the texture's texel (0, 0) — which `round_out` put on a whole
+        // device pixel. Handing over `layer.bounds.origin` instead leaves a
+        // fractional offset in the subtraction, and that offset lands on the one
+        // thing in this compiler that depends on absolute device coordinates:
+        // `snap_glyph_quad` rounds a glyph to the device grid knowing nothing
+        // about which target it is bound for, so inside a layer every bitmap
+        // glyph would sit `frac(origin * scale)` off its texel and go through the
+        // atlas's linear sampler as a genuine bilinear blur. The size is derived
+        // the same way for the same reason: the composite has to be a unit-scale
+        // blit or the layer is resampled on the way out.
+        //
+        // From `size` and not `device.size`, because the clamp above can shrink
+        // an oversized layer, and describing the destination with the unclamped
+        // rect would stretch the texture across it.
+        let inv = 1.0 / scale.get();
+        let snapped = Rect::new(
+            Point::new(Px(device.origin.x.0 as f32 * inv), Px(device.origin.y.0 as f32 * inv)),
+            Size::new(Px(size.width.0 as f32 * inv), Px(size.height.0 as f32 * inv)),
+        );
+
         let parent_target = self.target_stack.last().map(|t| t.target).unwrap_or(0);
-        self.frame.targets.push(RenderTarget {
-            is_surface: false,
-            size,
-            origin: layer.bounds.origin,
-        });
+        self.frame.targets.push(RenderTarget { is_surface: false, size, origin: snapped.origin });
         let target = (self.frame.targets.len() - 1) as u32;
 
         self.close_pass(parent_target, None);
-        self.target_stack.push(OpenTarget { target, layer: layer_index, parent_target });
+        self.target_stack.push(OpenTarget { target, layer: layer_index, parent_target, snapped });
     }
 
     fn end_layer(&mut self, scene: &Scene) {
@@ -496,7 +520,10 @@ impl BatchCompiler {
             Some(Composite {
                 source: open.target,
                 destination: open.parent_target,
-                bounds: layer.bounds,
+                // The snapped rect, not `layer.bounds`: it is exactly as large
+                // as the texture that was allocated, so the blit is one texel to
+                // one pixel and nothing inside the layer is resampled.
+                bounds: open.snapped,
                 opacity: layer.opacity,
                 blend: layer.blend,
                 filter: layer.filter,
@@ -837,10 +864,13 @@ impl BatchCompiler {
                 // what lets one batch mix sizes and still antialias correctly.
                 px_range: (p.range_em * size * scale).max(1e-3),
                 outline_width: run.outline_width.get(),
-                // A non-finite or non-positive exponent would make `pow` in the
-                // shader produce NaN coverage, which shows as a black block.
-                coverage_gamma: if run.coverage_gamma.is_finite() && run.coverage_gamma > 0.0 {
-                    run.coverage_gamma
+                // A non-finite exponent would make `pow` in the shader produce
+                // NaN coverage, which shows as a black block. The sign is
+                // meaningful here — it picks which end of the ramp bends — so
+                // only the magnitude is clamped, and a magnitude below one is
+                // the shader's own no-op.
+                coverage_contrast: if run.coverage_contrast.is_finite() {
+                    run.coverage_contrast.clamp(-8.0, 8.0)
                 } else {
                     1.0
                 },
@@ -1348,6 +1378,72 @@ mod tests {
         assert_eq!(f.passes.iter().filter(|p| p.target == 0 && p.clear).count(), 1);
     }
 
+    /// A layer's coordinate space has to sit on the device grid, because
+    /// `snap_glyph_quad` rounds glyphs in absolute device coordinates and knows
+    /// nothing about which target they will land in. A fractional target origin
+    /// would shift every snapped glyph inside the layer off its texel and take
+    /// the whole bitmap path through the atlas's linear sampler.
+    #[test]
+    fn a_layers_origin_and_extent_land_on_whole_device_pixels() {
+        for (scale, origin, size) in
+            [(1.0f32, 10.25f32, 40.5f32), (1.5, 10.25, 40.5), (2.0, 7.3, 33.1), (1.25, 0.6, 100.9)]
+        {
+            let mut s = Scene::new(size2(px(800.0), px(600.0)), ScaleFactor::new(scale));
+            {
+                let mut c = Canvas::new(&mut s);
+                c.push_opacity_layer(rect(px(origin), px(origin), px(size), px(size)), 0.5);
+                c.fill_rect(rect(px(origin), px(origin), px(4.0), px(4.0)), Color::BLUE);
+                c.end_layer();
+            }
+            let f = compile(&s);
+            let target = f.targets[1];
+            let composite = f.passes.iter().find_map(|p| p.composite.as_ref()).expect("composite");
+
+            for (name, v) in
+                [("origin.x", target.origin.x.get()), ("origin.y", target.origin.y.get())]
+            {
+                let device = v * scale;
+                assert!(
+                    (device - device.round()).abs() < 1e-3,
+                    "scale {scale}: target {name} is {device} device px"
+                );
+            }
+
+            // And the destination is exactly the texture, so the blit is 1:1
+            // rather than a resample of a `round_out`-sized texture into a
+            // fractional rect.
+            let w = composite.bounds.width().get() * scale;
+            let h = composite.bounds.height().get() * scale;
+            assert!(
+                (w - target.size.width.get() as f32).abs() < 1e-3,
+                "scale {scale}: composite is {w} px wide for a {} px texture",
+                target.size.width.get()
+            );
+            assert!((h - target.size.height.get() as f32).abs() < 1e-3, "scale {scale}");
+            assert_eq!(composite.bounds.min_x(), target.origin.x);
+            assert_eq!(composite.bounds.min_y(), target.origin.y);
+        }
+    }
+
+    /// The clamp can shrink an oversized layer, and the composite has to follow
+    /// it — describing the destination with the unclamped rect would stretch the
+    /// texture across it.
+    #[test]
+    fn a_clamped_layer_still_composites_one_texel_to_one_pixel() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            c.push_opacity_layer(rect(px(0.0), px(0.0), px(500_000.0), px(500_000.0)), 0.5);
+            c.fill_rect(rect(px(0.0), px(0.0), px(10.0), px(10.0)), Color::RED);
+            c.end_layer();
+        }
+        let f = compile(&s);
+        let target = f.targets[1];
+        let composite = f.passes.iter().find_map(|p| p.composite.as_ref()).expect("composite");
+        assert_eq!(composite.bounds.width().get(), target.size.width.get() as f32);
+        assert_eq!(composite.bounds.height().get(), target.size.height.get() as f32);
+    }
+
     #[test]
     fn an_offscreen_target_is_capped_so_a_runaway_layer_cannot_allocate_gigabytes() {
         let mut s = scene();
@@ -1382,7 +1478,7 @@ mod tests {
                     raster: TextRasterMode::Mtsdf,
                     outline_width: Px::ZERO,
                     outline_color: Color::TRANSPARENT,
-                    coverage_gamma: crate::scene::DEFAULT_COVERAGE_GAMMA,
+                    coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
                 },
                 Color::WHITE,
             );
@@ -1446,7 +1542,7 @@ mod tests {
                     raster: TextRasterMode::Auto,
                     outline_width: Px::ZERO,
                     outline_color: Color::TRANSPARENT,
-                    coverage_gamma: crate::scene::DEFAULT_COVERAGE_GAMMA,
+                    coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
                 },
                 Color::WHITE,
             );
@@ -1488,7 +1584,7 @@ mod tests {
                     raster: TextRasterMode::Auto,
                     outline_width: Px::ZERO,
                     outline_color: Color::TRANSPARENT,
-                    coverage_gamma: crate::scene::DEFAULT_COVERAGE_GAMMA,
+                    coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
                 },
                 Color::WHITE,
             );
@@ -1548,7 +1644,7 @@ mod tests {
                     raster: TextRasterMode::Auto,
                     outline_width: Px::ZERO,
                     outline_color: Color::TRANSPARENT,
-                    coverage_gamma: crate::scene::DEFAULT_COVERAGE_GAMMA,
+                    coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
                 },
                 Color::WHITE,
             );
@@ -1616,7 +1712,7 @@ mod tests {
                     raster: TextRasterMode::Auto,
                     outline_width: Px::ZERO,
                     outline_color: Color::TRANSPARENT,
-                    coverage_gamma: crate::scene::DEFAULT_COVERAGE_GAMMA,
+                    coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
                 },
                 Color::WHITE,
             );
@@ -1646,7 +1742,7 @@ mod tests {
                     raster: TextRasterMode::Mtsdf,
                     outline_width: Px::ZERO,
                     outline_color: Color::TRANSPARENT,
-                    coverage_gamma: crate::scene::DEFAULT_COVERAGE_GAMMA,
+                    coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
                 },
                 Color::WHITE,
             );

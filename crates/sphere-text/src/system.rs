@@ -28,7 +28,9 @@ use crate::atlas::{AtlasConfig, AtlasStats, DirtyRegion, GlyphAtlas};
 use crate::cache::{CacheStats, ShapeCache};
 use crate::font::FontDatabase;
 use crate::mtsdf::{GlyphRasterConfig, generate_mtsdf};
-use crate::raster::{RasterStrategy, bitmap_size_px, choose_raster_strategy, rasterize_glyph};
+use crate::raster::{
+    RasterStrategy, bitmap_size_px, choose_raster_strategy, rasterize_glyph_with_zones,
+};
 use crate::types::{GlyphFormat, GlyphKey, TextLayout, TextStyle};
 use sphere_core::{FontId, GlyphId, Px, ScaleFactor};
 use sphere_render::{GlyphPlacement, GlyphProvider, GlyphRequest, TextRasterMode};
@@ -233,7 +235,10 @@ impl TextSystem {
                 self.fonts.with_outline_face(font, |face| generate_mtsdf(face, glyph, &raster))?
             }
             RasterStrategy::Bitmap => {
-                self.fonts.with_outline_face(font, |face| rasterize_glyph(face, glyph, size_px))?
+                let zones = self.fonts.vertical_zones(font);
+                self.fonts.with_outline_face(font, |face| {
+                    rasterize_glyph_with_zones(face, glyph, size_px, zones)
+                })?
             }
         }
         .ok()?;

@@ -15,7 +15,7 @@
 use smallvec::SmallVec;
 use sphere_core::{
     Affine, BlendMode, Color, Corners, FillRule, GlyphId, ImageId, LinearColor, Paint, Path, Point,
-    Px, Rect, RoundedRect, Size, Stroke, TextureId,
+    Px, Rect, RoundedRect, Size, Stroke, TextureId, linear_to_srgb, srgb_to_linear,
 };
 
 /// Index into a scene side table.
@@ -85,60 +85,120 @@ pub struct GlyphRun {
     pub outline_width: Px,
     /// Outline color, ignored when `outline_width` is zero.
     pub outline_color: Color,
-    /// Exponent applied to glyph coverage before compositing.
+    /// Signed exponent that steepens glyph coverage before compositing.
     ///
-    /// Antialiasing coverage is a geometric quantity, and blending it in linear
-    /// light — which is physically correct and what this engine does everywhere
-    /// else — makes light-on-dark text bloom and read as soft. Fifty per cent
-    /// coverage of white on black is linear 0.5, which is sRGB 0.735, noticeably
-    /// heavier than the 0.5 a traditional gamma-space rasteriser produces.
+    /// Antialiasing coverage is a geometric fraction of a pixel, and Sphere
+    /// blends it in linear light, because that is physically right and is what
+    /// every other primitive here needs. Text is the one primitive it is wrong
+    /// for. Half coverage of white on black is linear 0.5, which the surface
+    /// encodes as sRGB **0.735** — so the one grey pixel beside a stem comes out
+    /// nearly three quarters as bright as the stem itself, and a one-pixel edge
+    /// reads as a two-pixel glow. That glow is what "soft text" is, and it is
+    /// why every traditional rasteriser composites glyph coverage in gamma
+    /// space instead (egui goes as far as asking for a non-sRGB framebuffer so
+    /// its whole pipeline blends that way; see `docs/text.md`).
     ///
-    /// An exponent above 1.0 pulls the midtones back down and restores the
-    /// weight the rasteriser intended. This is a *perceptual* correction, not a
-    /// physical one, which is why it is a knob rather than a constant: dark text
-    /// on a light background wants the opposite adjustment, and text over an
-    /// image wants neither.
+    /// The correction is to bend the coverage ramp so that what lands on screen
+    /// *after* the linear blend and the sRGB encode is the ramp the rasteriser
+    /// meant. Which way it has to bend depends on which side of the background
+    /// the text sits:
     ///
-    /// [`DEFAULT_COVERAGE_GAMMA`] is a modest correction tuned for the
-    /// light-on-dark case that dominates this engine's target applications.
-    /// `1.0` disables it.
-    pub coverage_gamma: f32,
+    /// ```text
+    /// light text on dark:  alpha = coverage ^ k
+    /// dark text on light:  alpha = 1 - (1 - coverage) ^ k
+    /// ```
+    ///
+    /// Those are mirror images, not one formula with an exponent above and
+    /// below 1.0 — the blend is only linear in the *destination*, so the end of
+    /// the ramp that needs bending is the end nearest the background. A single
+    /// exponent applied in both directions cancels the error at one end and
+    /// doubles it at the other.
+    ///
+    /// This field carries both: `|value|` is `k` and its sign picks the branch,
+    /// positive for light-on-dark. `1.0` (or `-1.0`) disables the correction.
+    /// [`coverage_contrast_for`] works the value out from the two colours, which
+    /// is what callers should use.
+    pub coverage_contrast: f32,
 }
 
-/// The coverage exponent for light text on a dark background.
+/// The exponent that cancels the sRGB encode outright, for black against white.
 ///
-/// See [`GlyphRun::coverage_gamma`]. Prefer [`coverage_gamma_for`], which picks
-/// the right end of the range from the two colours involved.
-pub const DEFAULT_COVERAGE_GAMMA: f32 = 1.25;
+/// The surface is sRGB, whose transfer function is close enough to a 2.2 power
+/// that raising coverage to 2.2 before a linear blend reproduces a gamma-space
+/// blend to within a percent across the whole ramp; solving for the exponent
+/// exactly at the extreme pair gives 2.224.
+///
+/// It is documentation, not the interpolation endpoint: [`coverage_contrast_for`]
+/// solves the exponent from the two colours it is actually given, because how far
+/// a pair travels through the curved part of the encode depends on *where* on the
+/// ramp it sits and not only on how far apart the two ends are. Muted grey text
+/// on a dark ground needs nearly the full exponent even though its contrast is
+/// half that of white on black.
+pub const FULL_COVERAGE_CONTRAST: f32 = 2.2;
 
-/// The coverage exponent for dark text on a light background.
+/// The largest exponent [`coverage_contrast_for`] will return.
 ///
-/// Below 1.0, because the correction genuinely runs the other way. Linear-light
-/// blending makes light-on-dark text bloom, and it makes dark-on-light text
-/// *thin* by the same mechanism — the midtones land closer to the background
-/// than a gamma-space rasteriser would put them, so the strokes read as washed
-/// out rather than as heavy.
-pub const LIGHT_MODE_COVERAGE_GAMMA: f32 = 0.8;
+/// The solved exponent is unbounded as the two luminances converge from opposite
+/// sides of the encode's knee, and a runaway value there would turn a low
+/// contrast label into hard-edged aliasing. Three is above every real colour
+/// pair — the extreme black-on-white case solves to 2.224 — so the clamp only
+/// ever catches degenerate input.
+const MAX_COVERAGE_CONTRAST: f32 = 3.0;
 
-/// The coverage exponent for text of one colour drawn on another.
+/// The coverage correction for text of one colour drawn on another.
 ///
-/// [`GlyphRun::coverage_gamma`] has always documented that "dark text on a light
-/// background wants the opposite adjustment"; this is what works that out
-/// instead of leaving every caller to remember it. Applying the light-on-dark
-/// constant to a light theme does not merely fail to help — it applies the
-/// correction backwards and makes the text visibly thinner than it should be.
+/// See [`GlyphRun::coverage_contrast`] for what the number means. Positive for
+/// light-on-dark, negative for dark-on-light, `1.0` when there is no contrast to
+/// correct.
 ///
-/// Interpolates on relative luminance, so it is right for a dark label on a
-/// light card inside a dark theme, not only for whole-theme changes. Text on a
-/// background of the same luminance gets 1.0: there is no correction to make
-/// when there is no contrast to correct.
-pub fn coverage_gamma_for(text: Color, background: Color) -> f32 {
-    let delta = (text.luminance() - background.luminance()).clamp(-1.0, 1.0);
-    if delta >= 0.0 {
-        1.0 + delta * (DEFAULT_COVERAGE_GAMMA - 1.0)
-    } else {
-        1.0 + delta * (1.0 - LIGHT_MODE_COVERAGE_GAMMA)
+/// The exponent is *solved*, not interpolated: it is the one that puts half
+/// coverage where a gamma-space rasteriser would put it, for this exact pair of
+/// colours. Find the sRGB midpoint of the two, decode it, and read off the alpha
+/// that a linear blend needs in order to land there; the exponent follows.
+///
+/// A pair-independent ramp — `1 + |delta| * (k - 1)` — is the obvious thing to
+/// write and is wrong in the case that matters most. Muted grey text on a dark
+/// ground has roughly half the luminance contrast of white on black but sits
+/// almost entirely inside the steep part of the encode, so it needs nearly the
+/// same exponent; interpolating hands it half of one, and secondary labels stay
+/// soft while the primary ones come good.
+///
+/// Solving per pair also means it is right for a dark label on a light card
+/// inside a dark theme, not only for whole-theme changes.
+pub fn coverage_contrast_for(text: Color, background: Color) -> f32 {
+    let (ink, ground) = (text.luminance(), background.luminance());
+    let delta = ink - ground;
+    // Text the same brightness as its background has no ramp to correct, and
+    // dividing by that delta is what the guard is really for.
+    if delta.abs() < 1e-4 {
+        return 1.0;
     }
+
+    // Where a gamma-space rasteriser puts half coverage: halfway between the two
+    // in sRGB, expressed back in the linear light the blend actually works in.
+    let target = srgb_to_linear((linear_to_srgb(ink) + linear_to_srgb(ground)) * 0.5);
+    // The alpha a premultiplied linear blend needs to land there.
+    let half = ((target - ground) / delta).clamp(1e-4, 1.0 - 1e-4);
+
+    // Invert whichever branch of `alpha_from_coverage` this direction takes, at
+    // `coverage = 0.5`. Both reduce to a ratio of logarithms.
+    let bent = if delta > 0.0 { half } else { 1.0 - half };
+    let k = (bent.ln() / 0.5f32.ln()).clamp(1.0, MAX_COVERAGE_CONTRAST);
+    if delta > 0.0 { k } else { -k }
+}
+
+/// Applies [`GlyphRun::coverage_contrast`] on the CPU.
+///
+/// `text.wgsl` does exactly this on the GPU; anything that needs to predict what
+/// the shader will produce — the `glyph_quad_probe` example, tests — must call
+/// this rather than write the formula out a second time.
+pub fn alpha_from_coverage(coverage: f32, contrast: f32) -> f32 {
+    let c = coverage.clamp(0.0, 1.0);
+    let k = contrast.abs();
+    if !k.is_finite() || k <= 1.0 {
+        return c;
+    }
+    if contrast > 0.0 { c.powf(k) } else { 1.0 - (1.0 - c).powf(k) }
 }
 
 /// One glyph placed at a baseline-relative position.
@@ -564,32 +624,145 @@ mod tests {
 
     #[test]
     fn the_coverage_correction_reverses_between_light_and_dark_themes() {
-        // The bug this exists for: applying the light-on-dark constant to a
-        // light theme does not merely fail to help, it corrects backwards and
-        // makes dark text visibly thinner than the rasteriser intended.
-        let on_dark = coverage_gamma_for(Color::WHITE, Color::BLACK);
-        let on_light = coverage_gamma_for(Color::BLACK, Color::WHITE);
-        assert!(on_dark > 1.0, "light on dark must thin the strokes: {on_dark}");
-        assert!(on_light < 1.0, "dark on light must fatten them: {on_light}");
-        assert!((on_dark - DEFAULT_COVERAGE_GAMMA).abs() < 1e-4);
-        assert!((on_light - LIGHT_MODE_COVERAGE_GAMMA).abs() < 1e-4);
+        // The bug this exists for: applying the light-on-dark form to a light
+        // theme does not merely fail to help, it bends the ramp the wrong way
+        // and doubles the softness it was meant to remove.
+        let on_dark = coverage_contrast_for(Color::WHITE, Color::BLACK);
+        let on_light = coverage_contrast_for(Color::BLACK, Color::WHITE);
+        assert!(on_dark > 0.0, "light on dark takes the positive branch: {on_dark}");
+        assert!(on_light < 0.0, "dark on light takes the mirrored one: {on_light}");
+        // The extreme pair is symmetric, and lands on the constant the docs cite.
+        assert!((on_dark + on_light).abs() < 1e-3, "{on_dark} against {on_light}");
+        assert!((on_dark - FULL_COVERAGE_CONTRAST).abs() < 0.05, "{on_dark}");
     }
 
     #[test]
     fn text_with_no_contrast_gets_no_correction() {
         // There is nothing to correct when there is nothing to see, and a
         // nonzero correction there would be an arbitrary thinning.
-        let g = coverage_gamma_for(Color::WHITE, Color::WHITE);
-        assert!((g - 1.0).abs() < 1e-4, "{g}");
+        let g = coverage_contrast_for(Color::WHITE, Color::WHITE);
+        assert!((g.abs() - 1.0).abs() < 1e-4, "{g}");
+        assert!((alpha_from_coverage(0.5, g) - 0.5).abs() < 1e-4);
     }
 
     #[test]
-    fn the_correction_scales_with_contrast_rather_than_switching_at_a_threshold() {
+    fn the_correction_follows_the_colours_rather_than_switching_at_a_threshold() {
         // So a dark label on a light card inside a dark theme gets the right
         // answer, not the theme's answer.
-        let strong = coverage_gamma_for(Color::WHITE, Color::BLACK);
-        let weak = coverage_gamma_for(Color::WHITE, Color::hex(0x808080));
+        let strong = coverage_contrast_for(Color::WHITE, Color::BLACK);
+        let weak = coverage_contrast_for(Color::WHITE, Color::hex(0x808080));
         assert!(weak > 1.0 && weak < strong, "weak {weak}, strong {strong}");
+        // Dark on light mirrors, sign and all.
+        let dark_on_light = coverage_contrast_for(Color::BLACK, Color::hex(0x808080));
+        assert!(dark_on_light < -1.0, "{dark_on_light}");
+    }
+
+    /// The reason the exponent is solved per pair instead of interpolated from
+    /// the luminance gap: the two are not the same function, and they disagree
+    /// most on the secondary text every interface is full of.
+    #[test]
+    fn muted_text_needs_nearly_the_full_exponent_despite_half_the_contrast() {
+        let ink = Color::hex(0x939BA8);
+        let ground = Color::hex(0x14161A);
+        let solved = coverage_contrast_for(ink, ground);
+        let gap = ink.luminance() - ground.luminance();
+
+        // Barely a third of the luminance gap of white on black...
+        let full = Color::WHITE.luminance() - Color::BLACK.luminance();
+        assert!(gap < 0.4 * full, "gap {gap} against {full}");
+        // ...but nearly all of the correction, because the pair sits inside the
+        // steep part of the encode. Interpolating on the gap would hand it
+        // roughly 1.4 and leave every muted label soft.
+        assert!(solved > 1.75, "solved {solved}");
+    }
+
+    /// What the corrected pixel actually shows, worked forward through the same
+    /// steps the GPU takes: bend the coverage, blend premultiplied in linear
+    /// light, let the sRGB surface encode the result.
+    ///
+    /// Compared against a gamma-space rasteriser, which is the thing being
+    /// reproduced: it lerps the two colours in sRGB directly.
+    fn shown(coverage: f32, ink: Color, ground: Color) -> (f32, f32) {
+        let (i, g) = (ink.luminance(), ground.luminance());
+        let alpha = alpha_from_coverage(coverage, coverage_contrast_for(ink, ground));
+        let blended = linear_to_srgb(alpha * i + (1.0 - alpha) * g);
+        let reference = linear_to_srgb(g) + coverage * (linear_to_srgb(i) - linear_to_srgb(g));
+        (blended, reference)
+    }
+
+    /// The claim the whole correction rests on: what survives the linear blend
+    /// and the sRGB encode is the ramp a gamma-space rasteriser would have drawn.
+    #[test]
+    fn the_correction_reproduces_a_gamma_space_blend() {
+        // Every pair the shipped themes actually draw, plus the two extremes.
+        let pairs = [
+            ("white on black", Color::WHITE, Color::BLACK),
+            ("black on white", Color::BLACK, Color::WHITE),
+            ("dark theme", Color::hex(0xE6E9EF), Color::hex(0x14161A)),
+            ("dark theme, muted", Color::hex(0x939BA8), Color::hex(0x14161A)),
+            ("light theme", Color::hex(0x1A1D22), Color::hex(0xF5F6F8)),
+            ("light theme, muted", Color::hex(0x606772), Color::hex(0xF5F6F8)),
+        ];
+        for (name, ink, ground) in pairs {
+            let mut worst: f32 = 0.0;
+            for step in 0..=32 {
+                let coverage = step as f32 / 32.0;
+                let (blended, reference) = shown(coverage, ink, ground);
+                worst = worst.max((blended - reference).abs());
+            }
+            // Four per cent is ten levels out of 255, which is under what a
+            // one-pixel edge can show. Before this correction the same pairs
+            // were out by 21 to 24 per cent; see the test below.
+            assert!(worst < 0.04, "{name}: worst error {worst}");
+        }
+    }
+
+    /// The size of the problem being fixed, so the numbers in the doc comments
+    /// are checked rather than asserted.
+    #[test]
+    fn an_uncorrected_linear_blend_lifts_the_midtones_by_a_sixth_of_the_ramp() {
+        // Half coverage of white on black lands at sRGB 0.735, not 0.5. That
+        // gap is the halo: the grey pixel beside a stem reads as three quarters
+        // of the stem's own brightness.
+        assert!((linear_to_srgb(0.5) - 0.735).abs() < 0.005);
+
+        // And the 1.25 exponent this replaced closed a fifth of it.
+        assert!((linear_to_srgb(0.5f32.powf(1.25)) - 0.680).abs() < 0.005);
+
+        // Applied to the real dark theme, uncorrected, at half coverage: the
+        // half-covered pixel shows at 0.673 where it should show at 0.499, so it
+        // sits a sixth of the whole ramp too close to the ink.
+        let (ink, ground) = (Color::hex(0xE6E9EF).luminance(), Color::hex(0x14161A).luminance());
+        let uncorrected = linear_to_srgb(0.5 * ink + 0.5 * ground);
+        let reference = (linear_to_srgb(ink) + linear_to_srgb(ground)) * 0.5;
+        assert!(uncorrected - reference > 0.17, "{uncorrected} against {reference}");
+
+        // And what the correction leaves: a hundredth of the ramp, at the same
+        // point on the same pair.
+        let (blended, corrected) = shown(0.5, Color::hex(0xE6E9EF), Color::hex(0x14161A));
+        assert!((blended - corrected).abs() < 0.01, "{blended} against {corrected}");
+    }
+
+    #[test]
+    fn a_disabled_or_malformed_correction_is_the_identity() {
+        for contrast in [1.0, -1.0, 0.0, 0.5, f32::NAN, f32::INFINITY] {
+            let a = alpha_from_coverage(0.3, contrast);
+            assert!((a - 0.3).abs() < 1e-6, "contrast {contrast} gave {a}");
+        }
+    }
+
+    #[test]
+    fn the_correction_is_monotonic_and_pins_both_ends() {
+        for contrast in [FULL_COVERAGE_CONTRAST, -FULL_COVERAGE_CONTRAST, 1.6, -1.6] {
+            assert_eq!(alpha_from_coverage(0.0, contrast), 0.0, "contrast {contrast}");
+            assert_eq!(alpha_from_coverage(1.0, contrast), 1.0, "contrast {contrast}");
+            let mut previous = 0.0;
+            for step in 0..=64 {
+                let a = alpha_from_coverage(step as f32 / 64.0, contrast);
+                assert!(a >= previous - 1e-6, "contrast {contrast} dipped at {step}");
+                previous = a;
+            }
+        }
     }
     use super::*;
     use sphere_core::{ScaleFactor, px, rect, size};

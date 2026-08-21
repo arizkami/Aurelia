@@ -137,8 +137,8 @@ pub struct GlyphInstance {
     pub px_range: f32,
     /// Outline half-width in distance-field units.
     pub outline_width: f32,
-    /// Exponent applied to coverage; see [`crate::GlyphRun::coverage_gamma`].
-    pub coverage_gamma: f32,
+    /// Exponent applied to coverage; see [`crate::GlyphRun::coverage_contrast`].
+    pub coverage_contrast: f32,
     /// Reserved float, keeping the four `u32`s below contiguous.
     ///
     /// The vertex layout reads the floats as one `vec4` and the indices as one

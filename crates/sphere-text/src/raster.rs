@@ -23,6 +23,7 @@
 //! so flattening error is the only error in the output, and it converts directly
 //! into coverage error at the boundary.
 
+use crate::hint::{GridFit, VerticalZones};
 use crate::mtsdf::{Shape, extract_shape};
 use crate::types::{GlyphFormat, GlyphImage};
 use sphere_core::{FontError, GlyphId, Point, Px, Rect, ScaleFactor, Size};
@@ -300,18 +301,43 @@ impl Rasterizer {
 /// `size_px` lands the bitmap on the pixel grid one texel to one pixel — which is
 /// the entire reason this path exists.
 pub fn rasterize_shape(shape: &Shape, size_px: f32) -> GlyphImage {
+    rasterize_shape_fitted(shape, size_px, None)
+}
+
+/// Rasterises an outline with an optional vertical grid fit.
+///
+/// The fit is applied to the *flattened* polylines rather than to the curve
+/// control points. Moving control points through a piecewise-linear map bends
+/// the curve between them by an amount nothing accounts for; moving the
+/// flattened vertices is exact for the geometry actually rasterised, and the
+/// flattening tolerance was already chosen against the pixel grid.
+pub fn rasterize_shape_fitted(shape: &Shape, size_px: f32, fit: Option<&GridFit>) -> GlyphImage {
     let empty = GlyphImage::empty(GlyphFormat::Grayscale);
     if shape.is_empty() || !size_px.is_finite() || size_px <= 0.0 {
         return empty;
     }
     let Some(ink) = shape.bounds() else { return empty };
 
+    // The fit is monotonic, so mapping the two extremes maps the whole range.
+    // Taking the bounds from the unfitted outline would cut the glyph off
+    // wherever the fit moved an edge outward.
+    let (ink_top, ink_bottom) = match fit {
+        Some(f) => (f.apply(ink.min_y()), f.apply(ink.max_y())),
+        None => (ink.min_y(), ink.max_y()),
+    };
+
     // Round the ink box out to whole pixels. The partially covered pixels at the
     // boundary have to be included or the antialiased edge is cut off.
+    //
+    // Only `y` goes through the fit, and only a fitted `y` has a round trip to
+    // undo, so the unfitted path keeps the exact `floor`/`ceil` it always had.
+    // `x` is a raw outline coordinate on both paths and is untouched.
     let x0 = (ink.min_x() * size_px).floor();
-    let y0 = (ink.min_y() * size_px).floor();
     let x1 = (ink.max_x() * size_px).ceil();
-    let y1 = (ink.max_y() * size_px).ceil();
+    let (y0, y1) = match fit {
+        Some(_) => (snap_out(ink_top * size_px, false), snap_out(ink_bottom * size_px, true)),
+        None => ((ink_top * size_px).floor(), (ink_bottom * size_px).ceil()),
+    };
     if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
         return empty;
     }
@@ -328,7 +354,13 @@ pub fn rasterize_shape(shape: &Shape, size_px: f32) -> GlyphImage {
     let mut buffer: Vec<Point<f32>> = Vec::new();
     for polyline in shape.flatten(tolerance) {
         buffer.clear();
-        buffer.extend(polyline.iter().map(|p| Point::new(p.x * size_px - x0, p.y * size_px - y0)));
+        buffer.extend(polyline.iter().map(|p| {
+            let y = match fit {
+                Some(f) => f.apply(p.y),
+                None => p.y,
+            };
+            Point::new(p.x * size_px - x0, y * size_px - y0)
+        }));
         rasterizer.add_polyline(&buffer);
     }
 
@@ -346,6 +378,33 @@ pub fn rasterize_shape(shape: &Shape, size_px: f32) -> GlyphImage {
     }
 }
 
+/// Rounds one ink-box edge outward, tolerating a value that is already a whole
+/// pixel to within float noise.
+///
+/// A fitted zone is `(y * size).round() / size`, and pushing that back through
+/// `* size` does not reliably land on the integer it came from. Measured: Segoe
+/// UI, Arial, Tahoma and Verdana all put their fitted x-height at -7.000000477
+/// device pixels at 13 px. `floor` returns -8, so `x` renders eight rows with an
+/// entirely blank first one — and grid-fitting puts glyph extrema exactly on
+/// whole pixels far more often than not fitting does, so without this the row
+/// fitting gains is replaced by an empty one and the feature looks inert.
+///
+/// A thousand-and-twenty-fourth of a pixel is some two hundred times the worst
+/// round-trip error at these sizes, and a quarter of one step of 8-bit
+/// coverage, so it cannot clip anything a reader could see.
+#[inline]
+fn snap_out(px: f32, up: bool) -> f32 {
+    const EPS_PX: f32 = 1.0 / 1024.0;
+    let whole = px.round();
+    if (px - whole).abs() <= EPS_PX {
+        whole
+    } else if up {
+        px.ceil()
+    } else {
+        px.floor()
+    }
+}
+
 /// Rasterises one glyph of a face into a grayscale bitmap.
 ///
 /// `size_px` is the em size in *device* pixels; use [`device_font_size`] to get
@@ -356,8 +415,27 @@ pub fn rasterize_glyph(
     glyph: GlyphId,
     size_px: f32,
 ) -> Result<GlyphImage, FontError> {
+    rasterize_glyph_with_zones(face, glyph, size_px, VerticalZones::from_face(face))
+}
+
+/// Rasterises one glyph with zones the caller has already measured.
+///
+/// The zones cost five to twelve microseconds to read and do not depend on the
+/// size, so the rendering path measures them once per face through
+/// [`crate::font::FontDatabase::vertical_zones`] and hands them in here.
+/// [`rasterize_glyph`] reads them itself and is for callers that have a face and
+/// nothing else, which in practice means tests.
+pub fn rasterize_glyph_with_zones(
+    face: &ttf_parser::Face<'_>,
+    glyph: GlyphId,
+    size_px: f32,
+    zones: Option<VerticalZones>,
+) -> Result<GlyphImage, FontError> {
     let shape = extract_shape(face, glyph)?;
-    Ok(rasterize_shape(&shape, size_px))
+    // Grid-fitting is a property of this path and not of the distance field,
+    // which is size-independent and therefore has no single size to fit to.
+    let fit = zones.and_then(|z| GridFit::new(&z, size_px));
+    Ok(rasterize_shape_fitted(&shape, size_px, fit.as_ref()))
 }
 
 #[cfg(test)]
@@ -692,9 +770,22 @@ mod tests {
         // of the em.
         assert!(img.height >= 6 && img.height <= 12, "height {}", img.height);
         assert!(img.width >= 4 && img.width <= 14, "width {}", img.width);
-        // The bitmap covers the ink and snaps outwards, never inwards.
+        // Horizontally the bitmap covers the ink and snaps outwards, never
+        // inwards: `x` is a raw outline coordinate on both paths.
         assert!(img.bounds_em.min_x() <= metrics.bounds.min_x() + 1e-6);
-        assert!(img.bounds_em.max_y() >= metrics.bounds.max_y() - 1e-6);
+        // Vertically it does *not*, and that is the point of grid-fitting. The
+        // baseline slab pulls a round letter's foot up onto the baseline, so a
+        // fitted `bounds_em.max_y()` can sit above the unfitted ink bottom by up
+        // to the face's overshoot. Measured at 11 px, `O` fits to exactly 0.0 on
+        // all ten faces installed here while its ink bottoms between +0.0088 and
+        // +0.0166 em. So the bound is the *fitted* geometry's, and it is one
+        // device pixel — half from the line's rounding, half from the slab,
+        // which `collapse_knot` caps at half a pixel.
+        //
+        // `glyph_metrics().bounds` is therefore no longer an inner bound on
+        // `bounds_em` for a fitted glyph, and nothing should assume it is.
+        let drift = (img.bounds_em.max_y() - metrics.bounds.max_y()).abs() * size;
+        assert!(drift <= 1.0 + 1e-4, "the fitted foot moved {drift} px");
         // Some ink, but nowhere near solid: an 'H' is mostly counter.
         let ink: u32 = img.data.iter().map(|&c| c as u32).sum();
         let full = img.data.len() as u32 * 255;
@@ -702,6 +793,29 @@ mod tests {
         assert!(ink < full * 9 / 10, "an 'H' should not be a solid block: {ink}/{full}");
     }
 
+    #[test]
+    fn a_round_capital_is_fitted_onto_the_baseline_not_below_it() {
+        // The case that makes the vertical bound above a range rather than a
+        // floor. Named separately because it is the intended behaviour, and a
+        // future reader finding the loosened assertion should find this too.
+        let Some(data) = system_font() else {
+            eprintln!("skipping: no system font found");
+            return;
+        };
+        let face = ttf_parser::Face::parse(&data, 0).unwrap();
+        let Some(gid) = face.glyph_index('O') else { return };
+        let glyph = GlyphId(gid.0);
+        let Ok(metrics) = glyph_metrics(&face, glyph) else { return };
+        let img = rasterize_glyph(&face, glyph, 11.0).unwrap();
+        // Fitted foot at or above the raw ink bottom: pulled up onto the
+        // baseline, never pushed below it.
+        assert!(
+            img.bounds_em.max_y() <= metrics.bounds.max_y() + 1e-6,
+            "fitted {} against ink {}",
+            img.bounds_em.max_y(),
+            metrics.bounds.max_y()
+        );
+    }
     #[test]
     fn a_space_rasterises_to_nothing_without_erroring() {
         let Some(data) = system_font() else {

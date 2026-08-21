@@ -6,29 +6,137 @@
 //! sharp at which size are a picture and a measurement rather than an assertion.
 //!
 //! **It re-implements `text.wgsl` on the CPU.** The sampling, the median, the
-//! screen range and the coverage gamma below are transcriptions of the shader,
-//! not captures of what the GPU produced. It shows that the geometry and the
-//! path choice handed to the GPU are right; it cannot prove the GPU agreed.
+//! screen range and the coverage correction below are transcriptions of the
+//! shader, not captures of what the GPU produced. It shows that the geometry and
+//! the path choice handed to the GPU are right; it cannot prove the GPU agreed.
+//!
+//! It also transcribes the *blend*, which is the part that used to be wrong.
+//! Compositing happens in linear light against an sRGB surface, so this walks
+//! every pixel through `alpha_from_coverage`, a premultiplied linear blend and
+//! an sRGB encode, in that order. An earlier version blended straight into sRGB
+//! bytes, which is a gamma-space blend — the very thing the correction exists to
+//! reproduce — so it showed text a good deal crisper than the GPU was drawing
+//! and hid the calibration bug it was built to catch.
 //!
 //! ```bash
 //! cargo run -p sphere-text --example glyph_quad_probe --release -- out.png
 //! SPHERE_PROBE_SIZE=13 cargo run -p sphere-text --example glyph_quad_probe --release
+//! SPHERE_PROBE_COMPARE=blend SPHERE_PROBE_ZOOM=8 cargo run -p sphere-text --example glyph_quad_probe --release
+//! SPHERE_PROBE_COMPARE=fit SPHERE_PROBE_SIZE=13 cargo run -p sphere-text --example glyph_quad_probe --release
 //! ```
+//!
+//! `SPHERE_PROBE_THEME=dark` flips both panels to light-on-dark, which is the
+//! direction the correction has to mirror for.
 
+use sphere_core::{Color, linear_to_srgb};
 use sphere_render::batch::{GlyphPlacement, GlyphProvider, GlyphRequest};
-use sphere_render::scene::TextRasterMode;
+use sphere_render::scene::{TextRasterMode, alpha_from_coverage, coverage_contrast_for};
 use sphere_text::raster::{BITMAP_MAX_DEVICE_PX, choose_raster_strategy};
 use sphere_text::{GlyphFormat, TextStyle, TextSystem};
 
 const DEFAULT_TEXT: &str = "Handgloves 0123 Preferences";
 const PAD: usize = 16;
 
-/// Dark text on a light ground, so the coverage correction runs downward. The
-/// same number `coverage_gamma_for` produces for black on white.
-const GAMMA: f32 = 0.8;
+/// The two colours a panel is drawn with, and the correction that pair implies.
+///
+/// Held together because the correction is a function of the pair: reading it
+/// off one colour, or hard-coding it, is how the previous version of this probe
+/// came to validate a number the renderer never used.
+#[derive(Copy, Clone)]
+struct Ink {
+    text: Color,
+    ground: Color,
+    contrast: f32,
+}
+
+impl Ink {
+    fn new(text: Color, ground: Color) -> Self {
+        Self { text, ground, contrast: coverage_contrast_for(text, ground) }
+    }
+
+    /// The same pair with the correction disabled, for the comparison panel.
+    fn uncorrected(self) -> Self {
+        Self { contrast: 1.0, ..self }
+    }
+}
+
+/// A linear-light image, encoded to sRGB only on the way out.
+///
+/// The surface Sphere renders into is sRGB, so the hardware decodes, blends and
+/// re-encodes. Holding linear floats here and encoding once at the end is that
+/// same arrangement, and it is the only way a CPU transcription of the shader
+/// can show what the shader produces.
+struct Canvas {
+    width: usize,
+    height: usize,
+    pixels: Vec<[f32; 3]>,
+}
+
+impl Canvas {
+    fn new(width: usize, height: usize, ground: Color) -> Self {
+        let g = ground.to_linear();
+        Self { width, height, pixels: vec![[g.r, g.g, g.b]; width * height] }
+    }
+
+    /// Premultiplied source-over, exactly the blend state the glyph pipeline
+    /// binds (`BlendState::PREMULTIPLIED_ALPHA_BLENDING`).
+    fn blend(&mut self, x: usize, y: usize, color: Color, alpha: f32) {
+        if x >= self.width || y >= self.height || alpha <= 0.0 {
+            return;
+        }
+        let src = color.to_linear();
+        let dst = &mut self.pixels[y * self.width + x];
+        let a = (src.a * alpha).clamp(0.0, 1.0);
+        for (k, s) in [src.r, src.g, src.b].into_iter().enumerate() {
+            dst[k] = s * alpha + dst[k] * (1.0 - a);
+        }
+    }
+
+    /// Nearest-neighbour magnification applied *after* the encode, so the pixels
+    /// shown are exactly the pixels rendered. Any smooth resample would hide the
+    /// very thing this probe exists to show.
+    fn into_rgba(self, zoom: usize) -> (Vec<u8>, u32, u32) {
+        let zoom = zoom.max(1);
+        let (w, h) = (self.width * zoom, self.height * zoom);
+        let mut out = vec![255u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let src = self.pixels[(y / zoom) * self.width + (x / zoom)];
+                let dst = (y * w + x) * 4;
+                for k in 0..3 {
+                    out[dst + k] = (linear_to_srgb(src[k].clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
+                }
+            }
+        }
+        (out, w as u32, h as u32)
+    }
+}
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok()
+}
+
+fn zoom() -> usize {
+    env("SPHERE_PROBE_ZOOM").and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 16)
+}
+
+/// The colour pair to draw, from `SPHERE_PROBE_THEME`.
+///
+/// Light by default: dark-on-light is the direction whose correction is the
+/// mirrored branch, and therefore the one worth looking at first.
+fn ink() -> Ink {
+    match env("SPHERE_PROBE_THEME").as_deref() {
+        Some("dark") => Ink::new(Color::hex(0xE6E9EF), Color::hex(0x14161A)),
+        _ => Ink::new(Color::hex(0x1A1D22), Color::hex(0xF5F6F8)),
+    }
+}
+
+fn save(path_default: &str, rgba: &[u8], w: u32, h: u32, caption: &str) {
+    let path = std::env::args().nth(1).unwrap_or_else(|| path_default.into());
+    match image::save_buffer(&path, rgba, w, h, image::ExtendedColorType::Rgba8) {
+        Ok(()) => println!("\nwrote {path} — {caption}"),
+        Err(e) => println!("\ncould not write {path}: {e}"),
+    }
 }
 
 fn main() {
@@ -51,6 +159,7 @@ fn main() {
         return;
     };
     let baseline = line.baseline.get();
+    let ink = ink();
 
     println!("system ui font: {}", sphere_text::system_ui::family());
     println!(
@@ -66,105 +175,156 @@ fn main() {
     );
     println!("stem approx:    {:.2} px, of which {:.2} px is solid", size / 9.0, size / 9.0 - 1.0);
     println!("threshold:      {BITMAP_MAX_DEVICE_PX} device px, so Auto picks {strategy:?}");
+    println!("coverage:       contrast {:+.3} for this colour pair", ink.contrast);
 
-    // Both panels resolved before anything borrows the atlas pixels.
-    let mut panels: Vec<Vec<(f32, GlyphPlacement)>> = Vec::new();
-    for mode in [TextRasterMode::Mtsdf, TextRasterMode::Auto] {
-        let mut placed = Vec::new();
-        for run in &line.runs {
-            for g in &run.glyphs {
-                let Some(p) = text.place_glyph(GlyphRequest {
-                    font: run.font,
-                    glyph: g.glyph,
-                    font_size: run.font_size,
-                    device_scale: 1.0,
-                    mode,
-                }) else {
-                    continue;
-                };
-                if p.uv[2] <= p.uv[0] || p.uv[3] <= p.uv[1] {
-                    continue;
-                }
-                placed.push((g.position.x.get(), p));
-            }
-        }
-        placed.sort_by(|a, b| a.0.total_cmp(&b.0));
-        panels.push(placed);
+    match env("SPHERE_PROBE_COMPARE").as_deref() {
+        // Both panels are bitmaps, the left one rasterised without a grid fit
+        // and the right one with. Rasterised directly rather than through the
+        // atlas, because the atlas has no way to hand back an unfitted glyph —
+        // fitting is not optional there.
+        Some("fit") => compare_fit(&source, &style, size, ink),
+        // Both panels take whatever path `Auto` picks; only the coverage
+        // correction differs. This is the one that shows what the linear blend
+        // does to an uncorrected edge.
+        Some("blend") => compare_blend(&mut text, &line, baseline, size, ink),
+        _ => compare_raster(&mut text, &line, baseline, size, ink),
     }
+}
 
-    let w = layout.size.width.get().ceil() as usize + PAD * 2;
-    let h = (baseline * 2.0).ceil() as usize + PAD * 2;
-    // Opaque white ground: dark-on-light, so the letterforms read as shapes
-    // rather than as glowing edges.
-    let mut canvas = vec![255u8; w * h * 2 * 4];
+/// Resolves every glyph in a line through the atlas, in one raster mode.
+fn place(
+    text: &mut TextSystem,
+    line: &sphere_text::TextLine,
+    mode: TextRasterMode,
+) -> Vec<(f32, GlyphPlacement)> {
+    let mut placed = Vec::new();
+    for run in &line.runs {
+        for g in &run.glyphs {
+            let Some(p) = text.place_glyph(GlyphRequest {
+                font: run.font,
+                glyph: g.glyph,
+                font_size: run.font_size,
+                device_scale: 1.0,
+                mode,
+            }) else {
+                continue;
+            };
+            if p.uv[2] <= p.uv[0] || p.uv[3] <= p.uv[1] {
+                // A zero-area placement is a space or a control character.
+                continue;
+            }
+            placed.push((g.position.x.get(), p));
+        }
+    }
+    placed.sort_by(|a, b| a.0.total_cmp(&b.0));
+    placed
+}
 
-    for (half, placed) in panels.iter().enumerate() {
-        for (pen_x, p) in placed {
+/// Lays two panels side by side, each drawn by `draw`, with a hairline between.
+fn two_panels(
+    width: usize,
+    height: usize,
+    ground: Color,
+    mut draw: impl FnMut(&mut Canvas, usize, usize),
+) -> Canvas {
+    let mut canvas = Canvas::new(width * 2, height, ground);
+    for half in 0..2 {
+        draw(&mut canvas, half, half * width);
+    }
+    let rule = Color::hex(0x808080).to_linear();
+    for y in 0..height {
+        canvas.pixels[y * width * 2 + width] = [rule.r, rule.g, rule.b];
+    }
+    canvas
+}
+
+/// Forced distance field against whatever `Auto` picks: the size question.
+fn compare_raster(
+    text: &mut TextSystem,
+    line: &sphere_text::TextLine,
+    baseline: f32,
+    size: f32,
+    ink: Ink,
+) {
+    let panels =
+        [place(text, line, TextRasterMode::Mtsdf), place(text, line, TextRasterMode::Auto)];
+    let width = line.width.get().ceil() as usize + PAD * 2;
+    let height = (baseline * 2.0).ceil() as usize + PAD * 2;
+
+    let canvas = two_panels(width, height, ink.ground, |canvas, half, x_offset| {
+        for (pen_x, p) in &panels[half] {
             draw_glyph(
-                &mut canvas,
-                w * 2,
-                h,
-                half * w,
-                &text,
+                canvas,
+                x_offset,
+                text,
                 p,
                 *pen_x + PAD as f32,
                 baseline + PAD as f32,
                 size,
+                ink,
             );
         }
-    }
+    });
 
-    // A hairline between the halves, so the two are unmistakably separate.
-    for y in 0..h {
-        let i = (y * w * 2 + w) * 4;
-        canvas[i..i + 3].fill(200);
-    }
+    let (rgba, w, h) = canvas.into_rgba(zoom());
+    save("glyph_quad_probe.png", &rgba, w, h, "left: forced MTSDF, right: what Auto chooses");
+}
 
-    // Nearest-neighbour magnification, applied *after* compositing so the
-    // pixels shown are exactly the pixels rendered. Any smooth resample would
-    // hide the very thing this probe exists to show.
-    let zoom: usize =
-        env("SPHERE_PROBE_ZOOM").and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 16);
-    let (out_w, out_h) = (w * 2 * zoom, h * zoom);
-    let canvas = if zoom == 1 {
-        canvas
-    } else {
-        let mut big = vec![255u8; out_w * out_h * 4];
-        for y in 0..out_h {
-            for x in 0..out_w {
-                let src = ((y / zoom) * w * 2 + (x / zoom)) * 4;
-                let dst = (y * out_w + x) * 4;
-                big[dst..dst + 4].copy_from_slice(&canvas[src..src + 4]);
-            }
+/// Uncorrected coverage against corrected: the blend-space question.
+///
+/// Both panels take the same rasterisation path, so every difference on screen
+/// is the coverage correction alone. The left panel is what a physically linear
+/// blend produces from raw coverage, which is what this engine drew before
+/// `coverage_contrast_for` was calibrated against the sRGB encode rather than
+/// guessed at.
+fn compare_blend(
+    text: &mut TextSystem,
+    line: &sphere_text::TextLine,
+    baseline: f32,
+    size: f32,
+    ink: Ink,
+) {
+    let placed = place(text, line, TextRasterMode::Auto);
+    let width = line.width.get().ceil() as usize + PAD * 2;
+    let height = (baseline * 2.0).ceil() as usize + PAD * 2;
+    let inks = [ink.uncorrected(), ink];
+
+    let canvas = two_panels(width, height, ink.ground, |canvas, half, x_offset| {
+        for (pen_x, p) in &placed {
+            draw_glyph(
+                canvas,
+                x_offset,
+                text,
+                p,
+                *pen_x + PAD as f32,
+                baseline + PAD as f32,
+                size,
+                inks[half],
+            );
         }
-        big
-    };
+    });
 
-    let path = std::env::args().nth(1).unwrap_or_else(|| "glyph_quad_probe.png".into());
-    match image::save_buffer(
-        &path,
-        &canvas,
-        out_w as u32,
-        out_h as u32,
-        image::ExtendedColorType::Rgba8,
-    ) {
-        Ok(()) => println!("\nwrote {path} — left: forced MTSDF, right: what Auto chooses"),
-        Err(e) => println!("\ncould not write {path}: {e}"),
-    }
+    let (rgba, w, h) = canvas.into_rgba(zoom());
+    save(
+        "blend_probe.png",
+        &rgba,
+        w,
+        h,
+        "left: raw coverage, right: corrected for the linear blend",
+    );
 }
 
 /// Composites one glyph, sampling the atlas the way `text.wgsl` does.
 #[allow(clippy::too_many_arguments)]
 fn draw_glyph(
-    canvas: &mut [u8],
-    stride_px: usize,
-    height: usize,
+    canvas: &mut Canvas,
     x_offset: usize,
     text: &TextSystem,
     p: &GlyphPlacement,
     pen_x: f32,
     baseline: f32,
     size: f32,
+    ink: Ink,
 ) {
     let atlas = text.atlas();
     let Some(format) = atlas.page_format(p.page) else { return };
@@ -194,7 +354,7 @@ fn draw_glyph(
     let screen_range = (p.range_em * size).max(1.0);
 
     let y_lo = y0.floor().max(0.0) as usize;
-    let y_hi = (y0 + qh).ceil().clamp(0.0, height as f32) as usize;
+    let y_hi = (y0 + qh).ceil().max(0.0) as usize;
     let x_lo = x0.floor().max(0.0) as usize;
     let x_hi = (x0 + qw).ceil().max(0.0) as usize;
 
@@ -215,20 +375,7 @@ fn draw_glyph(
                 let sd = median3(s[0], s[1], s[2]) - 0.5;
                 (sd * screen_range + 0.5).clamp(0.0, 1.0)
             };
-            let alpha = coverage.powf(GAMMA);
-            if alpha <= 0.0 {
-                continue;
-            }
-
-            let i = (py * stride_px + px + x_offset) * 4;
-            if i + 3 >= canvas.len() {
-                continue;
-            }
-            for k in 0..3 {
-                let prev = canvas[i + k] as f32 / 255.0;
-                canvas[i + k] = ((prev * (1.0 - alpha)) * 255.0) as u8;
-            }
-            canvas[i + 3] = 255;
+            canvas.blend(px + x_offset, py, ink.text, alpha_from_coverage(coverage, ink.contrast));
         }
     }
 }
@@ -263,4 +410,80 @@ fn bilinear(pixels: &[u8], page: usize, bpp: usize, u: f32, v: f32) -> [f32; 4] 
 
 fn median3(a: f32, b: f32, c: f32) -> f32 {
     a.max(b).min(a.min(b).max(c))
+}
+
+/// Renders unfitted against fitted bitmaps, straight from the rasteriser.
+fn compare_fit(source: &str, style: &TextStyle, size: f32, ink: Ink) {
+    use sphere_text::font::FontDatabase;
+    use sphere_text::hint::{GridFit, VerticalZones};
+    use sphere_text::mtsdf::extract_shape;
+    use sphere_text::raster::{rasterize_glyph, rasterize_shape};
+
+    let mut db = FontDatabase::with_system_fonts();
+    let Some(font) = db.resolve(&style.font) else {
+        println!("no face for that request");
+        return;
+    };
+    println!("comparing unfitted against fitted bitmaps at {size} px");
+
+    // (unfitted, fitted, ink-left in em) per character.
+    let mut cells: Vec<(sphere_text::GlyphImage, sphere_text::GlyphImage, f32)> = Vec::new();
+    let mut pen = 0.0f32;
+    for c in source.chars() {
+        let Some(glyph) = db.glyph_index(font, c) else { continue };
+        let advance = db
+            .with_face(font, |face| {
+                let upem = (face.units_per_em() as f32).max(1.0);
+                face.glyph_hor_advance(ttf_parser::GlyphId(glyph.0)).map(|a| f32::from(a) / upem)
+            })
+            .flatten()
+            .unwrap_or(0.5);
+        let pair = db.with_face(font, |face| {
+            let shape = extract_shape(face, glyph).ok()?;
+            let plain = rasterize_shape(&shape, size);
+            let fitted = rasterize_glyph(face, glyph, size).ok()?;
+            VerticalZones::from_face(face).and_then(|z| GridFit::new(&z, size))?;
+            Some((plain, fitted))
+        });
+        if let Some(Some((plain, fitted))) = pair {
+            cells.push((plain, fitted, pen));
+        }
+        pen += advance;
+    }
+    if cells.is_empty() {
+        println!("nothing to fit at this size");
+        return;
+    }
+
+    let width = (pen * size).ceil() as usize + PAD * 2;
+    let height = (size * 2.2).ceil() as usize + PAD * 2;
+    let baseline = (size * 1.4) as i32 + PAD as i32;
+
+    let canvas = two_panels(width, height, ink.ground, |canvas, half, x_offset| {
+        for (plain, fitted, pen_em) in &cells {
+            let image = if half == 0 { plain } else { fitted };
+            let ox = (pen_em * size).round() as i32 + PAD as i32 + x_offset as i32;
+            let oy = baseline + (image.bounds_em.origin.y * size).round() as i32;
+            for row in 0..image.height as i32 {
+                for col in 0..image.width as i32 {
+                    let (x, y) = (ox + col, oy + row);
+                    if x < 0 || y < 0 {
+                        continue;
+                    }
+                    let coverage =
+                        f32::from(image.data[(row * image.width as i32 + col) as usize]) / 255.0;
+                    canvas.blend(
+                        x as usize,
+                        y as usize,
+                        ink.text,
+                        alpha_from_coverage(coverage, ink.contrast),
+                    );
+                }
+            }
+        }
+    });
+
+    let (rgba, w, h) = canvas
+        .into_rgba(env("SPHERE_PROBE_ZOOM").and_then(|v| v.parse().ok()).unwrap_or(4).clamp(1, 16));
+    save("grid_fit.png", &rgba, w, h, "left: unfitted, right: vertically grid-fitted");
 }

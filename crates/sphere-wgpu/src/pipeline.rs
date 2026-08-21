@@ -204,7 +204,7 @@ pub const GLYPH_ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
     1 => Float32x4,  // uv
     2 => Float32x4,  // color
     3 => Float32x4,  // outline_color
-    4 => Float32x4,  // px_range, outline_width, coverage_gamma, flags(bitcast)
+    4 => Float32x4,  // px_range, outline_width, coverage_contrast, flags(bitcast)
     5 => Uint32x4,   // atlas_page, transform_index, clip_index, pad
 ];
 

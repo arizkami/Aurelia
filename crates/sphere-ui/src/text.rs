@@ -31,13 +31,13 @@ pub struct Label {
     raster: TextRasterMode,
     /// Synthetic outline, for text over a busy backdrop such as a waveform.
     outline: Option<(Px, Color)>,
-    /// Perceptual coverage exponent, or `None` to derive it from the contrast
+    /// Signed coverage exponent, or `None` to derive it from the contrast
     /// between the text and the theme's background.
     ///
     /// Derived by default because the correction runs in opposite directions
     /// for light-on-dark and dark-on-light, and a constant is therefore wrong
     /// in one of the two themes every application ships.
-    coverage_gamma: Option<f32>,
+    coverage_contrast: Option<f32>,
 }
 
 /// Creates a [`Label`].
@@ -51,7 +51,7 @@ pub fn label(text: impl Into<String>) -> Label {
         color: None,
         raster: TextRasterMode::Auto,
         outline: None,
-        coverage_gamma: None,
+        coverage_contrast: None,
     }
 }
 
@@ -139,14 +139,15 @@ impl Label {
         self
     }
 
-    /// Overrides the perceptual coverage exponent.
+    /// Overrides the coverage correction.
     ///
-    /// Above `1.0` thins the strokes, which is what light text on a dark
-    /// surface wants; below `1.0` fattens them, which suits dark text on a
-    /// light one. `1.0` leaves coverage physically linear. See
-    /// [`sphere_render::GlyphRun::coverage_gamma`].
-    pub fn coverage_gamma(mut self, gamma: f32) -> Self {
-        self.coverage_gamma = Some(gamma);
+    /// A signed exponent: the magnitude sets how hard the coverage ramp bends
+    /// and the sign says which end bends, positive for light text on a dark
+    /// surface. `1.0` leaves coverage physically linear, which is right only
+    /// for text over an image, where there is no one background to correct
+    /// against. See [`sphere_render::GlyphRun::coverage_contrast`].
+    pub fn coverage_contrast(mut self, contrast: f32) -> Self {
+        self.coverage_contrast = Some(contrast);
         self
     }
 
@@ -213,8 +214,8 @@ impl Element for Label {
         let layout = cx.text.layout(&self.text, &self.text_style, Some(cx.bounds.width()));
         let origin = cx.bounds.origin;
         let (outline_width, outline_color) = self.outline.unwrap_or((Px::ZERO, Color::TRANSPARENT));
-        let coverage_gamma = self.coverage_gamma.unwrap_or_else(|| {
-            sphere_render::coverage_gamma_for(color, cx.theme.colors.background)
+        let coverage_contrast = self.coverage_contrast.unwrap_or_else(|| {
+            sphere_render::coverage_contrast_for(color, cx.theme.colors.background)
         });
 
         draw_layout(
@@ -224,7 +225,7 @@ impl Element for Label {
             color,
             self.raster,
             (outline_width, outline_color),
-            coverage_gamma,
+            coverage_contrast,
         );
     }
 
@@ -246,7 +247,7 @@ pub fn draw_layout(
     color: Color,
     raster: TextRasterMode,
     outline: (Px, Color),
-    coverage_gamma: f32,
+    coverage_contrast: f32,
 ) {
     for line in &layout.lines {
         for run in &line.runs {
@@ -276,7 +277,7 @@ pub fn draw_layout(
                     raster,
                     outline_width: outline.0,
                     outline_color: outline.1,
-                    coverage_gamma,
+                    coverage_contrast,
                 },
                 Brush::Solid(color),
             );
