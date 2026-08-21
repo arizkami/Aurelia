@@ -1,3 +1,17 @@
 # SphereKit keeps hot-path types small; warn when a type is copied around by value needlessly.
 too-many-arguments-threshold = 10
 type-complexity-threshold = 400
+
+# Names that are prose, not code.
+#
+# `clippy::doc_markdown` flags any CamelCase word in a doc comment as an
+# identifier that should be in backticks. Applied to a product or a vendor's
+# name that is exactly wrong: `SphereKit` renders as code and reads as a type
+# that does not exist, and the crate is *called* SphereKit, so the word appears
+# in nearly every module header. Auto-fixing the lint rewrites all sixty-odd of
+# them that way, which is why this list exists rather than a `cargo clippy
+# --fix` diff.
+#
+# `".."` extends clippy's own default list — which already covers `WebGPU`,
+# `TrueType`, `macOS` and the rest — instead of replacing it.
+doc-valid-idents = ["SphereKit", "DirectWrite", "FreeType", "ClearType", "CoreText", ".."]

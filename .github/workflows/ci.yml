@@ -1,0 +1,135 @@
+name: CI
+
+# SphereKit compiles different code on each of the three desktop platforms —
+# `backend::nc` and the `NONCLIENTMETRICSW` interface-font lookup on Windows,
+# the `CoreText` family list and the Command-key modifier mapping on macOS —
+# so the matrix is not box-ticking. Two thirds of the platform crate is
+# invisible to any single runner.
+
+on:
+  push:
+    branches: [main, cpp_oldversion]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch makes the first one's result irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Every job resolves the same lockfile. `--locked` below turns a dependency
+  # that drifted into a failed build rather than a silently different one.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Split out so a misformatted patch fails in under a minute instead of behind
+  # a full matrix build. Formatting is platform-independent, so one runner does.
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing must not hide the state of the other two, which is
+      # the whole reason for having them.
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: Windows
+            os: windows-latest
+          - name: macOS
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # winit and xkbcommon reach X11 and Wayland through `dlopen`, so these are
+      # not link-time requirements — but a runner without them turns a windowing
+      # bug into a confusing runtime failure, and they cost seconds.
+      #
+      # `mesa-vulkan-drivers` is the one that earns its place: it provides
+      # lavapipe, a software Vulkan device, which is what lets the headless
+      # suite in `spherekit-wgpu/tests/pipelines.rs` actually build every
+      # pipeline and compile every WGSL module through naga on a real adapter.
+      # Without it that suite skips itself and the shaders are only checked by
+      # the device-free unit tests.
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxkbcommon-dev libwayland-dev \
+            mesa-vulkan-drivers
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      # Lint first: it is the cheapest of the three gates and catches the most.
+      # `-D warnings` is passed to clippy rather than set in `RUSTFLAGS`, which
+      # would apply it to every dependency as well and fail on code this
+      # repository does not own.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # `--all-targets` covers unit tests, integration tests and every example;
+      # it deliberately excludes doctests, which is why the second command
+      # exists. This crate's documentation carries real assertions.
+      - name: Test
+        run: |
+          cargo test --workspace --all-targets --locked
+          cargo test --workspace --doc --locked
+
+      # Re-run with output so the adapter each platform actually found is in the
+      # log. Everything is compiled by now, so this costs a second.
+      - name: Report the GPU adapter
+        run: cargo test -p spherekit-wgpu --test pipelines --locked -- --nocapture
+
+      # The plug-in configuration: no window runner, no clipboard, host-owned
+      # window only. It is the one arrangement where `backend::nc` compiles with
+      # nothing calling it, and the only place that combination is exercised.
+      - name: Check the plug-in configuration
+        run: cargo clippy -p spherekit-platform --no-default-features --all-targets --locked -- -D warnings
+
+      # The release profile is a different compilation: `lto = "thin"`,
+      # `codegen-units = 1` and `panic = "abort"`. The last of those is why this
+      # builds rather than tests — the test harness needs unwinding — and why
+      # release-only breakage would otherwise reach a user before CI.
+      #
+      # `--examples` rather than the bare workspace because every crate here is
+      # a library: the examples are the only targets that actually link, and
+      # linking is what differs most between the three platforms.
+      - name: Build (release)
+        run: cargo build --workspace --examples --release --locked
+
+      - name: Upload example binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: spherekit-examples-${{ matrix.name }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            target/release/examples/desktop_app*
+            target/release/examples/system_window*
+            target/release/examples/plugin_ui_demo*
+            !target/release/examples/*.d
+            !target/release/examples/*.pdb

@@ -15,7 +15,13 @@
 // functions are pure and their tests are the only thing standing between a
 // transcription error in an `HT*` code and a window whose edges are subtly
 // wrong.
+//
+// Without the backend nothing calls them, so `dead_code` fires on all ten — and
+// that is the arrangement rather than a defect, which is why the allow is
+// conditional on the plug-in configuration instead of blanket. Their own tests
+// still run there, which is the entire point of compiling them.
 #[cfg(windows)]
+#[cfg_attr(not(feature = "winit-backend"), allow(dead_code))]
 pub(crate) mod nc;
 
 // Every unsafe call the custom frame makes. Needs a backend to have produced a
