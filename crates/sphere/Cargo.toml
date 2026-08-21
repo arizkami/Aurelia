@@ -19,5 +19,7 @@ sphere-image.workspace = true
 sphere-platform.workspace = true
 sphere-ui.workspace = true
 sphere-audio-ui.workspace = true
+rustc-hash.workspace = true
+raw-window-handle.workspace = true
 tracing.workspace = true
 pollster.workspace = true

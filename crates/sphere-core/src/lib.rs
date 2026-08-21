@@ -1,6 +1,6 @@
 //! # sphere-core
 //!
-//! The shared vocabulary of SphereGraphicEngine: units, geometry, transforms,
+//! The shared vocabulary of `SphereGraphicEngine`: units, geometry, transforms,
 //! color, paths, paint, identity and errors.
 //!
 //! This crate has no GPU, windowing or text dependencies. Every other Sphere
@@ -58,9 +58,7 @@ pub use error::{
     FontError, ImageError, InitError, LayoutError, PlatformError, RenderError, ShaderError,
     SurfaceError, SvgError,
 };
-pub use geometry::{
-    Corners, Edges, Point, Rect, RoundedRect, Size, point, rect, size,
-};
+pub use geometry::{Corners, Edges, Point, Rect, RoundedRect, Size, point, rect, size};
 pub use id::{
     ElementId, FocusId, FontId, GenerationalKey, GenerationalStore, GlyphId, ImageId, NodeId,
     PipelineId, SvgId, TextureId, ViewId, WindowId,

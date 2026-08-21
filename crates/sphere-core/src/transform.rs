@@ -83,17 +83,18 @@ impl Affine {
     /// source of off-by-a-half-pixel bugs.
     #[inline]
     pub fn rotate_about(pivot: Point<Px>, angle: Rad) -> Self {
-        let to = Self::translate(Size::new(pivot.x, pivot.y));
-        let back = Self::translate(Size::new(-pivot.x, -pivot.y));
-        to.then(Self::rotate(angle)).then(back)
+        // Move the pivot to the origin, rotate there, then move it back.
+        let to_origin = Self::translate(Size::new(-pivot.x, -pivot.y));
+        let restore = Self::translate(Size::new(pivot.x, pivot.y));
+        to_origin.then(Self::rotate(angle)).then(restore)
     }
 
     /// A transform that scales about `pivot`.
     #[inline]
     pub fn scale_about(pivot: Point<Px>, sx: f32, sy: f32) -> Self {
-        let to = Self::translate(Size::new(pivot.x, pivot.y));
-        let back = Self::translate(Size::new(-pivot.x, -pivot.y));
-        to.then(Self::scale(sx, sy)).then(back)
+        let to_origin = Self::translate(Size::new(-pivot.x, -pivot.y));
+        let restore = Self::translate(Size::new(pivot.x, pivot.y));
+        to_origin.then(Self::scale(sx, sy)).then(restore)
     }
 
     /// Returns `self` followed by `next`.
@@ -171,8 +172,7 @@ impl Affine {
     /// rectangles, which is what allows scissor-rect clipping instead of a mask.
     #[inline]
     pub fn is_axis_aligned(self) -> bool {
-        (self.b.abs() < 1e-6 && self.c.abs() < 1e-6)
-            || (self.a.abs() < 1e-6 && self.d.abs() < 1e-6)
+        (self.b.abs() < 1e-6 && self.c.abs() < 1e-6) || (self.a.abs() < 1e-6 && self.d.abs() < 1e-6)
     }
 
     /// The translation component.

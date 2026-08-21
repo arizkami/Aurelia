@@ -180,10 +180,32 @@ impl Path {
 
     /// Flattens the path into line segments, invoking `emit(from, to)` for each.
     ///
-    /// Subpaths are implicitly closed for the purposes of flattening, which is
-    /// what fill and containment tests need. Stroking handles open subpaths
-    /// separately.
-    pub fn flatten(&self, tolerance: Px, mut emit: impl FnMut(Point<Px>, Point<Px>)) {
+    /// Subpaths without an explicit [`Verb::Close`] are still closed, because
+    /// that is what filling and containment testing require: an unclosed
+    /// triangle still has an interior.
+    ///
+    /// Stroking and dashing must **not** see that implicit segment — a line
+    /// from A to B would come back as a line from B to A and double its length.
+    /// Those callers want [`Path::flatten_open`].
+    pub fn flatten(&self, tolerance: Px, emit: impl FnMut(Point<Px>, Point<Px>)) {
+        self.flatten_impl(tolerance, true, emit);
+    }
+
+    /// Flattens the path without implicitly closing open subpaths.
+    ///
+    /// Explicit [`Verb::Close`] verbs still emit their closing segment; only
+    /// the implicit one is suppressed. This is the flattening stroking, dashing
+    /// and arc-length measurement need.
+    pub fn flatten_open(&self, tolerance: Px, emit: impl FnMut(Point<Px>, Point<Px>)) {
+        self.flatten_impl(tolerance, false, emit);
+    }
+
+    fn flatten_impl(
+        &self,
+        tolerance: Px,
+        close_open_subpaths: bool,
+        mut emit: impl FnMut(Point<Px>, Point<Px>),
+    ) {
         let tol = tolerance.get().max(1e-3);
         let mut cursor = Point::ZERO;
         let mut start = Point::ZERO;
@@ -192,7 +214,7 @@ impl Path {
         for ev in self.iter() {
             match ev {
                 PathEvent::MoveTo(p) => {
-                    if open && cursor != start {
+                    if close_open_subpaths && open && cursor != start {
                         emit(cursor, start);
                     }
                     cursor = p;
@@ -234,16 +256,19 @@ impl Path {
                 }
             }
         }
-        if open && cursor != start {
+        if close_open_subpaths && open && cursor != start {
             emit(cursor, start);
         }
     }
 
-    /// Total length of the flattened outline, used to place dashes and to
-    /// distribute automation-curve samples.
+    /// Total length of the outline, used to place dashes and to distribute
+    /// automation-curve samples.
+    ///
+    /// Measures the path as authored: an open subpath is not counted as if it
+    /// closed.
     pub fn length(&self, tolerance: Px) -> Px {
         let mut total = 0.0f32;
-        self.flatten(tolerance, |a, b| total += a.distance_to(b).get());
+        self.flatten_open(tolerance, |a, b| total += a.distance_to(b).get());
         Px(total)
     }
 
@@ -358,7 +383,7 @@ impl PathBuilder {
         let rx = r.width().get() * 0.5;
         let ry = r.height().get() * 0.5;
         // Magic constant for approximating a quarter circle with one cubic.
-        const K: f32 = 0.552_284_75;
+        const K: f32 = 0.552_284_8;
         let (kx, ky) = (rx * K, ry * K);
         let (cx, cy) = (c.x.get(), c.y.get());
         let p = |x: f32, y: f32| Point::new(Px(x), Px(y));
@@ -387,7 +412,7 @@ impl PathBuilder {
         if c.is_zero() {
             return self.rect(r);
         }
-        const K: f32 = 0.552_284_75;
+        const K: f32 = 0.552_284_8;
         let (x0, y0) = (r.min_x().get(), r.min_y().get());
         let (x1, y1) = (r.max_x().get(), r.max_y().get());
         let (tl, tr, br, bl) =
@@ -564,7 +589,11 @@ mod tests {
     fn control_bounds_enclose_the_flattened_curve() {
         let mut b = PathBuilder::new();
         b.move_to(point(px(0.0), px(0.0)));
-        b.cubic_to(point(px(0.0), px(100.0)), point(px(100.0), px(100.0)), point(px(100.0), px(0.0)));
+        b.cubic_to(
+            point(px(0.0), px(100.0)),
+            point(px(100.0), px(100.0)),
+            point(px(100.0), px(0.0)),
+        );
         let p = b.build();
         let bounds = p.control_bounds();
         p.flatten(px(0.05), |a, _| {
@@ -613,6 +642,36 @@ mod tests {
         assert!(bounds.max_x() <= r.max_x() + px(0.001));
         assert!(bounds.min_y() >= r.min_y() - px(0.001));
         assert!(bounds.max_y() <= r.max_y() + px(0.001));
+    }
+
+    #[test]
+    fn open_flattening_does_not_add_the_return_leg() {
+        // Dashing and stroking read the path as authored; adding the implicit
+        // closing segment would double a straight line's length.
+        let mut b = PathBuilder::new();
+        b.move_to(point(px(0.0), px(0.0)));
+        b.line_to(point(px(100.0), px(0.0)));
+        let p = b.build();
+
+        let mut closed_len = 0.0;
+        p.flatten(px(0.1), |a, c| closed_len += a.distance_to(c).get());
+        let mut open_len = 0.0;
+        p.flatten_open(px(0.1), |a, c| open_len += a.distance_to(c).get());
+
+        assert!((open_len - 100.0).abs() < 1e-3, "open flatten gave {open_len}");
+        assert!((closed_len - 200.0).abs() < 1e-3, "closed flatten gave {closed_len}");
+        assert!((p.length(px(0.1)).get() - 100.0).abs() < 1e-3, "length must measure as authored");
+    }
+
+    #[test]
+    fn an_explicit_close_still_emits_its_segment_in_open_mode() {
+        let mut b = PathBuilder::new();
+        b.move_to(point(px(0.0), px(0.0)));
+        b.line_to(point(px(10.0), px(0.0)));
+        b.close();
+        let mut len = 0.0;
+        b.build().flatten_open(px(0.1), |a, c| len += a.distance_to(c).get());
+        assert!((len - 20.0).abs() < 1e-3, "explicit close was dropped, got {len}");
     }
 
     #[test]

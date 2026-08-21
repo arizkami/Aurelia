@@ -122,10 +122,8 @@ impl ElementId {
     /// The high bit is set so that key-derived ids can never collide with the
     /// counter-derived ids from [`ElementId::unique`].
     pub fn from_key<K: core::hash::Hash>(key: K) -> Self {
-        use core::hash::{BuildHasher, Hasher};
-        let mut h = rustc_hash::FxBuildHasher.build_hasher();
-        key.hash(&mut h);
-        Self(h.finish() | (1 << 63))
+        use core::hash::BuildHasher;
+        Self(rustc_hash::FxBuildHasher.hash_one(key) | (1 << 63))
     }
 
     /// Combines a parent id with a child key, so sibling lists keep stable

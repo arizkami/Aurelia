@@ -8,11 +8,34 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# The winit backend and the standalone application runner. On by default; a
+# plug-in that renders into a host-owned window can turn it off and keep the
+# event, keyboard, monitor, scheduler and foreign-window types.
+default = ["winit-backend", "clipboard"]
+winit-backend = ["dep:winit"]
+# System clipboard support, via `arboard`. Without it, clipboard operations
+# report `PlatformError::Unsupported` unless the embedder supplies its own
+# `ClipboardProvider`.
+clipboard = ["dep:arboard"]
+
+# The smoke test drives `App`, which only exists with the runner compiled in.
+# Without this, `cargo test --no-default-features` — the plug-in configuration
+# the feature exists to support — fails to build the example.
+[[example]]
+name = "window_smoke"
+required-features = ["winit-backend"]
+
 [dependencies]
 sphere-core.workspace = true
-winit.workspace = true
 raw-window-handle.workspace = true
+bitflags.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 smallvec.workspace = true
 rustc-hash.workspace = true
+
+winit = { workspace = true, optional = true }
+# `default-features = false` drops arboard's image-data support, which would
+# otherwise pull the whole `image` crate in for a text clipboard.
+arboard = { version = "3.6", default-features = false, optional = true }

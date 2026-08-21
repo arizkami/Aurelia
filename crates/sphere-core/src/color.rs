@@ -58,12 +58,7 @@ impl Color {
     /// Builds from 8-bit sRGB components.
     #[inline]
     pub fn rgba8(r: u8, g: u8, b: u8, a: u8) -> Self {
-        Self {
-            r: r as f32 / 255.0,
-            g: g as f32 / 255.0,
-            b: b as f32 / 255.0,
-            a: a as f32 / 255.0,
-        }
+        Self { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a: a as f32 / 255.0 }
     }
 
     /// Parses `0xRRGGBB`, opaque.

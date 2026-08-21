@@ -1,0 +1,1485 @@
+//! The batch compiler: [`Scene`] in, GPU-ready buffers out.
+//!
+//! This is where painter-order commands become draw calls. Three rules govern
+//! it, and they are in tension, so the ordering matters:
+//!
+//! 1. **Order is never violated.** UI is painted back to front and overlapping
+//!    translucent content depends on it. Commands are therefore merged only
+//!    when *adjacent* and compatible — run-length batching, not a global sort.
+//!    A global sort would batch better and draw wrong.
+//! 2. **Invisible work is dropped before it costs anything.** Culling happens
+//!    against the device-space scissor before an instance is written, not after.
+//! 3. **State changes are counted.** A new batch means a bind or a pipeline
+//!    switch, so the compiler reports them and the diagnostics overlay makes
+//!    regressions visible.
+//!
+//! Compilation is GPU-free by construction, which is what makes it testable and
+//! benchmarkable without a device.
+
+use crate::primitives::{
+    FrameUniforms, GlyphInstance, GpuClip, GpuGradient, GpuTransform, QuadInstance, glyph_flags,
+    quad_flags,
+};
+use crate::scene::{
+    ClipKind, DrawCommand, Filter, Layer, Mesh, MeshVertex, NO_INDEX, QuadCommand, Scene,
+    SceneIndex, SceneStats, TextRasterMode,
+};
+use crate::tessellate::{TessellationOptions, Tessellator};
+use core::ops::Range;
+use rustc_hash::FxHashMap;
+use sphere_core::{
+    Affine, BlendMode, Brush, Color, Corners, DevicePx, FontId, GlyphId, ImageId, LinearColor,
+    Point, Px, Rect, Size, TextureId,
+};
+
+/// What a glyph rasteriser must answer for the compiler to emit a glyph.
+///
+/// Defined here rather than in `sphere-text` so the render crate stays
+/// independent of the text stack: `sphere-text` implements this trait, and a
+/// test can implement it with a stub in five lines.
+pub trait GlyphProvider {
+    /// Resolves a glyph to its atlas placement, rasterising on demand.
+    ///
+    /// Returning `None` means the glyph could not be produced — a missing face,
+    /// a full atlas — and the compiler silently skips it rather than failing the
+    /// whole frame. One missing glyph must not blank a window.
+    fn place_glyph(&mut self, request: GlyphRequest) -> Option<GlyphPlacement>;
+}
+
+/// A request for one glyph at one size.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct GlyphRequest {
+    /// The face.
+    pub font: FontId,
+    /// The glyph index within that face.
+    pub glyph: GlyphId,
+    /// Font size in logical pixels.
+    pub font_size: Px,
+    /// The surface scale factor, so the provider can decide MTSDF vs bitmap
+    /// from the *physical* size rather than the logical one.
+    pub device_scale: f32,
+    /// The caller's rasterisation preference.
+    pub mode: TextRasterMode,
+}
+
+/// Where a glyph lives in the atlas and how to draw it.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct GlyphPlacement {
+    /// Which atlas page.
+    pub page: u32,
+    /// Normalised `[u0, v0, u1, v1]` in that page.
+    pub uv: [f32; 4],
+    /// Ink bounds in em units, pen-relative, y-down: `[x, y, w, h]`.
+    pub bounds_em: [f32; 4],
+    /// The distance field's range in em units. Zero for a bitmap.
+    pub range_em: f32,
+    /// True when the placement is a grayscale bitmap rather than a field.
+    pub is_bitmap: bool,
+}
+
+/// What an image cache must answer for the compiler to emit a textured quad.
+pub trait TextureProvider {
+    /// Resolves an image handle to an uploaded texture.
+    fn texture_for(&mut self, image: ImageId) -> Option<TextureId>;
+}
+
+/// Which pipeline a batch runs on.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BatchKind {
+    /// Analytic rectangles, rounded rectangles, borders and shadows.
+    Quad,
+    /// Text, sampling one atlas page.
+    Glyph {
+        /// The atlas page this batch samples.
+        page: u32,
+        /// True when the page holds grayscale bitmaps rather than distance
+        /// fields, which the shader needs to know.
+        bitmap: bool,
+    },
+    /// Textured quads.
+    Image {
+        /// The texture this batch samples.
+        texture: TextureId,
+    },
+    /// Tessellated or generated triangle geometry.
+    Mesh {
+        /// Optional texture; `None` means vertex color only.
+        texture: Option<TextureId>,
+    },
+}
+
+/// A run of instances or indices that can be issued as one draw call.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Batch {
+    /// Which pipeline to bind.
+    pub kind: BatchKind,
+    /// Scissor rectangle in device pixels, relative to the batch's target.
+    pub scissor: Rect<DevicePx>,
+    /// Instance range for instanced kinds, index range for [`BatchKind::Mesh`].
+    pub range: Range<u32>,
+    /// First vertex, for mesh draws.
+    pub base_vertex: u32,
+    /// Index into [`CompiledFrame::targets`].
+    pub target: u32,
+}
+
+/// A render target the frame writes into.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct RenderTarget {
+    /// `true` for the swapchain image, `false` for an offscreen layer texture.
+    pub is_surface: bool,
+    /// Size in device pixels.
+    pub size: Size<DevicePx>,
+    /// The target's origin in scene-absolute logical pixels.
+    ///
+    /// Offscreen layers are allocated only as large as their content, so the
+    /// vertex stage subtracts this to bring scene coordinates into target
+    /// space. Allocating every layer at full window size would be simpler and
+    /// far more expensive.
+    pub origin: Point<Px>,
+}
+
+/// How a finished offscreen target composites back into its parent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Composite {
+    /// The offscreen target to read.
+    pub source: u32,
+    /// The target to write into.
+    pub destination: u32,
+    /// Where in the destination, in scene-absolute logical pixels.
+    pub bounds: Rect<Px>,
+    /// Opacity applied while compositing.
+    pub opacity: f32,
+    /// Blend mode used while compositing.
+    pub blend: BlendMode,
+    /// Effect applied before compositing.
+    pub filter: Option<Filter>,
+}
+
+/// One render pass: a contiguous run of batches sharing a target.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pass {
+    /// Index into [`CompiledFrame::targets`].
+    pub target: u32,
+    /// Range into [`CompiledFrame::batches`].
+    pub batches: Range<u32>,
+    /// Whether this pass must clear its target first.
+    ///
+    /// Only the first pass on a given target clears; a target resumed after a
+    /// nested layer must preserve what it already holds.
+    pub clear: bool,
+    /// The composite to run after this pass, if it ends a layer.
+    pub composite: Option<Composite>,
+}
+
+/// Everything a backend needs to draw one frame.
+#[derive(Clone, Debug, Default)]
+pub struct CompiledFrame {
+    /// Quad instances, indexed by [`Batch::range`].
+    pub quads: Vec<QuadInstance>,
+    /// Glyph instances.
+    pub glyphs: Vec<GlyphInstance>,
+    /// Mesh vertices.
+    pub mesh_vertices: Vec<MeshVertex>,
+    /// Mesh indices.
+    pub mesh_indices: Vec<u32>,
+    /// Transform table, indexed by instances.
+    pub transforms: Vec<GpuTransform>,
+    /// Clip table, indexed by instances.
+    pub clips: Vec<GpuClip>,
+    /// Gradient table, indexed by instances.
+    pub gradients: Vec<GpuGradient>,
+    /// Draw calls in submission order.
+    pub batches: Vec<Batch>,
+    /// Render passes in submission order.
+    pub passes: Vec<Pass>,
+    /// Render targets referenced by passes.
+    pub targets: Vec<RenderTarget>,
+    /// Per-frame uniforms.
+    pub uniforms: FrameUniforms,
+    /// Workload figures.
+    pub stats: SceneStats,
+}
+
+impl CompiledFrame {
+    /// Drops every buffer's contents while keeping the allocations.
+    pub fn clear(&mut self) {
+        self.quads.clear();
+        self.glyphs.clear();
+        self.mesh_vertices.clear();
+        self.mesh_indices.clear();
+        self.transforms.clear();
+        self.clips.clear();
+        self.gradients.clear();
+        self.batches.clear();
+        self.passes.clear();
+        self.targets.clear();
+        self.stats = SceneStats::default();
+    }
+
+    /// True when the frame would draw nothing.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.batches.is_empty()
+    }
+
+    /// Total bytes that must be uploaded for this frame.
+    pub fn upload_bytes(&self) -> u64 {
+        use core::mem::size_of;
+        (self.quads.len() * size_of::<QuadInstance>()
+            + self.glyphs.len() * size_of::<GlyphInstance>()
+            + self.mesh_vertices.len() * size_of::<MeshVertex>()
+            + self.mesh_indices.len() * 4
+            + self.transforms.len() * size_of::<GpuTransform>()
+            + self.clips.len() * size_of::<GpuClip>()
+            + self.gradients.len() * size_of::<GpuGradient>()) as u64
+    }
+}
+
+/// Turns scenes into [`CompiledFrame`]s, reusing its buffers across frames.
+pub struct BatchCompiler {
+    frame: CompiledFrame,
+    tessellator: Tessellator,
+    /// Absolute clip bounds and radii, resolved once per frame per clip index.
+    resolved_clips: Vec<ResolvedClip>,
+    /// Maps a scene paint index to a gradient table index, so a gradient shared
+    /// by many primitives is uploaded once.
+    gradient_map: FxHashMap<SceneIndex, u32>,
+    /// Stack of open targets during the layer walk.
+    target_stack: Vec<OpenTarget>,
+    current_batch: Option<OpenBatch>,
+    pass_start: u32,
+    time: f32,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct ResolvedClip {
+    /// Intersected bounds of the whole ancestor chain, in logical pixels.
+    bounds: Rect<Px>,
+    /// Radii of the nearest rounded clip, or zero.
+    radii: Corners<Px>,
+    /// Whether the chain contains a rounded or path clip.
+    needs_shader_clip: bool,
+    /// Index into the GPU clip table.
+    gpu_index: u32,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct OpenTarget {
+    target: u32,
+    layer: SceneIndex,
+    /// Where the parent's pass should resume from.
+    parent_target: u32,
+}
+
+#[derive(Clone, Debug)]
+struct OpenBatch {
+    kind: BatchKind,
+    scissor: Rect<DevicePx>,
+    start: u32,
+    base_vertex: u32,
+    target: u32,
+}
+
+impl Default for BatchCompiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BatchCompiler {
+    /// A new compiler.
+    pub fn new() -> Self {
+        Self {
+            frame: CompiledFrame::default(),
+            tessellator: Tessellator::new(),
+            resolved_clips: Vec::new(),
+            gradient_map: FxHashMap::default(),
+            target_stack: Vec::new(),
+            current_batch: None,
+            pass_start: 0,
+            time: 0.0,
+        }
+    }
+
+    /// Sets the animation clock handed to shaders via [`FrameUniforms::time`].
+    pub fn set_time(&mut self, seconds: f32) {
+        self.time = seconds;
+    }
+
+    /// The most recently compiled frame.
+    #[inline]
+    pub fn frame(&self) -> &CompiledFrame {
+        &self.frame
+    }
+
+    /// Compiles a scene.
+    pub fn compile(
+        &mut self,
+        scene: &Scene,
+        glyphs: &mut dyn GlyphProvider,
+        textures: &mut dyn TextureProvider,
+    ) -> &CompiledFrame {
+        self.frame.clear();
+        self.gradient_map.clear();
+        self.target_stack.clear();
+        self.current_batch = None;
+        self.pass_start = 0;
+
+        let scale = scene.scale_factor;
+        let (vw, vh) = scene.viewport.to_surface_extent(scale);
+        self.frame.uniforms = FrameUniforms {
+            viewport: [vw as f32, vh as f32],
+            scale_factor: scale.get(),
+            time: self.time,
+        };
+
+        // The surface is always target 0.
+        self.frame.targets.push(RenderTarget {
+            is_surface: true,
+            size: Size::new(DevicePx(vw as i32), DevicePx(vh as i32)),
+            origin: Point::ZERO,
+        });
+
+        for t in &scene.transforms {
+            self.frame.transforms.push(GpuTransform::from_affine(*t, scale));
+        }
+        self.resolve_clips(scene);
+
+        let viewport_px = Rect::new(Point::ZERO, scene.viewport);
+        self.frame.stats.commands = scene.commands.len() as u32;
+
+        for cmd in &scene.commands {
+            match cmd {
+                DrawCommand::BeginLayer { layer } => self.begin_layer(scene, *layer),
+                DrawCommand::EndLayer => self.end_layer(scene),
+                _ => self.emit(scene, cmd, viewport_px, glyphs, textures),
+            }
+        }
+
+        // A scene that ends with layers still open would leave content in an
+        // offscreen texture that never composites. Close them.
+        while !self.target_stack.is_empty() {
+            self.end_layer(scene);
+        }
+        self.flush_batch();
+        self.close_pass(0, None);
+
+        self.frame.stats.batches = self.frame.batches.len() as u32;
+        self.frame.stats.quads = self.frame.quads.len() as u32;
+        self.frame.stats.glyphs = self.frame.glyphs.len() as u32;
+        self.frame.stats.triangles = (self.frame.mesh_indices.len() / 3) as u32;
+        self.frame.stats.layers = self.frame.targets.len().saturating_sub(1) as u32;
+        &self.frame
+    }
+
+    // -------------------------------------------------------------- clips
+
+    fn resolve_clips(&mut self, scene: &Scene) {
+        self.resolved_clips.clear();
+        self.resolved_clips.reserve(scene.clips.len());
+
+        for i in 0..scene.clips.len() {
+            let clip = &scene.clips[i];
+            // Parents always precede children: the canvas only ever appends a
+            // clip whose parent already exists, so one forward pass suffices.
+            let (parent_bounds, parent_radii, parent_shader) =
+                if clip.parent == NO_INDEX || clip.parent as usize >= self.resolved_clips.len() {
+                    (Rect::INFINITE, Corners::ZERO, false)
+                } else {
+                    let p = self.resolved_clips[clip.parent as usize];
+                    (p.bounds, p.radii, p.needs_shader_clip)
+                };
+
+            let bounds = parent_bounds.intersection(clip.bounds);
+            let (radii, shader) = match &clip.kind {
+                ClipKind::Rect => (parent_radii, parent_shader),
+                // Only the innermost rounded clip is evaluated analytically.
+                // Nesting two rounded clips is vanishingly rare in UI, and the
+                // outer one is still enforced by the intersected scissor, so
+                // the result is conservative rather than wrong.
+                ClipKind::Rounded(r) => (*r, true),
+                // A path clip needs a mask the backend builds separately; the
+                // scissor keeps it conservative until then.
+                ClipKind::Path { .. } => (parent_radii, true),
+            };
+
+            let gpu_index = self.frame.clips.len() as u32;
+            self.frame.clips.push(GpuClip {
+                bounds: [
+                    bounds.min_x().get(),
+                    bounds.min_y().get(),
+                    bounds.max_x().get(),
+                    bounds.max_y().get(),
+                ],
+                radii: radii.clamp_for(bounds.size).to_array(),
+            });
+            self.resolved_clips.push(ResolvedClip {
+                bounds,
+                radii,
+                needs_shader_clip: shader,
+                gpu_index,
+            });
+        }
+
+        if self.resolved_clips.is_empty() {
+            self.frame.clips.push(GpuClip::INFINITE);
+            self.resolved_clips.push(ResolvedClip {
+                bounds: Rect::INFINITE,
+                radii: Corners::ZERO,
+                needs_shader_clip: false,
+                gpu_index: 0,
+            });
+        }
+    }
+
+    #[inline]
+    fn clip_of(&self, i: SceneIndex) -> ResolvedClip {
+        self.resolved_clips.get(i as usize).copied().unwrap_or(self.resolved_clips[0])
+    }
+
+    // ------------------------------------------------------------- layers
+
+    fn begin_layer(&mut self, scene: &Scene, layer_index: SceneIndex) {
+        let Some(layer) = scene.layers.get(layer_index as usize) else { return };
+        self.flush_batch();
+
+        let scale = scene.scale_factor;
+        let device = layer.bounds.round_out(scale);
+        let (w, h) = device.size.to_extent();
+        // Cap the offscreen allocation at the surface size. A layer whose
+        // bounds are enormous (an unclipped shadow, a runaway transform) must
+        // not turn into a gigabyte of render target.
+        let (max_w, max_h) = (
+            self.frame.targets[0].size.width.as_u32().max(1),
+            self.frame.targets[0].size.height.as_u32().max(1),
+        );
+        let size = Size::new(
+            DevicePx(w.min(max_w.saturating_mul(2)) as i32),
+            DevicePx(h.min(max_h.saturating_mul(2)) as i32),
+        );
+
+        let parent_target = self.target_stack.last().map(|t| t.target).unwrap_or(0);
+        self.frame.targets.push(RenderTarget {
+            is_surface: false,
+            size,
+            origin: layer.bounds.origin,
+        });
+        let target = (self.frame.targets.len() - 1) as u32;
+
+        self.close_pass(parent_target, None);
+        self.target_stack.push(OpenTarget { target, layer: layer_index, parent_target });
+    }
+
+    fn end_layer(&mut self, scene: &Scene) {
+        let Some(open) = self.target_stack.pop() else { return };
+        self.flush_batch();
+
+        let layer = scene.layers.get(open.layer as usize).cloned().unwrap_or(Layer {
+            bounds: Rect::ZERO,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            filter: None,
+            end_command: NO_INDEX,
+        });
+
+        self.close_pass(
+            open.target,
+            Some(Composite {
+                source: open.target,
+                destination: open.parent_target,
+                bounds: layer.bounds,
+                opacity: layer.opacity,
+                blend: layer.blend,
+                filter: layer.filter,
+            }),
+        );
+    }
+
+    fn close_pass(&mut self, target: u32, composite: Option<Composite>) {
+        let end = self.frame.batches.len() as u32;
+        if end == self.pass_start && composite.is_none() {
+            return;
+        }
+        // A target is cleared by the first pass that writes it. Offscreen
+        // layers always start blank; the surface is cleared once per frame.
+        let clear = !self.frame.passes.iter().any(|p| p.target == target);
+        self.frame.passes.push(Pass { target, batches: self.pass_start..end, clear, composite });
+        self.pass_start = end;
+    }
+
+    #[inline]
+    fn current_target(&self) -> u32 {
+        self.target_stack.last().map(|t| t.target).unwrap_or(0)
+    }
+
+    // --------------------------------------------------------- batching
+
+    fn push_instance(&mut self, kind: BatchKind, scissor: Rect<DevicePx>, count: u32) {
+        let target = self.current_target();
+        let compatible = self
+            .current_batch
+            .as_ref()
+            .is_some_and(|b| b.kind == kind && b.scissor == scissor && b.target == target);
+        if !compatible {
+            self.flush_batch();
+            let start = match kind {
+                BatchKind::Quad => self.frame.quads.len() as u32,
+                BatchKind::Glyph { .. } => self.frame.glyphs.len() as u32,
+                BatchKind::Image { .. } => self.frame.quads.len() as u32,
+                BatchKind::Mesh { .. } => self.frame.mesh_indices.len() as u32,
+            };
+            self.current_batch = Some(OpenBatch { kind, scissor, start, base_vertex: 0, target });
+        }
+        let _ = count;
+    }
+
+    fn flush_batch(&mut self) {
+        let Some(b) = self.current_batch.take() else { return };
+        let end = match b.kind {
+            BatchKind::Quad | BatchKind::Image { .. } => self.frame.quads.len() as u32,
+            BatchKind::Glyph { .. } => self.frame.glyphs.len() as u32,
+            BatchKind::Mesh { .. } => self.frame.mesh_indices.len() as u32,
+        };
+        if end > b.start {
+            self.frame.batches.push(Batch {
+                kind: b.kind,
+                scissor: b.scissor,
+                range: b.start..end,
+                base_vertex: b.base_vertex,
+                target: b.target,
+            });
+        }
+    }
+
+    // --------------------------------------------------------- emission
+
+    fn emit(
+        &mut self,
+        scene: &Scene,
+        cmd: &DrawCommand,
+        viewport: Rect<Px>,
+        glyph_provider: &mut dyn GlyphProvider,
+        textures: &mut dyn TextureProvider,
+    ) {
+        match cmd {
+            DrawCommand::Quad(q) => self.emit_quad(scene, q, viewport),
+            DrawCommand::Shadow { shape, blur_radius, color, inset, transform, clip } => self
+                .emit_shadow(
+                    scene,
+                    *shape,
+                    *blur_radius,
+                    *color,
+                    *inset,
+                    *transform,
+                    *clip,
+                    viewport,
+                ),
+            DrawCommand::Text { run, paint, transform, clip } => {
+                self.emit_text(scene, *run, *paint, *transform, *clip, viewport, glyph_provider)
+            }
+            DrawCommand::Image { dest, source, image, tint, radii, transform, clip } => self
+                .emit_image(
+                    scene, *dest, *source, *image, *tint, *radii, *transform, *clip, viewport,
+                    textures,
+                ),
+            DrawCommand::FillPath { path, paint, fill_rule, transform, clip } => {
+                self.emit_fill_path(scene, *path, *paint, *fill_rule, *transform, *clip, viewport)
+            }
+            DrawCommand::StrokePath { path, paint, stroke, transform, clip } => {
+                self.emit_stroke_path(scene, *path, *paint, *stroke, *transform, *clip, viewport)
+            }
+            DrawCommand::Mesh { mesh, texture, transform, clip } => {
+                self.emit_mesh(scene, *mesh, *texture, *transform, *clip, viewport, textures)
+            }
+            DrawCommand::BeginLayer { .. } | DrawCommand::EndLayer => {}
+        }
+    }
+
+    /// Computes the device-space scissor and rejects the command when it cannot
+    /// contribute anything visible.
+    fn visible(
+        &mut self,
+        scene: &Scene,
+        local_bounds: Rect<Px>,
+        transform: SceneIndex,
+        clip: SceneIndex,
+        viewport: Rect<Px>,
+    ) -> Option<(ResolvedClip, Rect<DevicePx>)> {
+        let rc = self.clip_of(clip);
+        let t = scene.transform(transform);
+        let world = t.transform_rect_bounds(local_bounds);
+
+        let visible_region = rc.bounds.intersection(viewport);
+        if visible_region.is_empty() || !world.intersects(visible_region) {
+            self.frame.stats.culled += 1;
+            return None;
+        }
+        Some((rc, visible_region.round_out(scene.scale_factor)))
+    }
+
+    fn emit_quad(&mut self, scene: &Scene, q: &QuadCommand, viewport: Rect<Px>) {
+        let Some((rc, scissor)) = self.visible(scene, q.bounds, q.transform, q.clip, viewport)
+        else {
+            return;
+        };
+
+        let mut flags = 0u32;
+        if rc.needs_shader_clip {
+            flags |= quad_flags::CLIP_ROUNDED;
+        }
+        let mut color = LinearColor::TRANSPARENT;
+        let mut gradient = u32::MAX;
+
+        if q.fill != NO_INDEX
+            && let Some(paint) = scene.paints.get(q.fill as usize)
+        {
+            match &paint.brush {
+                Brush::Solid(c) => {
+                    flags |= quad_flags::FILL_SOLID;
+                    color = c.scale_alpha(paint.opacity).to_linear();
+                }
+                Brush::Gradient(g) => {
+                    flags |= quad_flags::FILL_GRADIENT;
+                    gradient = self.intern_gradient(q.fill, g);
+                    // The shader still needs a base color for the degenerate
+                    // single-stop case and for premultiplied alpha maths.
+                    color = g.sample(0.0).scale_alpha(paint.opacity).to_linear();
+                }
+                Brush::Image { tint, .. } => {
+                    flags |= quad_flags::FILL_SOLID;
+                    color = tint.scale_alpha(paint.opacity).to_linear();
+                }
+            }
+        }
+        let border = q.border_width > Px::ZERO && !q.border_color.is_transparent();
+        if border {
+            flags |= quad_flags::BORDER;
+        }
+
+        self.push_instance(BatchKind::Quad, scissor, 1);
+        self.frame.quads.push(QuadInstance {
+            bounds: [
+                q.bounds.min_x().get(),
+                q.bounds.min_y().get(),
+                q.bounds.width().get(),
+                q.bounds.height().get(),
+            ],
+            radii: q.radii.clamp_for(q.bounds.size).to_array(),
+            color: color.to_array(),
+            border_color: q.border_color.to_linear().to_array(),
+            border_width: if border { q.border_width.get() } else { 0.0 },
+            blur_sigma: 0.0,
+            flags,
+            gradient,
+            transform_index: q.transform,
+            clip_index: rc.gpu_index,
+            _pad: [0; 2],
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_shadow(
+        &mut self,
+        scene: &Scene,
+        shape: sphere_core::RoundedRect,
+        blur_radius: Px,
+        color: Color,
+        inset: bool,
+        transform: SceneIndex,
+        clip: SceneIndex,
+        viewport: Rect<Px>,
+    ) {
+        // The blurred footprint reaches beyond the shape, so cull against the
+        // grown bounds or an offscreen shape's visible shadow disappears.
+        let grow = Px(blur_radius.get() * 1.5 + 1.0);
+        let grown = shape.rect.outset(sphere_core::Edges::all(grow));
+        let Some((rc, scissor)) = self.visible(scene, grown, transform, clip, viewport) else {
+            return;
+        };
+
+        let mut flags = quad_flags::SHADOW | quad_flags::FILL_SOLID;
+        if inset {
+            flags |= quad_flags::SHADOW_INSET;
+        }
+        if rc.needs_shader_clip {
+            flags |= quad_flags::CLIP_ROUNDED;
+        }
+
+        self.push_instance(BatchKind::Quad, scissor, 1);
+        self.frame.quads.push(QuadInstance {
+            bounds: [
+                shape.rect.min_x().get(),
+                shape.rect.min_y().get(),
+                shape.rect.width().get(),
+                shape.rect.height().get(),
+            ],
+            radii: shape.clamped_radii().to_array(),
+            color: color.to_linear().to_array(),
+            border_color: [0.0; 4],
+            border_width: 0.0,
+            // The analytic box-shadow approximation treats `blur_radius` as
+            // twice sigma, matching the CSS definition.
+            blur_sigma: (blur_radius.get() * 0.5).max(1e-3),
+            flags,
+            gradient: u32::MAX,
+            transform_index: transform,
+            clip_index: rc.gpu_index,
+            _pad: [0; 2],
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_text(
+        &mut self,
+        scene: &Scene,
+        run_index: SceneIndex,
+        paint_index: SceneIndex,
+        transform: SceneIndex,
+        clip: SceneIndex,
+        viewport: Rect<Px>,
+        provider: &mut dyn GlyphProvider,
+    ) {
+        let Some(run) = scene.runs.get(run_index as usize) else { return };
+        let color = match scene.paints.get(paint_index as usize).map(|p| (&p.brush, p.opacity)) {
+            Some((Brush::Solid(c), o)) => c.scale_alpha(o).to_linear(),
+            Some((Brush::Gradient(g), o)) => g.sample(0.5).scale_alpha(o).to_linear(),
+            Some((Brush::Image { tint, .. }, o)) => tint.scale_alpha(o).to_linear(),
+            None => return,
+        };
+
+        let size = run.font_size.get();
+        let scale = scene.scale_factor.get();
+        let outline = run.outline_width > Px::ZERO;
+        let outline_color = run.outline_color.to_linear();
+
+        for g in &run.glyphs {
+            let Some(p) = provider.place_glyph(GlyphRequest {
+                font: run.font,
+                glyph: g.glyph,
+                font_size: run.font_size,
+                device_scale: scale,
+                mode: run.raster,
+            }) else {
+                continue;
+            };
+            if p.uv[2] <= p.uv[0] || p.uv[3] <= p.uv[1] {
+                // A zero-area placement is a space or a control character.
+                continue;
+            }
+
+            // Em-relative bounds scale by the font size and offset by the pen.
+            let bounds = Rect::new(
+                Point::new(
+                    Px(g.position.x.get() + p.bounds_em[0] * size),
+                    Px(g.position.y.get() + p.bounds_em[1] * size),
+                ),
+                Size::new(Px(p.bounds_em[2] * size), Px(p.bounds_em[3] * size)),
+            );
+
+            let Some((rc, scissor)) = self.visible(scene, bounds, transform, clip, viewport) else {
+                continue;
+            };
+
+            let mut flags = 0u32;
+            if p.is_bitmap {
+                flags |= glyph_flags::BITMAP;
+            }
+            if outline {
+                flags |= glyph_flags::OUTLINE;
+            }
+            if rc.needs_shader_clip {
+                flags |= glyph_flags::CLIP_ROUNDED;
+            }
+
+            self.push_instance(BatchKind::Glyph { page: p.page, bitmap: p.is_bitmap }, scissor, 1);
+            self.frame.glyphs.push(GlyphInstance {
+                bounds: [
+                    bounds.min_x().get(),
+                    bounds.min_y().get(),
+                    bounds.width().get(),
+                    bounds.height().get(),
+                ],
+                uv: p.uv,
+                color: color.to_array(),
+                outline_color: outline_color.to_array(),
+                // The field's em range becomes a destination-pixel range once
+                // multiplied by the font size and the surface scale. This is
+                // what lets one batch mix sizes and still antialias correctly.
+                px_range: (p.range_em * size * scale).max(1e-3),
+                outline_width: run.outline_width.get(),
+                flags,
+                atlas_page: p.page,
+                transform_index: transform,
+                clip_index: rc.gpu_index,
+                _pad: [0; 2],
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_image(
+        &mut self,
+        scene: &Scene,
+        dest: Rect<Px>,
+        source: Rect<Px>,
+        image: ImageId,
+        tint: Color,
+        radii: Corners<Px>,
+        transform: SceneIndex,
+        clip: SceneIndex,
+        viewport: Rect<Px>,
+        textures: &mut dyn TextureProvider,
+    ) {
+        let Some(texture) = textures.texture_for(image) else {
+            self.frame.stats.culled += 1;
+            return;
+        };
+        let Some((rc, scissor)) = self.visible(scene, dest, transform, clip, viewport) else {
+            return;
+        };
+
+        let mut flags = quad_flags::FILL_TEXTURE;
+        if rc.needs_shader_clip {
+            flags |= quad_flags::CLIP_ROUNDED;
+        }
+
+        self.push_instance(BatchKind::Image { texture }, scissor, 1);
+        self.frame.quads.push(QuadInstance {
+            bounds: [
+                dest.min_x().get(),
+                dest.min_y().get(),
+                dest.width().get(),
+                dest.height().get(),
+            ],
+            radii: radii.clamp_for(dest.size).to_array(),
+            color: tint.to_linear().to_array(),
+            // The source rectangle rides in the border-color slot, which is
+            // unused for textured quads. Reusing it keeps the instance at 96
+            // bytes instead of growing the struct for every quad in the frame.
+            border_color: [
+                source.min_x().get(),
+                source.min_y().get(),
+                source.width().get(),
+                source.height().get(),
+            ],
+            border_width: 0.0,
+            blur_sigma: 0.0,
+            flags,
+            gradient: u32::MAX,
+            transform_index: transform,
+            clip_index: rc.gpu_index,
+            _pad: [0; 2],
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_fill_path(
+        &mut self,
+        scene: &Scene,
+        path_index: SceneIndex,
+        paint_index: SceneIndex,
+        fill_rule: sphere_core::FillRule,
+        transform: SceneIndex,
+        clip: SceneIndex,
+        viewport: Rect<Px>,
+    ) {
+        let Some(path) = scene.paths.get(path_index as usize) else { return };
+        let Some((_, scissor)) =
+            self.visible(scene, path.control_bounds(), transform, clip, viewport)
+        else {
+            return;
+        };
+        let color = match scene.paints.get(paint_index as usize).map(|p| (&p.brush, p.opacity)) {
+            Some((Brush::Solid(c), o)) => c.scale_alpha(o).to_linear(),
+            Some((Brush::Gradient(g), o)) => g.sample(0.5).scale_alpha(o).to_linear(),
+            Some((Brush::Image { tint, .. }, o)) => tint.scale_alpha(o).to_linear(),
+            None => return,
+        };
+        let opts = TessellationOptions {
+            tolerance: 0.25,
+            scale: scene.transform(transform).approx_scale() * scene.scale_factor.get(),
+        };
+        let Ok(mesh) = self.tessellator.fill_path(path, fill_rule, color, opts) else { return };
+        self.append_mesh(&mesh, None, scissor, scene.transform(transform));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_stroke_path(
+        &mut self,
+        scene: &Scene,
+        path_index: SceneIndex,
+        paint_index: SceneIndex,
+        stroke_index: SceneIndex,
+        transform: SceneIndex,
+        clip: SceneIndex,
+        viewport: Rect<Px>,
+    ) {
+        let Some(path) = scene.paths.get(path_index as usize) else { return };
+        let Some(stroke) = scene.strokes.get(stroke_index as usize) else { return };
+        let grow = sphere_core::Edges::all(Px(stroke.width.get() * 0.5 + 1.0));
+        let Some((_, scissor)) =
+            self.visible(scene, path.control_bounds().outset(grow), transform, clip, viewport)
+        else {
+            return;
+        };
+        let color = match scene.paints.get(paint_index as usize).map(|p| (&p.brush, p.opacity)) {
+            Some((Brush::Solid(c), o)) => c.scale_alpha(o).to_linear(),
+            Some((Brush::Gradient(g), o)) => g.sample(0.5).scale_alpha(o).to_linear(),
+            Some((Brush::Image { tint, .. }, o)) => tint.scale_alpha(o).to_linear(),
+            None => return,
+        };
+        let opts = TessellationOptions {
+            tolerance: 0.25,
+            scale: scene.transform(transform).approx_scale() * scene.scale_factor.get(),
+        };
+        let dashed;
+        let target = if stroke.dash.is_empty() {
+            path
+        } else {
+            dashed = crate::tessellate::apply_dash(
+                path,
+                &stroke.dash,
+                stroke.dash_offset,
+                Px(opts.local_tolerance()),
+            );
+            &dashed
+        };
+        let Ok(mesh) = self.tessellator.stroke_path(target, stroke, color, opts) else { return };
+        self.append_mesh(&mesh, None, scissor, scene.transform(transform));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_mesh(
+        &mut self,
+        scene: &Scene,
+        mesh_index: SceneIndex,
+        texture: Option<TextureId>,
+        transform: SceneIndex,
+        clip: SceneIndex,
+        viewport: Rect<Px>,
+        textures: &mut dyn TextureProvider,
+    ) {
+        let Some(mesh) = scene.meshes.get(mesh_index as usize) else { return };
+        let _ = textures;
+        let Some((_, scissor)) = self.visible(scene, mesh.bounds(), transform, clip, viewport)
+        else {
+            return;
+        };
+        self.append_mesh(mesh, texture, scissor, scene.transform(transform));
+    }
+
+    /// Appends mesh geometry, baking the transform into the vertices.
+    ///
+    /// Mesh vertices carry no transform index — an indexed transform would need
+    /// a per-vertex lookup, and meshes are already CPU-side geometry, so baking
+    /// is both simpler and cheaper.
+    fn append_mesh(
+        &mut self,
+        mesh: &Mesh,
+        texture: Option<TextureId>,
+        scissor: Rect<DevicePx>,
+        transform: Affine,
+    ) {
+        if mesh.is_empty() {
+            return;
+        }
+        let base = self.frame.mesh_vertices.len() as u32;
+        // A single mesh cannot exceed the u32 index space, and neither can the
+        // accumulated frame; bail rather than wrap around into garbage indices.
+        if base as usize + mesh.vertices.len() > u32::MAX as usize {
+            return;
+        }
+
+        let kind = BatchKind::Mesh { texture };
+        let target = self.current_target();
+        let compatible = self.current_batch.as_ref().is_some_and(|b| {
+            b.kind == kind && b.scissor == scissor && b.target == target && b.base_vertex == 0
+        });
+        if !compatible {
+            self.flush_batch();
+            self.current_batch = Some(OpenBatch {
+                kind,
+                scissor,
+                start: self.frame.mesh_indices.len() as u32,
+                // Indices are rebased on append, so every mesh batch draws from
+                // vertex zero. That lets consecutive meshes merge into one call.
+                base_vertex: 0,
+                target,
+            });
+        }
+
+        if transform == Affine::IDENTITY {
+            self.frame.mesh_vertices.extend_from_slice(&mesh.vertices);
+        } else {
+            self.frame.mesh_vertices.extend(mesh.vertices.iter().map(|v| {
+                let p = transform.apply(Point::new(Px(v.position[0]), Px(v.position[1])));
+                MeshVertex { position: [p.x.get(), p.y.get()], uv: v.uv, color: v.color }
+            }));
+        }
+        self.frame.mesh_indices.extend(mesh.indices.iter().map(|i| i + base));
+    }
+
+    fn intern_gradient(&mut self, paint_index: SceneIndex, g: &sphere_core::Gradient) -> u32 {
+        if let Some(i) = self.gradient_map.get(&paint_index) {
+            return *i;
+        }
+        let i = self.frame.gradients.len() as u32;
+        self.frame.gradients.push(GpuGradient::from_gradient(g));
+        self.gradient_map.insert(paint_index, i);
+        i
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canvas::Canvas;
+    use sphere_core::{Gradient, ScaleFactor, px, rect, size};
+
+    /// A glyph provider that hands back a fixed placement, so batching and
+    /// culling can be tested without a font stack.
+    struct StubGlyphs {
+        page: u32,
+        calls: usize,
+    }
+    impl GlyphProvider for StubGlyphs {
+        fn place_glyph(&mut self, r: GlyphRequest) -> Option<GlyphPlacement> {
+            self.calls += 1;
+            Some(GlyphPlacement {
+                // Alternate pages so page-switch batching is exercised.
+                page: if self.page == 0 { 0 } else { (r.glyph.0 as u32) % self.page },
+                uv: [0.0, 0.0, 0.1, 0.1],
+                bounds_em: [0.0, -0.8, 0.6, 0.8],
+                range_em: 0.1,
+                is_bitmap: false,
+            })
+        }
+    }
+
+    struct StubTextures(bool);
+    impl TextureProvider for StubTextures {
+        fn texture_for(&mut self, _: ImageId) -> Option<TextureId> {
+            self.0.then(|| TextureId::new(0, 1))
+        }
+    }
+
+    fn scene() -> Scene {
+        Scene::new(size(px(800.0), px(600.0)), ScaleFactor::IDENTITY)
+    }
+
+    fn compile(s: &Scene) -> CompiledFrame {
+        let mut c = BatchCompiler::new();
+        c.compile(s, &mut StubGlyphs { page: 0, calls: 0 }, &mut StubTextures(true)).clone()
+    }
+
+    #[test]
+    fn a_run_of_plain_rects_becomes_a_single_batch() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            for i in 0..500 {
+                c.fill_rect(rect(px(i as f32), px(0.0), px(1.0), px(10.0)), Color::RED);
+            }
+        }
+        let f = compile(&s);
+        assert_eq!(f.quads.len(), 500);
+        assert_eq!(f.batches.len(), 1, "500 compatible quads must be one draw call");
+        assert_eq!(f.batches[0].range, 0..500);
+    }
+
+    #[test]
+    fn changing_the_clip_starts_a_new_batch() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            c.fill_rect(rect(px(0.0), px(0.0), px(10.0), px(10.0)), Color::RED);
+            c.save();
+            c.clip_rect(rect(px(0.0), px(0.0), px(50.0), px(50.0)));
+            c.fill_rect(rect(px(0.0), px(0.0), px(10.0), px(10.0)), Color::BLUE);
+            c.restore();
+        }
+        let f = compile(&s);
+        assert_eq!(f.batches.len(), 2, "a scissor change is a state change");
+    }
+
+    #[test]
+    fn painters_order_is_never_reordered_across_kinds() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            c.fill_rect(rect(px(0.0), px(0.0), px(10.0), px(10.0)), Color::RED);
+            c.draw_image(
+                ImageId::new(0, 1),
+                rect(px(0.0), px(0.0), px(10.0), px(10.0)),
+                sphere_core::ImageFit::Fill,
+            );
+            c.fill_rect(rect(px(0.0), px(0.0), px(10.0), px(10.0)), Color::BLUE);
+        }
+        let f = compile(&s);
+        // Merging the two quads across the image would draw the image on top.
+        assert_eq!(f.batches.len(), 3);
+        assert!(matches!(f.batches[0].kind, BatchKind::Quad));
+        assert!(matches!(f.batches[1].kind, BatchKind::Image { .. }));
+        assert!(matches!(f.batches[2].kind, BatchKind::Quad));
+    }
+
+    #[test]
+    fn offscreen_primitives_are_culled_before_they_cost_an_instance() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            c.fill_rect(rect(px(0.0), px(0.0), px(10.0), px(10.0)), Color::RED);
+            c.fill_rect(rect(px(-5000.0), px(0.0), px(10.0), px(10.0)), Color::RED);
+            c.fill_rect(rect(px(5000.0), px(0.0), px(10.0), px(10.0)), Color::RED);
+            c.fill_rect(rect(px(0.0), px(-5000.0), px(10.0), px(10.0)), Color::RED);
+        }
+        let f = compile(&s);
+        assert_eq!(f.quads.len(), 1);
+        assert_eq!(f.stats.culled, 3);
+    }
+
+    #[test]
+    fn content_clipped_entirely_away_is_culled() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            c.clip_rect(rect(px(0.0), px(0.0), px(10.0), px(10.0)));
+            c.fill_rect(rect(px(500.0), px(500.0), px(10.0), px(10.0)), Color::RED);
+        }
+        let f = compile(&s);
+        assert_eq!(f.quads.len(), 0);
+        assert_eq!(f.stats.culled, 1);
+    }
+
+    #[test]
+    fn a_shadow_is_not_culled_when_only_its_blur_reaches_the_viewport() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            // The shape sits just off the left edge, but a 40 px blur spills in.
+            c.draw_shadow(
+                sphere_core::RoundedRect::uniform(
+                    rect(px(-20.0), px(100.0), px(15.0), px(50.0)),
+                    px(4.0),
+                ),
+                &sphere_core::Shadow {
+                    offset: size(px(0.0), px(0.0)),
+                    blur_radius: px(40.0),
+                    spread: Px::ZERO,
+                    color: Color::BLACK,
+                    inset: false,
+                },
+            );
+        }
+        let f = compile(&s);
+        assert_eq!(f.quads.len(), 1, "the visible blur tail was wrongly culled");
+        assert!(f.quads[0].flags & quad_flags::SHADOW != 0);
+        assert!(f.quads[0].blur_sigma > 0.0);
+    }
+
+    #[test]
+    fn clip_chains_resolve_to_the_intersected_scissor() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            c.clip_rect(rect(px(0.0), px(0.0), px(100.0), px(100.0)));
+            c.clip_rect(rect(px(50.0), px(50.0), px(200.0), px(200.0)));
+            c.fill_rect(rect(px(50.0), px(50.0), px(10.0), px(10.0)), Color::RED);
+        }
+        let f = compile(&s);
+        let sc = f.batches[0].scissor;
+        assert_eq!(sc.min_x(), DevicePx(50));
+        assert_eq!(sc.min_y(), DevicePx(50));
+        assert_eq!(sc.width(), DevicePx(50));
+        assert_eq!(sc.height(), DevicePx(50));
+    }
+
+    #[test]
+    fn a_rounded_clip_marks_instances_for_shader_evaluation() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            c.clip_rounded_rect(sphere_core::RoundedRect::uniform(
+                rect(px(0.0), px(0.0), px(100.0), px(100.0)),
+                px(8.0),
+            ));
+            c.fill_rect(rect(px(0.0), px(0.0), px(10.0), px(10.0)), Color::RED);
+        }
+        let f = compile(&s);
+        assert!(f.quads[0].flags & quad_flags::CLIP_ROUNDED != 0);
+        assert!(f.clips[f.quads[0].clip_index as usize].radii[0] > 0.0);
+    }
+
+    #[test]
+    fn a_plain_rect_clip_does_not_pay_for_shader_clipping() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            c.clip_rect(rect(px(0.0), px(0.0), px(100.0), px(100.0)));
+            c.fill_rect(rect(px(0.0), px(0.0), px(10.0), px(10.0)), Color::RED);
+        }
+        let f = compile(&s);
+        assert_eq!(f.quads[0].flags & quad_flags::CLIP_ROUNDED, 0);
+    }
+
+    #[test]
+    fn a_layer_produces_an_offscreen_target_and_a_composite() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            c.fill_rect(rect(px(0.0), px(0.0), px(10.0), px(10.0)), Color::RED);
+            c.push_opacity_layer(rect(px(0.0), px(0.0), px(100.0), px(100.0)), 0.5);
+            c.fill_rect(rect(px(0.0), px(0.0), px(50.0), px(50.0)), Color::BLUE);
+            c.end_layer();
+            c.fill_rect(rect(px(0.0), px(0.0), px(10.0), px(10.0)), Color::GREEN);
+        }
+        let f = compile(&s);
+        assert_eq!(f.targets.len(), 2, "one surface plus one offscreen layer");
+        assert!(!f.targets[1].is_surface);
+        let composite = f.passes.iter().find_map(|p| p.composite.as_ref()).expect("a composite");
+        assert_eq!(composite.source, 1);
+        assert_eq!(composite.destination, 0);
+        assert!((composite.opacity - 0.5).abs() < 1e-6);
+        // The surface must be cleared exactly once, by its first pass.
+        assert_eq!(f.passes.iter().filter(|p| p.target == 0 && p.clear).count(), 1);
+    }
+
+    #[test]
+    fn an_offscreen_target_is_capped_so_a_runaway_layer_cannot_allocate_gigabytes() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            c.push_opacity_layer(rect(px(0.0), px(0.0), px(500_000.0), px(500_000.0)), 0.5);
+            c.fill_rect(rect(px(0.0), px(0.0), px(10.0), px(10.0)), Color::RED);
+            c.end_layer();
+        }
+        let f = compile(&s);
+        let t = f.targets[1];
+        assert!(t.size.width.get() <= 800 * 2 + 1, "{t:?}");
+        assert!(t.size.height.get() <= 600 * 2 + 1, "{t:?}");
+    }
+
+    #[test]
+    fn glyphs_batch_per_atlas_page() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            let glyphs = (0u16..6)
+                .map(|i| crate::scene::PositionedGlyph {
+                    glyph: GlyphId(i),
+                    position: Point::new(px(i as f32 * 10.0), px(20.0)),
+                })
+                .collect();
+            c.draw_glyph_run(
+                crate::scene::GlyphRun {
+                    font: FontId::new(0, 1),
+                    font_size: px(16.0),
+                    glyphs,
+                    raster: TextRasterMode::Mtsdf,
+                    outline_width: Px::ZERO,
+                    outline_color: Color::TRANSPARENT,
+                },
+                Color::WHITE,
+            );
+        }
+        let mut c = BatchCompiler::new();
+        // Two pages, alternating by glyph index.
+        let f = c.compile(&s, &mut StubGlyphs { page: 2, calls: 0 }, &mut StubTextures(true));
+        assert_eq!(f.glyphs.len(), 6);
+        assert!(f.batches.len() > 1, "a page switch must split the batch");
+        assert!(f.batches.iter().all(|b| matches!(b.kind, BatchKind::Glyph { .. })));
+    }
+
+    #[test]
+    fn glyph_px_range_scales_with_font_size_and_dpi() {
+        let mut s = Scene::new(size(px(800.0), px(600.0)), ScaleFactor::new(2.0));
+        {
+            let mut c = Canvas::new(&mut s);
+            c.draw_glyph_run(
+                crate::scene::GlyphRun {
+                    font: FontId::new(0, 1),
+                    font_size: px(20.0),
+                    glyphs: smallvec::smallvec![crate::scene::PositionedGlyph {
+                        glyph: GlyphId(1),
+                        position: Point::new(px(10.0), px(30.0)),
+                    }],
+                    raster: TextRasterMode::Mtsdf,
+                    outline_width: Px::ZERO,
+                    outline_color: Color::TRANSPARENT,
+                },
+                Color::WHITE,
+            );
+        }
+        let f = compile(&s);
+        // range_em 0.1 * size 20 * scale 2 = 4 destination pixels.
+        assert!((f.glyphs[0].px_range - 4.0).abs() < 1e-4, "{}", f.glyphs[0].px_range);
+    }
+
+    #[test]
+    fn an_unresolvable_image_is_skipped_not_fatal() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            c.draw_image(
+                ImageId::new(7, 1),
+                rect(px(0.0), px(0.0), px(10.0), px(10.0)),
+                sphere_core::ImageFit::Fill,
+            );
+            c.fill_rect(rect(px(0.0), px(0.0), px(10.0), px(10.0)), Color::RED);
+        }
+        let mut c = BatchCompiler::new();
+        let f = c.compile(&s, &mut StubGlyphs { page: 0, calls: 0 }, &mut StubTextures(false));
+        assert_eq!(f.quads.len(), 1, "the rect must still draw");
+        assert_eq!(f.stats.culled, 1);
+    }
+
+    #[test]
+    fn filled_paths_tessellate_into_mesh_batches_with_valid_indices() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            let mut b = sphere_core::PathBuilder::new();
+            b.circle(Point::new(px(100.0), px(100.0)), px(40.0));
+            c.fill_path(b.build(), Color::RED);
+        }
+        let f = compile(&s);
+        assert!(!f.mesh_indices.is_empty());
+        assert!(f.mesh_indices.iter().all(|i| (*i as usize) < f.mesh_vertices.len()));
+        assert!(matches!(f.batches[0].kind, BatchKind::Mesh { texture: None }));
+    }
+
+    #[test]
+    fn consecutive_meshes_merge_and_keep_their_indices_rebased() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            for i in 0..3 {
+                let mut b = sphere_core::PathBuilder::new();
+                b.circle(Point::new(px(50.0 + i as f32 * 60.0), px(100.0)), px(20.0));
+                c.fill_path(b.build(), Color::RED);
+            }
+        }
+        let f = compile(&s);
+        assert_eq!(f.batches.len(), 1, "three compatible meshes should be one draw");
+        assert!(f.mesh_indices.iter().all(|i| (*i as usize) < f.mesh_vertices.len()));
+        assert_eq!(f.batches[0].range, 0..f.mesh_indices.len() as u32);
+    }
+
+    #[test]
+    fn transformed_meshes_are_baked_into_world_space() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            c.translate(size(px(100.0), px(100.0)));
+            let mut b = sphere_core::PathBuilder::new();
+            b.rect(rect(px(0.0), px(0.0), px(10.0), px(10.0)));
+            c.fill_path(b.build(), Color::RED);
+        }
+        let f = compile(&s);
+        assert!(
+            f.mesh_vertices.iter().all(|v| v.position[0] >= 99.0 && v.position[1] >= 99.0),
+            "mesh vertices were not transformed"
+        );
+    }
+
+    #[test]
+    fn gradients_are_interned_once_per_paint() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            let g = Gradient::vertical(px(10.0), Color::RED, Color::BLUE);
+            for i in 0..10 {
+                c.fill_rect_with(
+                    rect(px(i as f32 * 12.0), px(0.0), px(10.0), px(10.0)),
+                    Brush::Gradient(g.clone()),
+                );
+            }
+        }
+        let f = compile(&s);
+        // Each fill_rect_with records its own paint, so ten entries is correct;
+        // what must NOT happen is a gradient uploaded twice for one paint.
+        assert_eq!(f.gradients.len(), 10);
+        let idx: Vec<u32> = f.quads.iter().map(|q| q.gradient).collect();
+        assert!(idx.iter().all(|i| *i != u32::MAX));
+        assert_eq!(idx.len(), idx.iter().collect::<std::collections::HashSet<_>>().len());
+    }
+
+    #[test]
+    fn compiling_twice_reuses_buffers_and_yields_the_same_result() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            for i in 0..50 {
+                c.fill_rect(rect(px(i as f32), px(0.0), px(1.0), px(10.0)), Color::RED);
+            }
+        }
+        let mut c = BatchCompiler::new();
+        let a =
+            c.compile(&s, &mut StubGlyphs { page: 0, calls: 0 }, &mut StubTextures(true)).clone();
+        let b =
+            c.compile(&s, &mut StubGlyphs { page: 0, calls: 0 }, &mut StubTextures(true)).clone();
+        assert_eq!(a.quads.len(), b.quads.len(), "second compile leaked state");
+        assert_eq!(a.batches, b.batches);
+    }
+
+    #[test]
+    fn an_empty_scene_compiles_to_nothing_without_panicking() {
+        let s = scene();
+        let f = compile(&s);
+        assert!(f.is_empty());
+        assert_eq!(f.upload_bytes(), (f.transforms.len() * 32 + f.clips.len() * 32) as u64);
+    }
+
+    #[test]
+    fn a_zero_area_viewport_does_not_produce_a_zero_sized_target() {
+        let s = Scene::new(size(Px::ZERO, Px::ZERO), ScaleFactor::IDENTITY);
+        let f = compile(&s);
+        assert!(f.targets[0].size.width.get() >= 1);
+        assert!(f.targets[0].size.height.get() >= 1);
+    }
+
+    #[test]
+    fn an_unbalanced_layer_is_closed_by_the_compiler() {
+        // The canvas normally guarantees balance, but a scene assembled by hand
+        // must not leave content stranded in an offscreen texture.
+        let mut s = scene();
+        s.layers.push(Layer {
+            bounds: rect(px(0.0), px(0.0), px(100.0), px(100.0)),
+            opacity: 0.5,
+            blend: BlendMode::Normal,
+            filter: None,
+            end_command: NO_INDEX,
+        });
+        s.commands.push(DrawCommand::BeginLayer { layer: 0 });
+        s.commands.push(DrawCommand::Quad(QuadCommand {
+            bounds: rect(px(0.0), px(0.0), px(10.0), px(10.0)),
+            radii: Corners::ZERO,
+            fill: NO_INDEX,
+            border_color: Color::RED,
+            border_width: px(1.0),
+            transform: 0,
+            clip: 0,
+        }));
+        let f = compile(&s);
+        assert!(
+            f.passes.iter().any(|p| p.composite.is_some()),
+            "an unbalanced layer must still composite"
+        );
+    }
+
+    #[test]
+    fn stats_account_for_every_command() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            c.fill_rect(rect(px(0.0), px(0.0), px(10.0), px(10.0)), Color::RED);
+            c.fill_rect(rect(px(-9999.0), px(0.0), px(10.0), px(10.0)), Color::RED);
+        }
+        let f = compile(&s);
+        assert_eq!(f.stats.commands, 2);
+        assert_eq!(f.stats.culled, 1);
+        assert_eq!(f.stats.quads, 1);
+        assert_eq!(f.stats.batches, 1);
+    }
+}

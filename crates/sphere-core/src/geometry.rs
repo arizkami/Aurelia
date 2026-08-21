@@ -113,7 +113,10 @@ impl Point<Px> {
     /// Linear interpolation, where `t == 0` yields `self`.
     #[inline]
     pub fn lerp(self, o: Self, t: f32) -> Self {
-        Self { x: Px(self.x.get() + (o.x.get() - self.x.get()) * t), y: Px(self.y.get() + (o.y.get() - self.y.get()) * t) }
+        Self {
+            x: Px(self.x.get() + (o.x.get() - self.x.get()) * t),
+            y: Px(self.y.get() + (o.y.get() - self.y.get()) * t),
+        }
     }
 
     /// Converts to device space for GPU submission. Not rounded: see
@@ -345,7 +348,10 @@ impl<T: Scalar> Rect<T> {
     /// Geometric centre.
     #[inline]
     pub fn center(self) -> Point<T> {
-        Point { x: self.origin.x + self.size.width.half(), y: self.origin.y + self.size.height.half() }
+        Point {
+            x: self.origin.x + self.size.width.half(),
+            y: self.origin.y + self.size.height.half(),
+        }
     }
 
     /// True when the rectangle encloses no area.
@@ -434,7 +440,10 @@ impl<T: Scalar> Rect<T> {
     /// Applies `f` to every component.
     #[inline]
     pub fn map<U: Scalar>(self, mut f: impl FnMut(T) -> U) -> Rect<U> {
-        Rect { origin: Point { x: f(self.origin.x), y: f(self.origin.y) }, size: Size { width: f(self.size.width), height: f(self.size.height) } }
+        Rect {
+            origin: Point { x: f(self.origin.x), y: f(self.origin.y) },
+            size: Size { width: f(self.size.width), height: f(self.size.height) },
+        }
     }
 }
 
@@ -576,31 +585,29 @@ impl Corners<Px> {
     pub fn clamp_for(self, size: Size<Px>) -> Self {
         let w = size.width.get().max(0.0);
         let h = size.height.get().max(0.0);
+        let r = self.map(|v| Px(v.get().max(0.0)));
         let pairs = [
-            (self.top_left.get() + self.top_right.get(), w),
-            (self.bottom_left.get() + self.bottom_right.get(), w),
-            (self.top_left.get() + self.bottom_left.get(), h),
-            (self.top_right.get() + self.bottom_right.get(), h),
+            (r.top_left.get() + r.top_right.get(), w),
+            (r.bottom_left.get() + r.bottom_right.get(), w),
+            (r.top_left.get() + r.bottom_left.get(), h),
+            (r.top_right.get() + r.bottom_right.get(), h),
         ];
+        // A single uniform factor, the minimum over all four edges, is what
+        // preserves the ratios the author asked for. Clamping each corner
+        // independently would silently reshape an asymmetric design.
         let mut f = 1.0f32;
         for (sum, extent) in pairs {
             if sum > extent && sum > 0.0 {
                 f = f.min(extent / sum);
             }
         }
-        let half_min = (w.min(h)) * 0.5;
-        self.map(|v| Px((v.get().max(0.0) * f).min(half_min)))
+        r.map(|v| Px(v.get() * f))
     }
 
     /// The four radii as a GPU-friendly array in `[tl, tr, br, bl]` order.
     #[inline]
     pub fn to_array(self) -> [f32; 4] {
-        [
-            self.top_left.get(),
-            self.top_right.get(),
-            self.bottom_right.get(),
-            self.bottom_left.get(),
-        ]
+        [self.top_left.get(), self.top_right.get(), self.bottom_right.get(), self.bottom_left.get()]
     }
 }
 
@@ -742,7 +749,12 @@ mod tests {
 
     #[test]
     fn asymmetric_radii_scale_uniformly() {
-        let c = Corners { top_left: px(80.0), top_right: px(20.0), bottom_right: px(0.0), bottom_left: px(0.0) };
+        let c = Corners {
+            top_left: px(80.0),
+            top_right: px(20.0),
+            bottom_right: px(0.0),
+            bottom_left: px(0.0),
+        };
         let clamped = c.clamp_for(size(px(50.0), px(200.0)));
         assert!(clamped.top_left.get() + clamped.top_right.get() <= 50.0 + 1e-4);
         // Uniform scaling preserves the 4:1 ratio between the two.

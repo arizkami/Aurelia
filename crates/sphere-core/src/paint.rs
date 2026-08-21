@@ -312,7 +312,7 @@ impl Stroke {
 }
 
 /// A drop or inner shadow.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 pub struct Shadow {
     /// Offset from the shape.
     pub offset: Size<Px>,

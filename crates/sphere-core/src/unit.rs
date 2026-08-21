@@ -4,7 +4,7 @@
 //! ([`DevicePx`]). Every public authoring API speaks logical pixels; only the
 //! renderer and the platform layer see device pixels. The conversion is always
 //! explicit and always goes through a [`ScaleFactor`], which makes accidental
-//! HiDPI mixing a type error rather than a blurry frame.
+//! `HiDPI` mixing a type error rather than a blurry frame.
 
 use core::fmt;
 use core::iter::Sum;
