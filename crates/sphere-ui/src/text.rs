@@ -27,6 +27,10 @@ pub struct Label {
     style: Style,
     paint: PaintStyle,
     text_style: TextStyle,
+    /// `true` until the caller supplies an explicit weight or a complete text
+    /// style. This lets the theme's body-weight token actually reach ordinary
+    /// labels while preserving per-label overrides.
+    inherit_theme_weight: bool,
     color: Option<Color>,
     raster: TextRasterMode,
     /// Synthetic outline, for text over a busy backdrop such as a waveform.
@@ -48,6 +52,7 @@ pub fn label(text: impl Into<String>) -> Label {
         style: Style::DEFAULT,
         paint: PaintStyle::default(),
         text_style: TextStyle::default(),
+        inherit_theme_weight: true,
         color: None,
         raster: TextRasterMode::Auto,
         outline: None,
@@ -83,6 +88,7 @@ impl Label {
     /// Font weight.
     pub fn weight(mut self, weight: sphere_text::FontWeight) -> Self {
         self.text_style.font.weight = weight;
+        self.inherit_theme_weight = false;
         self
     }
 
@@ -154,7 +160,17 @@ impl Label {
     /// Replaces the whole text style.
     pub fn text_style(mut self, style: TextStyle) -> Self {
         self.text_style = style;
+        self.inherit_theme_weight = false;
         self
+    }
+
+    /// Resolves inherited typography without mutating the authored style.
+    fn resolved_text_style(&self, theme: &crate::theme::Theme) -> TextStyle {
+        let mut style = self.text_style.clone();
+        if self.inherit_theme_weight {
+            style.font.weight = theme.typography.weight;
+        }
+        style
     }
 
     /// The text this label displays.
@@ -186,7 +202,7 @@ impl Element for Label {
         &mut self,
         request: &MeasureRequest<'_>,
         text: &mut TextSystem,
-        _theme: &crate::theme::Theme,
+        theme: &crate::theme::Theme,
     ) -> Option<Size<Px>> {
         if self.text.is_empty() {
             return Some(Size::ZERO);
@@ -200,7 +216,8 @@ impl Element for Label {
             (None, AvailableSpace::MaxContent) => None,
             (None, AvailableSpace::MinContent) => Some(Px::ZERO),
         };
-        let layout = text.layout(&self.text, &self.text_style, max_width);
+        let style = self.resolved_text_style(theme);
+        let layout = text.layout(&self.text, &style, max_width);
         Some(layout.size)
     }
 
@@ -211,7 +228,8 @@ impl Element for Label {
         }
 
         let color = self.color.unwrap_or(cx.theme.colors.text);
-        let layout = cx.text.layout(&self.text, &self.text_style, Some(cx.bounds.width()));
+        let style = self.resolved_text_style(cx.theme);
+        let layout = cx.text.layout(&self.text, &style, Some(cx.bounds.width()));
         let origin = cx.bounds.origin;
         let (outline_width, outline_color) = self.outline.unwrap_or((Px::ZERO, Color::TRANSPARENT));
         let coverage_contrast = self.coverage_contrast.unwrap_or_else(|| {
@@ -321,6 +339,52 @@ mod tests {
     fn a_str_becomes_a_label() {
         let mut d = div().child("Threshold");
         assert_eq!(d.children().len(), 1);
+    }
+
+    #[test]
+    fn a_label_inherits_theme_weight_and_an_explicit_weight_wins() {
+        let mut theme = Theme::dark();
+        theme.typography.weight = sphere_text::FontWeight::BOLD;
+
+        assert_eq!(
+            label("Inherited").resolved_text_style(&theme).font.weight,
+            sphere_text::FontWeight::BOLD
+        );
+        assert_eq!(
+            label("Override")
+                .weight(sphere_text::FontWeight::LIGHT)
+                .resolved_text_style(&theme)
+                .font
+                .weight,
+            sphere_text::FontWeight::LIGHT
+        );
+    }
+
+    #[test]
+    fn label_weight_reaches_the_painted_glyph_run() {
+        let Some(mut system) = text_system() else {
+            eprintln!("no system font; skipping");
+            return;
+        };
+        let mut tree = UiTree::new();
+        tree.build(
+            div()
+                .child(label("Regular").weight(sphere_text::FontWeight::NORMAL))
+                .child(label("SemiBold").weight(sphere_text::FontWeight::SEMI_BOLD))
+                .into_element(),
+        );
+        tree.compute_layout_with_text(viewport(), &mut system).unwrap();
+
+        let mut scene = Scene::new(viewport(), ScaleFactor::IDENTITY);
+        {
+            let mut canvas = Canvas::new(&mut scene);
+            tree.paint(&mut canvas, &mut system, viewport(), 0.0);
+        }
+        assert_eq!(scene.runs.len(), 2, "each label should produce one shaped run");
+        assert_ne!(
+            scene.runs[0].font, scene.runs[1].font,
+            "regular and semi-bold were painted with the same face"
+        );
     }
 
     #[test]

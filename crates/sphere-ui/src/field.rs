@@ -141,7 +141,15 @@ impl TextField {
     /// different size from the paint the caret would land on the wrong
     /// character — visibly so at the end of a long string.
     fn text_style(theme: &Theme) -> TextStyle {
-        TextStyle { font_size: theme.typography.md, wrap: WrapMode::None, ..Default::default() }
+        TextStyle {
+            font: sphere_text::FontRequest {
+                weight: theme.typography.weight,
+                ..Default::default()
+            },
+            font_size: theme.typography.md,
+            wrap: WrapMode::None,
+            ..Default::default()
+        }
     }
 
     /// The content box, inside the padding.
@@ -537,6 +545,13 @@ mod tests {
 
     fn viewport() -> Size<Px> {
         size(px(400.0), px(300.0))
+    }
+
+    #[test]
+    fn a_field_inherits_the_theme_font_weight() {
+        let mut theme = Theme::dark();
+        theme.typography.weight = sphere_text::FontWeight::BOLD;
+        assert_eq!(TextField::text_style(&theme).font.weight, sphere_text::FontWeight::BOLD);
     }
 
     /// A text system with a real face, or `None` on a machine with no fonts.

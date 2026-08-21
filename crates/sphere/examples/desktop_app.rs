@@ -1,9 +1,9 @@
 //! A conventional desktop application, built with nothing audio-specific.
 //!
 //! The other example is a plug-in editor and leans on `sphere-audio-ui`. This
-//! one is the shape most applications actually are: a header, a sidebar, a
-//! scrolling settings pane, a status bar, and a theme that can be switched at
-//! runtime.
+//! one is the shape most applications actually are: a compact title bar, a
+//! settings sidebar, a scrolling pane, and a status bar. Its custom dark theme
+//! uses lifted charcoal surfaces instead of near-black panels.
 //!
 //! It is also where the two rendering paths that are *not* analytically
 //! antialiased get exercised — the sidebar icons are SVG, tessellated into
@@ -14,7 +14,7 @@
 //! ```
 //!
 //! Keyboard: Tab and Shift-Tab move focus, Space and Enter activate, arrow keys
-//! adjust a focused slider, Ctrl+T switches theme, Escape quits.
+//! adjust a focused slider, Escape quits.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -31,12 +31,72 @@ use sphere::platform::{
 };
 use sphere::platform::{CaptionRegions, WindowChrome};
 use sphere::svg::SvgCache;
+use sphere::text::FontWeight;
 use sphere::ui::{
-    AnyElement, ButtonVariant, Cursor, Element, EventContext, InputTranslator, Interactive,
-    IntoElement, ParentElement, Role, Semantics, Styled, StyledInteraction, TextEdit, Theme,
-    button, checkbox, div, label, progress, scroll_view, separator, slider, text_field, toggle,
+    AnyElement, Cursor, Element, EventContext, InputTranslator, Interactive, IntoElement,
+    ParentElement, Role, Semantics, Styled, StyledInteraction, TextEdit, Theme, button, checkbox,
+    div, label, scroll_view, separator, slider, text_field, toggle,
 };
 use sphere::{SphereSurface, SurfaceOptions};
+
+/// The desktop example's product theme.
+///
+/// The application owns this mapping rather than changing Sphere's default
+/// theme: the example is intentionally demonstrating how a product can carry
+/// a distinct visual language without globally restyling every consumer.
+fn sphere_dark_theme() -> Theme {
+    let mut theme = Theme::dark();
+    let c = &mut theme.colors;
+
+    // Neutral graphite base
+    c.background = Color::hex(0x2B2C2F);
+    c.surface = Color::hex(0x333438);
+    c.elevated = Color::hex(0x3B3D41);
+
+    // Interaction states
+    c.hover = Color::hex(0x44464A);
+    c.pressed = Color::hex(0x4D4F54);
+
+    // Borders
+    c.border = Color::hex(0x414348);
+    c.border_strong = Color::hex(0x5A5D63);
+
+    // Typography
+    c.text = Color::hex(0xF0F0F1);
+    c.text_muted = Color::hex(0xACADB0);
+    c.text_on_accent = Color::hex(0x202124);
+
+    // Accent — blue แต่ลดความอมฟ้าของทั้ง UI
+    c.accent = Color::hex(0x78A8E8);
+    c.accent_hover = Color::hex(0x8BB5ED);
+    c.focus = Color::hex(0x78A8E8);
+
+    // Semantic
+    c.success = Color::hex(0x79B88A);
+    c.warning = Color::hex(0xD5AF68);
+    c.danger = Color::hex(0xD77880);
+
+    // Typography
+    theme.typography.xs = px(10.0);
+    theme.typography.sm = px(12.0);
+    theme.typography.md = px(14.0);
+    theme.typography.lg = px(17.0);
+    theme.typography.xl = px(22.0);
+    theme.typography.weight = FontWeight::NORMAL;
+    theme.typography.strong = FontWeight::SEMI_BOLD;
+
+    // Radius
+    theme.radii.sm = px(4.0);
+    theme.radii.md = px(6.0);
+    theme.radii.lg = px(8.0);
+
+    theme
+}
+
+/// Title/status bars sit one step above the panel and content surfaces.
+fn chrome_background() -> Color {
+    Color::hex(0x343A45)
+}
 
 /// The sections the sidebar navigates between.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -109,7 +169,6 @@ impl Section {
 /// intends — explicit, and impossible to panic on.
 struct State {
     section: Cell<Section>,
-    dark: Cell<bool>,
     notifications: Cell<bool>,
     auto_update: Cell<bool>,
     telemetry: Cell<bool>,
@@ -146,7 +205,6 @@ impl State {
     fn new() -> Rc<Self> {
         Rc::new(Self {
             section: Cell::new(Section::General),
-            dark: Cell::new(true),
             notifications: Cell::new(true),
             auto_update: Cell::new(false),
             telemetry: Cell::new(false),
@@ -164,7 +222,7 @@ impl State {
     }
 
     fn theme(&self) -> Theme {
-        if self.dark.get() { Theme::dark() } else { Theme::light() }
+        sphere_dark_theme()
     }
 
     fn say(&self, message: impl Into<String>) {
@@ -246,7 +304,6 @@ impl DesktopApp {
     fn header(&self, theme: &Theme) -> AnyElement {
         let c = theme.colors;
         let state = Rc::clone(&self.state);
-        let dark = self.state.dark.get();
 
         div()
             .flex_row()
@@ -255,37 +312,20 @@ impl DesktopApp {
             .h(px(CAPTION_HEIGHT))
             // Padded on the left only: the window buttons run flush to the
             // right edge, exactly as the shell's do.
-            .pl(theme.spacing.lg)
-            .bg(c.surface)
-            // Thirteen pixels: a window title is a label, not a heading. The
-            // page's own heading lives in the content area below.
-            .child(label("Preferences").text_size(theme.typography.md).text_color(c.text).no_wrap())
+            .pl(px(12.0))
+            .bg(chrome_background())
+            .child(
+                label("Sphere")
+                    .text_size(theme.typography.sm)
+                    .weight(theme.typography.strong)
+                    .text_color(c.text)
+                    .no_wrap(),
+            )
+            .child(label("/").text_size(theme.typography.sm).text_color(c.text_muted).no_wrap())
+            .child(
+                label("Settings").text_size(theme.typography.sm).text_color(c.text_muted).no_wrap(),
+            )
             .child(div().flex_1())
-            .child({
-                let s = Rc::clone(&state);
-                button(if dark { "Light theme" } else { "Dark theme" })
-                    .id("theme")
-                    .variant(ButtonVariant::Ghost)
-                    .on_press(move || {
-                        s.dark.set(!s.dark.get());
-                        s.say(if s.dark.get() {
-                            "Switched to dark."
-                        } else {
-                            "Switched to light."
-                        });
-                    })
-            })
-            .child({
-                let s = Rc::clone(&state);
-                button("Apply").id("apply").variant(ButtonVariant::Primary).on_press(move || {
-                    s.say(format!(
-                        "Applied: scale {:.0}%, volume {:.0}%.",
-                        s.ui_scale.get(),
-                        s.volume.get()
-                    ));
-                    s.download.set(0.0);
-                })
-            })
             // The window buttons sit inside the caption strip, which is exactly
             // why they have to be published as exclusions: a press the platform
             // routes as caption is swallowed by the modal move loop and never
@@ -316,17 +356,25 @@ impl DesktopApp {
         let current = self.state.section.get();
         let mut nav = div()
             .flex_col()
-            .w(px(210.0))
+            .w(px(220.0))
             .h(relative(1.0))
             .p(theme.spacing.md)
             .gap(theme.spacing.xs)
-            .bg(c.surface);
+            .bg(c.surface)
+            .child(
+                label("SETTINGS")
+                    .text_size(theme.typography.xs)
+                    .weight(theme.typography.strong)
+                    .text_color(c.text_muted)
+                    .px_(theme.spacing.md)
+                    .py_(theme.spacing.sm),
+            );
 
         for section in Section::ALL {
             let selected = section == current;
             let state = Rc::clone(&self.state);
             let icon = self.icon_for(section);
-            let tint = if selected { c.text_on_accent } else { c.text_muted };
+            let tint = if selected { c.accent } else { c.text_muted };
 
             nav = nav.child(
                 div()
@@ -335,20 +383,25 @@ impl DesktopApp {
                     .flex_row()
                     .items_center()
                     .gap(theme.spacing.md)
-                    .h(px(36.0))
+                    .h(px(32.0))
                     .px_(theme.spacing.md)
-                    .rounded(theme.radii.md)
-                    .bg(if selected { c.accent } else { Color::TRANSPARENT })
-                    .hover_bg(if selected { c.accent_hover } else { c.hover })
+                    .rounded(theme.radii.sm)
+                    .bg(if selected { c.pressed } else { Color::TRANSPARENT })
+                    .hover_bg(if selected { c.pressed } else { c.hover })
                     .active_bg(c.pressed)
                     .cursor(Cursor::Pointer)
                     .focus_ring(sphere::ui::FocusRing { color: c.focus, ..Default::default() })
                     .semantics(Semantics::new(Role::Tab, section.title()))
-                    .child(IconElement { svg: icon, tint, size: px(20.0) })
+                    .child(IconElement { svg: icon, tint, size: px(16.0) })
                     .child(
                         label(section.title())
-                            .text_size(theme.typography.md)
-                            .text_color(if selected { c.text_on_accent } else { c.text })
+                            .text_size(theme.typography.sm)
+                            .weight(if selected {
+                                theme.typography.strong
+                            } else {
+                                theme.typography.weight
+                            })
+                            .text_color(c.text)
                             .no_wrap(),
                     )
                     .on_click(move |cx: &mut EventContext<'_>| {
@@ -378,11 +431,40 @@ impl DesktopApp {
             .h(relative(1.0))
             .bg(c.background)
             .child(
-                scroll_view()
-                    .id("content-scroll")
-                    .flex_1()
-                    .w(relative(1.0))
-                    .child(div().flex_col().p(theme.spacing.xl).gap(theme.spacing.lg).child(body)),
+                div()
+                    .flex_row()
+                    .items_center()
+                    .h(px(36.0))
+                    .px_(px(12.0))
+                    .bg(c.surface)
+                    .child(
+                        label(self.state.section.get().title())
+                            .text_size(theme.typography.sm)
+                            .weight(theme.typography.strong)
+                            .text_color(c.text)
+                            .no_wrap(),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        label("User settings · changes save automatically")
+                            .text_size(theme.typography.xs)
+                            .text_color(c.text_muted)
+                            .no_wrap(),
+                    ),
+            )
+            .child(separator(false))
+            .child(
+                scroll_view().id("content-scroll").flex_1().w(relative(1.0)).child(
+                    div().flex_row().justify_center().w(relative(1.0)).child(
+                        div()
+                            .flex_col()
+                            .w(relative(1.0))
+                            .max_w(px(760.0))
+                            .p(px(32.0))
+                            .gap(theme.spacing.xl)
+                            .child(body),
+                    ),
+                ),
             )
             .into_element()
     }
@@ -393,8 +475,8 @@ impl DesktopApp {
 
         div()
             .flex_col()
-            .gap(theme.spacing.lg)
-            .child(section_title("General", theme))
+            .gap(theme.spacing.md)
+            .child(page_header("General", "Everyday behavior for this Sphere workspace.", theme))
             .child(setting_row(
                 "Show notifications",
                 "Desktop alerts when a background task finishes.",
@@ -412,6 +494,7 @@ impl DesktopApp {
                         .into_element()
                 },
             ))
+            .child(separator(false))
             .child(setting_row(
                 "Install updates automatically",
                 "Download and apply in the background.",
@@ -429,6 +512,7 @@ impl DesktopApp {
                         .into_element()
                 },
             ))
+            .child(separator(false))
             .child(setting_row("Send usage data", "Anonymous, and off by default.", theme, {
                 let s = Rc::clone(&state);
                 let on = s.telemetry.get();
@@ -443,7 +527,12 @@ impl DesktopApp {
                 div()
                     .flex_col()
                     .gap(theme.spacing.sm)
-                    .child(label("Output volume").text_size(theme.typography.md).text_color(c.text))
+                    .child(
+                        label("Output volume")
+                            .text_size(theme.typography.md)
+                            .weight(theme.typography.strong)
+                            .text_color(c.text),
+                    )
                     .child({
                         let s = Rc::clone(&state);
                         let v = s.volume.get();
@@ -472,13 +561,20 @@ impl DesktopApp {
         div()
             .flex_col()
             .gap(theme.spacing.lg)
-            .child(section_title("Appearance", theme))
+            .child(page_header(
+                "Appearance",
+                "Tune interface density and inspect the active type system.",
+                theme,
+            ))
             .child(
                 div()
                     .flex_col()
                     .gap(theme.spacing.sm)
                     .child(
-                        label("Interface scale").text_size(theme.typography.md).text_color(c.text),
+                        label("Interface scale")
+                            .text_size(theme.typography.md)
+                            .weight(theme.typography.strong)
+                            .text_color(c.text),
                     )
                     .child({
                         let s = Rc::clone(&state);
@@ -504,7 +600,12 @@ impl DesktopApp {
             .child(separator(false))
             // A type specimen. Every size below goes through the same MTSDF
             // path, and the two smallest cross into the bitmap fallback.
-            .child(label("Type specimen").text_size(theme.typography.md).text_color(c.text))
+            .child(
+                label("Type specimen")
+                    .text_size(theme.typography.md)
+                    .weight(theme.typography.strong)
+                    .text_color(c.text),
+            )
             .child(
                 div()
                     .flex_col()
@@ -517,6 +618,29 @@ impl DesktopApp {
                     .child(label("Small — 11 px").text_size(theme.typography.sm).text_color(c.text))
                     .child(
                         label("Medium — 13 px").text_size(theme.typography.md).text_color(c.text),
+                    )
+                    .child(
+                        div()
+                            .flex_row()
+                            .gap(theme.spacing.lg)
+                            .child(
+                                label("Regular 400")
+                                    .text_size(theme.typography.md)
+                                    .weight(sphere::text::FontWeight::NORMAL)
+                                    .text_color(c.text),
+                            )
+                            .child(
+                                label("SemiBold 600")
+                                    .text_size(theme.typography.md)
+                                    .weight(sphere::text::FontWeight::SEMI_BOLD)
+                                    .text_color(c.text),
+                            )
+                            .child(
+                                label("Bold 700")
+                                    .text_size(theme.typography.md)
+                                    .weight(sphere::text::FontWeight::BOLD)
+                                    .text_color(c.text),
+                            ),
                     )
                     .child(label("Large — 16 px").text_size(theme.typography.lg).text_color(c.text))
                     .child(
@@ -541,7 +665,11 @@ impl DesktopApp {
         div()
             .flex_col()
             .gap(theme.spacing.lg)
-            .child(section_title("Network", theme))
+            .child(page_header(
+                "Network",
+                "Manage sync state and the server used by this workspace.",
+                theme,
+            ))
             .child(
                 div()
                     .flex_col()
@@ -549,15 +677,13 @@ impl DesktopApp {
                     .p(theme.spacing.lg)
                     .bg(c.surface)
                     .rounded(theme.radii.lg)
-                    .border(px(1.0), c.border)
-                    .shadow(theme.shadows.sm)
                     .child(
                         label("Sync status")
                             .text_size(theme.typography.md)
                             .weight(theme.typography.strong)
                             .text_color(c.text),
                     )
-                    .child(progress(downloaded))
+                    .child(progress_bar(downloaded, theme))
                     .child(
                         label(if downloaded >= 1.0 {
                             "Up to date.".to_string()
@@ -569,10 +695,13 @@ impl DesktopApp {
                     )
                     .child(div().flex_row().gap(theme.spacing.md).child({
                         let s = Rc::clone(&state);
-                        button("Sync now").id("sync").on_press(move || {
-                            s.download.set(0.0);
-                            s.say("Sync started.");
-                        })
+                        button("Sync now")
+                            .id("sync")
+                            .weight(theme.typography.strong)
+                            .on_press(move || {
+                                s.download.set(0.0);
+                                s.say("Sync started.");
+                            })
                     })),
             )
             .child(
@@ -582,8 +711,6 @@ impl DesktopApp {
                     .p(theme.spacing.lg)
                     .bg(c.surface)
                     .rounded(theme.radii.lg)
-                    .border(px(1.0), c.border)
-                    .shadow(theme.shadows.sm)
                     .child(
                         label("Server")
                             .text_size(theme.typography.md)
@@ -601,7 +728,7 @@ impl DesktopApp {
                     })
                     .child(
                         label(
-                            "Try an input method here — the composition is underlined until it                              is committed, and the candidate window follows the caret.",
+                            "Try an input method here — composition stays underlined until it is committed.",
                         )
                         .text_size(theme.typography.sm)
                         .text_color(c.text_muted),
@@ -633,8 +760,17 @@ impl DesktopApp {
         div()
             .flex_col()
             .gap(theme.spacing.md)
-            .child(section_title("About", theme))
-            .child(label("SphereGraphicEngine").text_size(theme.typography.lg).text_color(c.text))
+            .child(page_header(
+                "About",
+                "Runtime and renderer details for this Sphere build.",
+                theme,
+            ))
+            .child(
+                label("SphereGraphicEngine")
+                    .text_size(theme.typography.lg)
+                    .weight(FontWeight::BOLD)
+                    .text_color(c.text),
+            )
             .child(
                 label("A GPU-first graphics and UI engine written in Rust.")
                     .text_size(theme.typography.md)
@@ -667,11 +803,11 @@ impl DesktopApp {
             .gap(theme.spacing.md)
             .h(px(26.0))
             .px_(theme.spacing.lg)
-            .bg(c.surface)
+            .bg(chrome_background())
             .child(label(last).text_size(theme.typography.xs).text_color(c.text_muted).no_wrap())
             .child(div().flex_1())
             .child(
-                label("Tab to move · Space to activate · Ctrl+T theme · Esc quit")
+                label("Tab to move · Space to activate · Esc to quit")
                     .text_size(theme.typography.xs)
                     .text_color(c.text_muted)
                     .no_wrap(),
@@ -890,11 +1026,33 @@ fn sphere_text_style(size: Px) -> sphere::text::TextStyle {
     }
 }
 
-fn section_title(text: &str, theme: &Theme) -> AnyElement {
-    label(text.to_string())
-        .text_size(theme.typography.lg)
-        .weight(theme.typography.strong)
-        .text_color(theme.colors.text)
+fn page_header(title: &str, description: &str, theme: &Theme) -> AnyElement {
+    let c = theme.colors;
+    div()
+        .flex_col()
+        .gap(theme.spacing.sm)
+        .pb(theme.spacing.md)
+        .child(
+            label(title.to_string())
+                .text_size(theme.typography.xl)
+                .weight(FontWeight::BOLD)
+                .text_color(c.text),
+        )
+        .child(
+            label(description.to_string()).text_size(theme.typography.sm).text_color(c.text_muted),
+        )
+        .into_element()
+}
+
+fn progress_bar(fraction: f32, theme: &Theme) -> AnyElement {
+    let t = fraction.clamp(0.0, 1.0);
+    div()
+        .h(px(4.0))
+        .w(relative(1.0))
+        .rounded_full()
+        .bg(theme.colors.pressed)
+        .clip()
+        .child(div().h(relative(1.0)).w(relative(t)).rounded_full().bg(theme.colors.accent))
         .into_element()
 }
 
@@ -920,6 +1078,7 @@ fn setting_row(title: &str, description: &str, theme: &Theme, control: AnyElemen
         .flex_row()
         .items_center()
         .gap(theme.spacing.lg)
+        .py_(theme.spacing.md)
         .child(
             div()
                 .flex_col()
@@ -1144,12 +1303,6 @@ impl AppHandler for DesktopApp {
                             needs_redraw = true;
                         }
                     }
-                    sphere::ui::Key::Character(ch)
-                        if ch.eq_ignore_ascii_case("t") && key.modifiers.command() =>
-                    {
-                        self.state.dark.set(!self.state.dark.get());
-                        needs_redraw = true;
-                    }
                     _ => {}
                 }
             }
@@ -1266,8 +1419,8 @@ impl DesktopApp {
     /// declares itself during paint through `PaintContext::keep_interactive`,
     /// and the tree collects them, so a button added to the header later is
     /// clickable without anyone remembering this function exists. Hand-listing
-    /// them is how "Light theme" and "Apply" ended up swallowed by the modal
-    /// move loop, with no error and no way to notice but trying to click them.
+    /// them is how header actions can be swallowed by the modal move loop, with
+    /// no error and no way to notice but trying to click them.
     fn publish_caption(&self) {
         let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_ref()) else {
             return;
@@ -1346,6 +1499,64 @@ impl DesktopApp {
         }
         if area.is_none() {
             self.ime_caret = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sphere::core::ScaleFactor;
+    use sphere::render::{Canvas, Scene};
+    use sphere::text::{FontRequest, TextSystem};
+    use sphere::ui::UiTree;
+
+    #[test]
+    fn product_theme_is_dark_but_uses_lifted_surfaces() {
+        let theme = sphere_dark_theme();
+        let c = theme.colors;
+
+        assert!(theme.is_dark());
+        assert!(c.background.luminance() > Color::hex(0x181A1F).luminance());
+        assert!(c.surface.luminance() > c.background.luminance());
+        assert!(c.elevated.luminance() > c.surface.luminance());
+        assert!((c.text.luminance() - c.background.luminance()).abs() > 0.6);
+    }
+
+    #[test]
+    fn desktop_typography_paints_regular_semibold_and_bold_faces() {
+        let mut text = TextSystem::with_system_fonts();
+        let regular = text.fonts_mut().resolve(&FontRequest::default().weight(FontWeight::NORMAL));
+        let semibold =
+            text.fonts_mut().resolve(&FontRequest::default().weight(FontWeight::SEMI_BOLD));
+        let bold = text.fonts_mut().resolve(&FontRequest::default().weight(FontWeight::BOLD));
+        let (Some(regular), Some(semibold), Some(bold)) = (regular, semibold, bold) else {
+            eprintln!("system has no complete UI weight family; skipping");
+            return;
+        };
+        if regular == semibold || regular == bold || semibold == bold {
+            eprintln!("system UI family aliases weight faces; skipping");
+            return;
+        }
+
+        let mut app = DesktopApp::new();
+        let viewport = size(px(980.0), px(640.0));
+        let mut tree = UiTree::new();
+        tree.set_theme(app.state.theme());
+        tree.build(app.build());
+        tree.compute_layout_with_text(viewport, &mut text).unwrap();
+
+        let mut scene = Scene::new(viewport, ScaleFactor::IDENTITY);
+        {
+            let mut canvas = Canvas::new(&mut scene);
+            tree.paint(&mut canvas, &mut text, viewport, 0.0);
+        }
+
+        for (name, face) in [("regular", regular), ("semibold", semibold), ("bold", bold)] {
+            assert!(
+                scene.runs.iter().any(|run| run.font == face),
+                "desktop app never painted its {name} face"
+            );
         }
     }
 }

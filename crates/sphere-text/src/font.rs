@@ -784,11 +784,13 @@ mod weight_tests {
             return;
         };
         let regular = db.resolve(&FontRequest::default().weight(FontWeight::NORMAL));
+        let semi_bold = db.resolve(&FontRequest::default().weight(FontWeight::SEMI_BOLD));
         let bold = db.resolve(&FontRequest::default().weight(FontWeight::BOLD));
-        let (Some(regular), Some(bold)) = (regular, bold) else {
+        let (Some(regular), Some(semi_bold), Some(bold)) = (regular, semi_bold, bold) else {
             eprintln!("no weighted faces; skipping");
             return;
         };
+        assert_ne!(regular, semi_bold, "semi-bold resolved to the regular face");
         assert_ne!(regular, bold, "bold resolved to the regular face");
         assert_ne!(
             db.family_name(regular).map(str::to_string),

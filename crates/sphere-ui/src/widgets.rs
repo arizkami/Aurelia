@@ -86,6 +86,8 @@ pub struct Button {
     text_size: Option<Px>,
     /// Overrides the default family, for an icon font.
     font: Option<sphere_text::FontRequest>,
+    /// Overrides the theme's body-text weight.
+    weight: Option<sphere_text::FontWeight>,
     on_press: Option<OnAction>,
 }
 
@@ -99,6 +101,7 @@ pub fn button(text: impl Into<String>) -> Button {
         disabled: false,
         text_size: None,
         font: None,
+        weight: None,
         on_press: None,
     }
 }
@@ -148,6 +151,12 @@ impl Button {
         self
     }
 
+    /// Overrides the label's font weight.
+    pub fn weight(mut self, weight: sphere_text::FontWeight) -> Self {
+        self.weight = Some(weight);
+        self
+    }
+
     /// Draws the label in a specific font family.
     ///
     /// For an icon button, where the label is a codepoint in an icon font
@@ -169,12 +178,46 @@ impl Button {
     /// box and `paint` fills it; if they disagree on the font size the text
     /// ends up outside the box the layout engine agreed to.
     fn label_style(&self, theme: &crate::theme::Theme) -> sphere_text::TextStyle {
+        let mut font = self.font.clone().unwrap_or_default();
+        font.weight = self.weight.unwrap_or(theme.typography.weight);
         sphere_text::TextStyle {
             font_size: self.text_size.unwrap_or(theme.typography.md),
-            font: self.font.clone().unwrap_or_default(),
+            font,
             wrap: sphere_text::WrapMode::None,
             ..Default::default()
         }
+    }
+
+    /// Flat button chrome shared by every variant.
+    ///
+    /// Buttons communicate hierarchy through fill and label colour. They do
+    /// not draw a resting border or a focus outline; hover and pressed fills
+    /// remain the interaction affordance.
+    fn paint_style(&self, theme: &crate::theme::Theme) -> PaintStyle {
+        let c = theme.colors;
+        let (base, hover, active) = match self.variant {
+            ButtonVariant::Primary => (c.accent, c.accent_hover, c.accent_hover),
+            ButtonVariant::Secondary => (c.elevated, c.hover, c.pressed),
+            ButtonVariant::Ghost => (Color::TRANSPARENT, c.hover, c.pressed),
+            ButtonVariant::Danger => (c.danger, c.danger, c.danger),
+        };
+
+        let mut style = PaintStyle {
+            background: Some(base.into()),
+            hover_background: Some(hover.into()),
+            active_background: Some(active.into()),
+            corner_radii: Corners::all(theme.radii.md),
+            border_width: Px::ZERO,
+            border_color: Color::TRANSPARENT,
+            focus_ring: None,
+            ..Default::default()
+        };
+        if self.disabled {
+            style.opacity = 0.45;
+            style.hover_background = None;
+            style.active_background = None;
+        }
+        style
     }
 }
 
@@ -218,30 +261,12 @@ impl Element for Button {
 
     fn paint(&mut self, cx: &mut PaintContext<'_, '_>) {
         let c = cx.theme.colors;
-        let (base, hover, active, text) = match self.variant {
-            ButtonVariant::Primary => (c.accent, c.accent_hover, c.accent_hover, c.text_on_accent),
-            ButtonVariant::Secondary => (c.elevated, c.hover, c.pressed, c.text),
-            ButtonVariant::Ghost => (Color::TRANSPARENT, c.hover, c.pressed, c.text),
-            ButtonVariant::Danger => (c.danger, c.danger, c.danger, c.text_on_accent),
+        let text = match self.variant {
+            ButtonVariant::Primary | ButtonVariant::Danger => c.text_on_accent,
+            ButtonVariant::Secondary | ButtonVariant::Ghost => c.text,
         };
 
-        let mut style = PaintStyle {
-            background: Some(base.into()),
-            hover_background: Some(hover.into()),
-            active_background: Some(active.into()),
-            corner_radii: Corners::all(cx.theme.radii.md),
-            border_width: if self.variant == ButtonVariant::Secondary { px(1.0) } else { Px::ZERO },
-            border_color: c.border,
-            focus_ring: Some(FocusRing { color: c.focus, ..FocusRing::default() }),
-            ..Default::default()
-        };
-        // Disabled controls are dimmed rather than recoloured, so their shape
-        // still reads and the layout does not shift.
-        if self.disabled {
-            style.opacity = 0.45;
-            style.hover_background = None;
-            style.active_background = None;
-        }
+        let style = self.paint_style(cx.theme);
         let mut state = cx.state;
         state.disabled = self.disabled;
         style.paint_box(cx.canvas, cx.bounds, state);
@@ -1213,6 +1238,42 @@ mod tests {
         let mut system = sphere_text::TextSystem::with_system_fonts();
         system.fonts_mut().resolve(&sphere_text::FontRequest::default())?;
         Some(system)
+    }
+
+    #[test]
+    fn a_button_inherits_theme_weight_and_allows_an_override() {
+        let mut theme = crate::theme::Theme::dark();
+        theme.typography.weight = sphere_text::FontWeight::SEMI_BOLD;
+
+        assert_eq!(
+            button("Inherited").label_style(&theme).font.weight,
+            sphere_text::FontWeight::SEMI_BOLD
+        );
+        assert_eq!(
+            button("Override")
+                .weight(sphere_text::FontWeight::BLACK)
+                .label_style(&theme)
+                .font
+                .weight,
+            sphere_text::FontWeight::BLACK
+        );
+    }
+
+    #[test]
+    fn buttons_are_flat_without_borders_or_focus_outlines() {
+        let theme = crate::theme::Theme::dark();
+
+        for variant in [
+            ButtonVariant::Primary,
+            ButtonVariant::Secondary,
+            ButtonVariant::Ghost,
+            ButtonVariant::Danger,
+        ] {
+            let style = button("Action").variant(variant).paint_style(&theme);
+            assert_eq!(style.border_width, Px::ZERO, "{variant:?} drew a border");
+            assert!(style.border_color.is_transparent(), "{variant:?} kept a border colour");
+            assert!(style.focus_ring.is_none(), "{variant:?} drew a focus outline");
+        }
     }
 
     #[test]

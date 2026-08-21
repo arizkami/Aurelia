@@ -44,10 +44,11 @@ pub struct SurfaceOptions {
     /// Enables RGB-stripe subpixel antialiasing when the backend and draw state
     /// can preserve it.
     ///
-    /// This is opt-in because graphics APIs cannot report the physical panel's
-    /// stripe order or whether the display is rotated. Leave it off for BGR,
-    /// PenTile/non-striped, rotated, remotely displayed, or subsequently scaled
-    /// output; ordinary grayscale antialiasing remains available everywhere.
+    /// Enabled by default for an ordinary RGB-stripe desktop panel. Graphics
+    /// APIs cannot report the physical panel's stripe order or whether the
+    /// display is rotated, so applications targeting BGR, PenTile/non-striped,
+    /// rotated, remotely displayed, or subsequently scaled output must turn it
+    /// off; ordinary grayscale antialiasing remains available everywhere.
     pub rgb_subpixel_text: bool,
     /// Byte budget for decoded images.
     pub image_budget_bytes: usize,
@@ -71,7 +72,7 @@ impl Default for SurfaceOptions {
             present: PresentPreference::LowLatency,
             vsync: VsyncMode::On,
             transparent: false,
-            rgb_subpixel_text: false,
+            rgb_subpixel_text: true,
             image_budget_bytes: 64 * 1024 * 1024,
             msaa_samples: sphere_render::DEFAULT_MSAA_SAMPLES,
             load_system_fonts: true,
@@ -633,7 +634,7 @@ mod tests {
         assert_eq!(o.present, PresentPreference::LowLatency);
         assert_eq!(o.present.max_frame_latency(), 1);
         assert!(o.load_system_fonts);
-        assert!(!o.rgb_subpixel_text, "panel-dependent RGB AA must be opt-in");
+        assert!(o.rgb_subpixel_text, "opaque desktop surfaces should render RGB text by default");
     }
 
     #[test]
