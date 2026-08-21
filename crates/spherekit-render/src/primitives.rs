@@ -145,12 +145,18 @@ pub struct GlyphInstance {
     pub outline_width: f32,
     /// Exponent applied to coverage; see [`crate::GlyphRun::coverage_contrast`].
     pub coverage_contrast: f32,
-    /// Reserved float, keeping the four `u32`s below contiguous.
+    /// The glyph's em size in destination pixels, before the transform.
     ///
-    /// The vertex layout reads the floats as one `vec4` and the indices as one
-    /// `vec4<u32>`; interleaving them would mean a `u32` arriving in the shader
-    /// reinterpreted as a float.
-    pub _pad_f: f32,
+    /// The vertex stage folds the transform's scale in and hands the result to
+    /// [`crate::mtsdf_edge_ramp`], which is why the *size* travels rather than
+    /// the compensation it implies: a panel zoomed to half puts 26 device-pixel
+    /// text on screen at 13, and only the vertex stage knows that.
+    ///
+    /// It occupies what used to be padding. The vertex layout reads the floats
+    /// as one `vec4` and the indices as one `vec4<u32>`; interleaving them would
+    /// mean a `u32` arriving in the shader reinterpreted as a float, so this
+    /// slot has to stay a float whether or not it carries anything.
+    pub em_px: f32,
     /// Bit set from [`glyph_flags`].
     pub flags: u32,
     /// Which atlas page to sample.

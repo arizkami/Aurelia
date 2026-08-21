@@ -20,11 +20,23 @@
 //! reproduce — so it showed text a good deal crisper than the GPU was drawing
 //! and hid the calibration bug it was built to catch.
 //!
+//! And it transcribes the *snapping*, which is the part that was wrong after
+//! that: `draw_glyph` snapped both axes for a bitmap and neither for a distance
+//! field, so every field panel it ever drew sat on a fractional device baseline
+//! that the renderer had been rounding since `snap_glyph_quad` was written.
+//!
+//! Every coordinate below is a **device** pixel. `SPHEREKIT_PROBE_SIZE` is
+//! logical and `SPHEREKIT_PROBE_SCALE` is the scale factor, because every
+//! threshold in this stack keys off the product of the two and a probe that
+//! could not separate them could not ask the question the thresholds answer.
+//!
 //! ```bash
 //! cargo run -p spherekit-text --example glyph_quad_probe --release -- out.png
 //! SPHEREKIT_PROBE_SIZE=13 cargo run -p spherekit-text --example glyph_quad_probe --release
+//! SPHEREKIT_PROBE_SIZE=13 SPHEREKIT_PROBE_SCALE=2 cargo run -p spherekit-text --example glyph_quad_probe --release
 //! SPHEREKIT_PROBE_COMPARE=blend SPHEREKIT_PROBE_ZOOM=8 cargo run -p spherekit-text --example glyph_quad_probe --release
 //! SPHEREKIT_PROBE_COMPARE=fit SPHEREKIT_PROBE_SIZE=13 cargo run -p spherekit-text --example glyph_quad_probe --release
+//! SPHEREKIT_PROBE_COMPARE=bias SPHEREKIT_PROBE_SIZE=13 SPHEREKIT_PROBE_ZOOM=6 cargo run -p spherekit-text --example glyph_quad_probe --release
 //! ```
 //!
 //! `SPHEREKIT_PROBE_THEME=dark` flips both panels to light-on-dark, which is the
@@ -32,7 +44,9 @@
 
 use spherekit_core::{Color, linear_to_srgb};
 use spherekit_render::batch::{GlyphPlacement, GlyphProvider, GlyphRequest};
-use spherekit_render::scene::{TextRasterMode, alpha_from_coverage, coverage_contrast_for};
+use spherekit_render::scene::{
+    TextRasterMode, alpha_from_coverage, coverage_contrast_for, mtsdf_edge_ramp,
+};
 use spherekit_text::raster::{BITMAP_MAX_DEVICE_PX, choose_raster_strategy};
 use spherekit_text::{TextStyle, TextSystem};
 
@@ -161,6 +175,13 @@ fn main() {
     let source = env("SPHEREKIT_PROBE_TEXT").unwrap_or_else(|| DEFAULT_TEXT.to_string());
     let family = env("SPHEREKIT_PROBE_FONT");
     let size: f32 = env("SPHEREKIT_PROBE_SIZE").and_then(|v| v.parse().ok()).unwrap_or(13.0);
+    // The scale factor is the whole point of the small-size question: 13
+    // logical pixels is a different glyph at 100 % than at 200 %, and every
+    // threshold in the text stack keys off the physical size rather than this
+    // one. Everything below works in device pixels; `size` stays logical.
+    let scale: f32 =
+        env("SPHEREKIT_PROBE_SCALE").and_then(|v| v.parse().ok()).unwrap_or(1.0f32).clamp(0.1, 8.0);
+    let em_px = size * scale;
 
     let mut text = TextSystem::with_system_fonts();
     let style = TextStyle {
@@ -176,7 +197,8 @@ fn main() {
         println!("nothing shaped; no system fonts?");
         return;
     };
-    let baseline = line.baseline.get();
+    // Device pixels from here down.
+    let baseline = line.baseline.get() * scale;
     let ink = ink();
 
     println!("system ui font: {}", spherekit_text::system_ui::family());
@@ -185,36 +207,54 @@ fn main() {
         line.runs.first().and_then(|r| text.fonts().family_name(r.font)).unwrap_or("<none>")
     );
     let strategy =
-        choose_raster_strategy(spherekit_core::Px(size), spherekit_core::ScaleFactor::IDENTITY);
-    println!("size:           {size} device px");
+        choose_raster_strategy(spherekit_core::Px(size), spherekit_core::ScaleFactor::new(scale));
+    println!("size:           {size} logical px at {scale}x, so {em_px} device px");
     println!(
         "field minified: {:.2}x  (a bilinear tap covers 2.00x)",
-        spherekit_text::mtsdf::DEFAULT_EM_SIZE_PX / size
+        spherekit_text::mtsdf::DEFAULT_EM_SIZE_PX / em_px
     );
-    println!("stem approx:    {:.2} px, of which {:.2} px is solid", size / 9.0, size / 9.0 - 1.0);
+    println!(
+        "stem approx:    {:.2} px, of which {:.2} px is solid",
+        em_px / 9.0,
+        em_px / 9.0 - 1.0
+    );
     println!("threshold:      {BITMAP_MAX_DEVICE_PX} device px, so Auto picks {strategy:?}");
     println!("coverage:       contrast {:+.3} for this colour pair", ink.contrast);
+    let field_range = spherekit_text::mtsdf::GlyphRasterConfig::default().range_em() * em_px;
+    let [edge_scale, edge_offset] = mtsdf_edge_ramp(em_px, field_range);
+    println!(
+        "field range:    {field_range:.3} device px, ramp {:.3} px, edge bias {:.3} px",
+        field_range / edge_scale,
+        edge_offset / edge_scale * field_range
+    );
 
     match env("SPHEREKIT_PROBE_COMPARE").as_deref() {
         // Both panels are bitmaps, the left one rasterised without a grid fit
         // and the right one with. Rasterised directly rather than through the
         // atlas, because the atlas has no way to hand back an unfitted glyph —
         // fitting is not optional there.
-        Some("fit") => compare_fit(&source, &style, size, ink),
+        Some("fit") => compare_fit(&source, &style, em_px, ink),
         // Both panels take whatever path `Auto` picks; only the coverage
         // correction differs. This is the one that shows what the linear blend
         // does to an uncorrected edge.
-        Some("blend") => compare_blend(&mut text, &line, baseline, size, ink),
-        _ => compare_raster(&mut text, &line, baseline, size, ink),
+        Some("blend") => compare_blend(&mut text, &line, baseline, size, scale, ink),
+        // Forced MTSDF twice, uncompensated against compensated. Nothing else
+        // differs, so every pixel that moved is the edge bias.
+        Some("bias") => compare_bias(&mut text, &line, baseline, size, scale, ink),
+        _ => compare_raster(&mut text, &line, baseline, size, scale, ink),
     }
 }
 
 /// Resolves every glyph in a line through the atlas, in one raster mode.
+///
+/// The returned pen is in *device* pixels, snapped the way `snap_glyph_quad`
+/// snaps it: a bitmap onto the grid, a field left exactly where it is.
 fn place(
     text: &mut TextSystem,
     line: &spherekit_text::TextLine,
     mode: TextRasterMode,
     subpixel: bool,
+    scale: f32,
 ) -> Vec<(f32, GlyphPlacement)> {
     let mut placed = Vec::new();
     for run in &line.runs {
@@ -222,15 +262,17 @@ fn place(
             // Mirror the batch compiler: bake the nearest quarter-pixel
             // remainder into the cached bitmap, then draw that bitmap at its
             // integral pen. Distance fields ignore the phase and keep the
-            // original fractional pen.
-            let quarters = (g.position.x.get() * 4.0).round() as i32;
+            // original fractional pen, which is the whole reason letter spacing
+            // does not clump on that path.
+            let device_pen = g.position.x.get() * scale;
+            let quarters = (device_pen * 4.0).round() as i32;
             let bitmap_pen_x = quarters.div_euclid(4) as f32;
             let subpixel_phase = quarters.rem_euclid(4) as u8;
             let Some(p) = text.place_glyph(GlyphRequest {
                 font: run.font,
                 glyph: g.glyph,
                 font_size: run.font_size,
-                device_scale: 1.0,
+                device_scale: scale,
                 mode,
                 subpixel,
                 subpixel_phase,
@@ -241,7 +283,7 @@ fn place(
                 // A zero-area placement is a space or a control character.
                 continue;
             }
-            placed.push((if p.is_bitmap { bitmap_pen_x } else { g.position.x.get() }, p));
+            placed.push((if p.is_bitmap { bitmap_pen_x } else { device_pen }, p));
         }
     }
     placed.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -272,17 +314,19 @@ fn compare_raster(
     line: &spherekit_text::TextLine,
     baseline: f32,
     size: f32,
+    scale: f32,
     ink: Ink,
 ) {
     let panels = [
-        place(text, line, TextRasterMode::Mtsdf, false),
-        place(text, line, TextRasterMode::Auto, true),
+        place(text, line, TextRasterMode::Mtsdf, false, scale),
+        place(text, line, TextRasterMode::Auto, true, scale),
     ];
     let subpixel_glyphs = panels[1].iter().filter(|(_, p)| p.is_subpixel).count();
-    println!("subpixel:        {subpixel_glyphs} RGB glyphs in the right panel");
-    let width = line.width.get().ceil() as usize + PAD * 2;
+    println!("subpixel:       {subpixel_glyphs} RGB glyphs in the right panel");
+    let width = (line.width.get() * scale).ceil() as usize + PAD * 2;
     let height = (baseline * 2.0).ceil() as usize + PAD * 2;
 
+    let mut coverage = [Coverage::default(); 2];
     let canvas = two_panels(width, height, ink.ground, |canvas, half, x_offset| {
         for (pen_x, p) in &panels[half] {
             draw_glyph(
@@ -292,11 +336,16 @@ fn compare_raster(
                 p,
                 *pen_x + PAD as f32,
                 baseline + PAD as f32,
-                size,
+                size * scale,
                 ink,
+                true,
+                &mut coverage[half],
             );
         }
     });
+    println!();
+    coverage[1].report("auto", None);
+    coverage[0].report("forced mtsdf", Some(coverage[1]));
 
     let (rgba, w, h) = canvas.into_rgba(zoom());
     save(
@@ -306,6 +355,71 @@ fn compare_raster(
         h,
         "left: forced MTSDF, right: Auto with RGB subpixel coverage",
     );
+}
+
+/// The small-text compensation, on against off, with nothing else differing.
+///
+/// Both panels are forced onto the field path, which is the only path the bias
+/// applies to and the only one a caller can reach it from. Above
+/// `SMALL_TEXT_MAX_DEVICE_PX` the two panels are identical by construction, and
+/// seeing that is as much the point as seeing the difference below it.
+fn compare_bias(
+    text: &mut TextSystem,
+    line: &spherekit_text::TextLine,
+    baseline: f32,
+    size: f32,
+    scale: f32,
+    ink: Ink,
+) {
+    let placed = place(text, line, TextRasterMode::Mtsdf, false, scale);
+    let width = (line.width.get() * scale).ceil() as usize + PAD * 2;
+    let height = (baseline * 2.0).ceil() as usize + PAD * 2;
+
+    let mut coverage = [Coverage::default(); 2];
+    let canvas = two_panels(width, height, ink.ground, |canvas, half, x_offset| {
+        for (pen_x, p) in &placed {
+            draw_glyph(
+                canvas,
+                x_offset,
+                text,
+                p,
+                *pen_x + PAD as f32,
+                baseline + PAD as f32,
+                size * scale,
+                ink,
+                half == 1,
+                &mut coverage[half],
+            );
+        }
+    });
+
+    // The bitmap path at the same size, as the weight this is measured against.
+    // It is what `Auto` draws below the threshold and what the field path is
+    // standing in for, so a compensated field that lands near it is the point.
+    let mut reference = Coverage::default();
+    let mut discard = Canvas::new(width, height, ink.ground);
+    for (pen_x, p) in &place(text, line, TextRasterMode::Bitmap, false, scale) {
+        draw_glyph(
+            &mut discard,
+            0,
+            text,
+            p,
+            *pen_x + PAD as f32,
+            baseline + PAD as f32,
+            size * scale,
+            ink,
+            true,
+            &mut reference,
+        );
+    }
+
+    println!();
+    coverage[0].report("uncompensated", None);
+    coverage[1].report("compensated", Some(coverage[0]));
+    reference.report("bitmap, for scale", Some(coverage[0]));
+
+    let (rgba, w, h) = canvas.into_rgba(zoom());
+    save("bias_probe.png", &rgba, w, h, "left: no compensation, right: compensated");
 }
 
 /// Uncorrected coverage against corrected: the blend-space question.
@@ -320,13 +434,15 @@ fn compare_blend(
     line: &spherekit_text::TextLine,
     baseline: f32,
     size: f32,
+    scale: f32,
     ink: Ink,
 ) {
-    let placed = place(text, line, TextRasterMode::Auto, true);
-    let width = line.width.get().ceil() as usize + PAD * 2;
+    let placed = place(text, line, TextRasterMode::Auto, true, scale);
+    let width = (line.width.get() * scale).ceil() as usize + PAD * 2;
     let height = (baseline * 2.0).ceil() as usize + PAD * 2;
     let inks = [ink.uncorrected(), ink];
 
+    let mut coverage = Coverage::default();
     let canvas = two_panels(width, height, ink.ground, |canvas, half, x_offset| {
         for (pen_x, p) in &placed {
             draw_glyph(
@@ -336,8 +452,10 @@ fn compare_blend(
                 p,
                 *pen_x + PAD as f32,
                 baseline + PAD as f32,
-                size,
+                size * scale,
                 inks[half],
+                true,
+                &mut coverage,
             );
         }
     });
@@ -353,6 +471,10 @@ fn compare_blend(
 }
 
 /// Composites one glyph, sampling the atlas the way `text.wgsl` does.
+///
+/// `size` is the em size in device pixels; every coordinate here is a device
+/// pixel. `compensate` selects whether the small-text edge bias is applied, so
+/// the `bias` comparison can draw the same glyph both ways.
 #[allow(clippy::too_many_arguments)]
 fn draw_glyph(
     canvas: &mut Canvas,
@@ -363,6 +485,8 @@ fn draw_glyph(
     baseline: f32,
     size: f32,
     ink: Ink,
+    compensate: bool,
+    stats: &mut Coverage,
 ) {
     let atlas = text.atlas();
     let Some(format) = atlas.page_format(p.page) else { return };
@@ -374,7 +498,13 @@ fn draw_glyph(
     // zero on the bitmap path, so this is unconditional.
     let pad = p.range_em * size;
     let mut x0 = pen_x + p.bounds_em[0] * size - pad;
-    let mut y0 = baseline + p.bounds_em[1] * size - pad;
+    // `snap_glyph_quad` rounds the *pen*, not the quad's own top edge, and
+    // applies the resulting delta to the whole quad. Every glyph in a run
+    // shares the pen and none of them share an ink top, so rounding the top
+    // edge instead would hand each glyph a different sub-pixel shift and tear
+    // the baseline apart. An earlier version of this probe did not snap the
+    // field path at all, and so drew it softer than the renderer does.
+    let mut y0 = baseline.round() + p.bounds_em[1] * size - pad;
     let mut qw = p.bounds_em[2] * size + 2.0 * pad;
     let mut qh = p.bounds_em[3] * size + 2.0 * pad;
     if p.is_bitmap {
@@ -382,14 +512,20 @@ fn draw_glyph(
         // grid, extent to the texel count. That 1:1 alignment is most of why
         // this path is sharp at small sizes.
         x0 = x0.round();
-        y0 = y0.round();
+        y0 = (baseline + p.bounds_em[1] * size - pad).round();
         qw = p.texel_size[0] as f32;
         qh = p.texel_size[1] as f32;
     }
     if qw <= 0.0 || qh <= 0.0 {
         return;
     }
-    let screen_range = (p.range_em * size).max(1.0);
+    // The vertex stage's job, transcribed. `compensate` is false only for the
+    // left-hand panel of the `bias` comparison.
+    let [edge_scale, edge_offset] = if compensate {
+        mtsdf_edge_ramp(size, p.range_em * size)
+    } else {
+        [(p.range_em * size).max(1.0), 0.0]
+    };
 
     let y_lo = y0.floor().max(0.0) as usize;
     let y_hi = (y0 + qh).ceil().max(0.0) as usize;
@@ -408,6 +544,7 @@ fn draw_glyph(
             let s = bilinear(pixels, page, bpp, u, v);
 
             if p.is_subpixel {
+                stats.add((s[0] + s[1] + s[2]) / 3.0);
                 let coverage = [
                     alpha_from_coverage(s[0], ink.contrast),
                     alpha_from_coverage(s[1], ink.contrast),
@@ -421,10 +558,50 @@ fn draw_glyph(
                 s[0]
             } else {
                 let sd = median3(s[0], s[1], s[2]) - 0.5;
-                (sd * screen_range + 0.5).clamp(0.0, 1.0)
+                (sd * edge_scale + edge_offset + 0.5).clamp(0.0, 1.0)
             };
+            stats.add(coverage);
             canvas.blend(px + x_offset, py, ink.text, alpha_from_coverage(coverage, ink.contrast));
         }
+    }
+}
+
+/// What a panel's coverage adds up to, which is the part a picture cannot say.
+///
+/// `ink` is total coverage — the geometric weight of the text. `solid` and
+/// `grey` split the pixels the glyph actually touches into the ones that reach
+/// full opacity and the ones that stay a partial tone. Softness at small sizes
+/// is the second number being large, and the two have to be read together: a
+/// bias that only raised `ink` would be emboldening without sharpening.
+#[derive(Default, Clone, Copy)]
+struct Coverage {
+    ink: f64,
+    solid: usize,
+    grey: usize,
+}
+
+impl Coverage {
+    fn add(&mut self, coverage: f32) {
+        self.ink += coverage as f64;
+        if coverage >= 0.85 {
+            self.solid += 1;
+        } else if coverage > 0.02 {
+            self.grey += 1;
+        }
+    }
+
+    fn report(&self, name: &str, reference: Option<Coverage>) {
+        let lit = (self.solid + self.grey).max(1) as f32;
+        let relative = match reference {
+            Some(r) if r.ink > 0.0 => format!("{:+7.1} %", (self.ink / r.ink - 1.0) * 100.0),
+            _ => "        -".into(),
+        };
+        println!(
+            "{name:>16}  ink {:>9.2}{relative}   solid {:>5.3}   grey {:>5.3}",
+            self.ink,
+            self.solid as f32 / lit,
+            self.grey as f32 / lit,
+        );
     }
 }
 

@@ -201,6 +201,126 @@ pub fn alpha_from_coverage(coverage: f32, contrast: f32) -> f32 {
     if contrast > 0.0 { c.powf(k) } else { 1.0 - (1.0 - c).powf(k) }
 }
 
+/// The on-screen em size at and above which the small-text compensation below
+/// is inert.
+///
+/// Deliberately the same number as `spherekit_text::raster::BITMAP_MAX_DEVICE_PX`,
+/// which is where `TextRasterMode::Auto` stops choosing the field at all. Two
+/// consequences follow, and both are load-bearing:
+///
+/// * Under `Auto` the compensation is unreachable — every glyph the field path
+///   receives is at least this large, so nothing an application draws today
+///   changes by one bit.
+/// * At a 2x scale factor a 12 logical-pixel glyph is already 24 device pixels,
+///   so the whole interface type scale sits at or above the ceiling and renders
+///   exactly as it did before.
+///
+/// It is a *device* pixel threshold, like the raster-strategy one it mirrors:
+/// the compensation exists because of the physical pixel grid, and 13 logical
+/// pixels at 200 % is not a small glyph.
+///
+/// The crates cannot share the constant — `spherekit-text` depends on this one,
+/// not the other way round — so `the_compensation_ceiling_matches_the_bitmap_threshold`
+/// in `spherekit-text` asserts the two are equal.
+pub const SMALL_TEXT_MAX_DEVICE_PX: f32 = 24.0;
+
+/// The widest outward edge bias, in device pixels, at the peak of the curve.
+///
+/// This is a **perceptual** emboldening, and the distinction matters because
+/// the obvious justification for it is measurably false here. A distance field
+/// drawn through `text.wgsl` is not geometrically thin at small sizes: measured
+/// over seven faces and 88 glyphs each, its total coverage sits within 1.7 % of
+/// what the analytic scanline rasteriser produces for the same outline at the
+/// same size, at every size from 8 to 48 device pixels, and the edge bias that
+/// would null that difference is under 0.006 px. There is no ink deficit to
+/// correct. Sharpening does not correct anything either — the reconstruction's
+/// RMS error against exact coverage *rises* monotonically with any ramp
+/// narrower than one pixel, because a one-pixel ramp already is the
+/// area-correct answer for a straight edge.
+///
+/// What is left is the thing every traditional rasteriser compensates for and
+/// no pixel metric measures: a thin dark stroke reads lighter than its coverage
+/// says it should. FreeType's CFF driver darkens a 1.4 px stem by 0.275 px of
+/// total width — 0.1375 px per side — and DirectWrite does something similar
+/// through its contrast parameter. Half of FreeType's amount is used here,
+/// because SphereKit already applies [`coverage_contrast_for`], a *solved*
+/// gamma-space correction, and part of what FreeType's darkening compensates
+/// for is the blend space that correction has already fixed.
+///
+/// Measured effect over the same seven faces, against the uncompensated field,
+/// as the fraction of inked pixels that reach full opacity:
+///
+/// | device px | bias | ramp | ink | solid before | solid after |
+/// |---|---|---|---|---|---|
+/// | 10 | 0.088 | 0.66 | +23.5 % | 0.127 | 0.295 |
+/// | 11 | 0.081 | 0.75 | +19.9 % | 0.163 | 0.322 |
+/// | 13 | 0.069 | 0.95 | +15.5 % | 0.196 | 0.282 |
+/// | 16 | 0.050 | 1.00 | +8.4 % | 0.263 | 0.310 |
+/// | 20 | 0.025 | 1.00 | +3.2 % | 0.359 | 0.376 |
+/// | 24 | 0 | 1.00 | 0 | 0.421 | 0.421 |
+pub const MAX_EDGE_BIAS_PX: f32 = 0.15;
+
+/// The narrowest antialiasing ramp [`mtsdf_edge_ramp`] will accept, in device
+/// pixels.
+///
+/// The ramp has to give way because the field has nowhere else to take the bias
+/// from. An MTSDF texel stores `distance / range + 0.5` clamped into a byte, so
+/// the field carries real distances only within **half a range** of the outline
+/// and is saturated beyond that. With the default 4-texel range at 48 texels per
+/// em the range is one twelfth of an em, which is 1.08 device pixels at 13 px
+/// and 0.83 at 10 — barely more than the one-pixel ramp itself.
+///
+/// Add a bias without accounting for that and the result is not a heavier glyph
+/// but a grey box: at the saturated background the shader's coverage sits
+/// *exactly* at zero, so any positive offset lifts the entire padded quad off
+/// the background uniformly. Measured, an 0.05 px bias applied that way at 10
+/// device pixels multiplies total ink by 1.75 and at 13 px by 1.20, almost all
+/// of it flood rather than edge.
+///
+/// So the bias is capped at `(range - MIN_EDGE_RAMP_PX) / 2` and the ramp
+/// narrowed to `range - 2 * bias`, which keeps the far background at hard zero
+/// by construction. 0.65 px is the floor because below it a near-horizontal
+/// contour starts to show stair-stepping; it binds only under about 10 device
+/// pixels, where the alternative is no compensation at all.
+pub const MIN_EDGE_RAMP_PX: f32 = 0.65;
+
+/// The distance-to-coverage ramp for one glyph, as `[scale, offset]`.
+///
+/// `text.wgsl` does exactly this on the GPU, in the vertex stage, and then
+/// evaluates `clamp(sd * scale + offset + 0.5, 0, 1)` per fragment. Anything
+/// that needs to predict what the shader will produce — the `glyph_quad_probe`
+/// example, tests — must call this rather than write the formula out a second
+/// time, and `the_shader_and_the_cpu_agree_on_the_edge_ramp` checks that the
+/// constants have not drifted apart.
+///
+/// `em_px` and `px_range` are both measured *on screen*, with the transform's
+/// scale already folded in, because that is the size the pixel grid sees.
+///
+/// **At `bias == 0` this is an exact restatement of what the shader did before
+/// the compensation existed** — `scale` reduces to `max(px_range, 1)` and
+/// `offset` to zero — which is what makes "nothing at or above
+/// [`SMALL_TEXT_MAX_DEVICE_PX`] changes" a property of the arithmetic rather
+/// than a claim about it.
+pub fn mtsdf_edge_ramp(em_px: f32, px_range: f32) -> [f32; 2] {
+    // A bitmap glyph arrives with a placeholder range and never reaches the
+    // field branch; a malformed font can produce a non-finite one.
+    let range = if px_range.is_finite() { px_range.max(1e-3) } else { 1e-3 };
+    let em = if em_px.is_finite() { em_px.max(0.0) } else { 0.0 };
+
+    // How far below the ceiling this glyph sits, in 0..=1. Linear, so the
+    // compensation fades out rather than stepping off at the boundary.
+    let smallness = (1.0 - em / SMALL_TEXT_MAX_DEVICE_PX).clamp(0.0, 1.0);
+    // The field is saturated beyond half a range, and the ramp spends
+    // `MIN_EDGE_RAMP_PX` of that budget, so this is all there is left to move
+    // the edge by without lifting the background off zero.
+    let headroom = ((range - MIN_EDGE_RAMP_PX) * 0.5).max(0.0);
+    let bias = (MAX_EDGE_BIAS_PX * smallness).min(headroom);
+    // `min(1.0)` keeps the ramp at the area-correct width wherever the field is
+    // wide enough to afford it, which is everywhere above about 15 device px.
+    let ramp = (range - 2.0 * bias).clamp(1e-4, 1.0);
+    [range / ramp, bias / ramp]
+}
+
 /// One glyph placed at a baseline-relative position.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct PositionedGlyph {
@@ -748,6 +868,151 @@ mod tests {
         for contrast in [1.0, -1.0, 0.0, 0.5, f32::NAN, f32::INFINITY] {
             let a = alpha_from_coverage(0.3, contrast);
             assert!((a - 0.3).abs() < 1e-6, "contrast {contrast} gave {a}");
+        }
+    }
+
+    /// The field range in device pixels for a glyph of `em_px`, using the
+    /// generator's default 4 texels of range at 48 texels per em.
+    fn default_px_range(em_px: f32) -> f32 {
+        em_px * (4.0 / 48.0)
+    }
+
+    /// Coverage the way `text.wgsl` computes it, for a signed distance held in
+    /// the field's own normalised units.
+    fn coverage(sd: f32, em_px: f32) -> f32 {
+        let [scale, offset] = mtsdf_edge_ramp(em_px, default_px_range(em_px));
+        (sd * scale + offset + 0.5).clamp(0.0, 1.0)
+    }
+
+    /// The promise the whole design rests on: the ceiling is the same number the
+    /// raster-strategy threshold uses, so `Auto` never reaches the compensation
+    /// and a 2x interface never reaches it either.
+    #[test]
+    fn the_compensation_is_inert_at_and_above_the_ceiling() {
+        for em in [SMALL_TEXT_MAX_DEVICE_PX, 24.5, 26.0, 32.0, 48.0, 96.0, 400.0] {
+            let range = default_px_range(em);
+            let [scale, offset] = mtsdf_edge_ramp(em, range);
+            assert_eq!(offset, 0.0, "{em} px biased the edge");
+            // Exactly what the shader computed before the compensation existed.
+            assert!((scale - range.max(1.0)).abs() < 1e-6, "{em} px: scale {scale}");
+        }
+    }
+
+    /// A bias applied without regard for the field's range does not thicken the
+    /// glyph, it floods the quad: beyond half a range the field is saturated, so
+    /// the offset lands on the background as a uniform grey. The headroom cap is
+    /// what stops that, and this checks it holds at every size, not only the
+    /// ones in the table.
+    #[test]
+    fn the_background_stays_at_hard_zero_at_every_size() {
+        for step in 0..=400 {
+            let em = 1.0 + step as f32 * 0.25;
+            // The saturated far background: a texel of 0 gives a median of
+            // -0.5, and nothing the field can store is lower.
+            //
+            // The cap makes this exactly zero in real arithmetic -- the ramp is
+            // `range - 2 * bias`, so the two terms cancel -- and the tolerance
+            // is for the float rounding of that cancellation, which lands
+            // around 3e-8. One 8-bit level is 4e-3, so this is four orders of
+            // magnitude below anything a surface can show; the point of the
+            // test is that it is not the 0.05-and-up flood an uncapped bias
+            // produces.
+            let background = coverage(-0.5, em);
+            assert!(background < 1e-6, "{em} px flooded the quad with {background}");
+        }
+    }
+
+    /// The trap the cap exists for, as a number rather than a warning. Adding
+    /// the bias straight to the coverage — the obvious implementation, and the
+    /// one every reference to "edge bias" describes — lifts the saturated
+    /// background off zero, so the glyph gains a grey box instead of a heavier
+    /// stroke. At 13 device pixels the field has only 0.04 px of range to spare
+    /// beyond its own ramp, and at 10 it has none at all.
+    #[test]
+    fn an_uncapped_bias_would_flood_the_quad_rather_than_thicken_the_glyph() {
+        for em in [10.0f32, 11.0, 13.0] {
+            let range = default_px_range(em);
+            let naive = (-0.5 * range.max(1.0) + 0.05 + 0.5).clamp(0.0, 1.0);
+            // Two 8-bit levels or more, over every texel of a quad that is
+            // mostly padding.
+            assert!(naive > 0.008, "{em} px: a naive 0.05 px bias reached only {naive}");
+            assert!(coverage(-0.5, em) < 1e-6, "{em} px: the cap did not hold");
+        }
+    }
+
+    /// Fitting is a nudge, here as much as in `hint.rs`: an eighth of a pixel is
+    /// enough to change perceived weight and small enough not to change shape.
+    #[test]
+    fn the_bias_is_bounded_and_fades_out_at_both_ends() {
+        let bias_at = |em: f32| {
+            let [scale, offset] = mtsdf_edge_ramp(em, default_px_range(em));
+            // `offset` is measured in ramp widths; recover device pixels.
+            offset / scale * default_px_range(em)
+        };
+        let mut peak: f32 = 0.0;
+        for step in 0..=400 {
+            let em = 1.0 + step as f32 * 0.25;
+            let bias = bias_at(em);
+            assert!((0.0..=MAX_EDGE_BIAS_PX + 1e-6).contains(&bias), "{em} px biased by {bias}");
+            peak = peak.max(bias);
+        }
+        // Zero where the field has no range to spare, zero at the ceiling, and a
+        // peak in between -- the compensation is a bump, not a step.
+        assert_eq!(bias_at(6.0), 0.0, "a field this small has no headroom to spend");
+        assert_eq!(bias_at(SMALL_TEXT_MAX_DEVICE_PX), 0.0);
+        assert!(peak > 0.08, "peak bias {peak} is not worth having");
+    }
+
+    /// A discontinuity in either output would show as a visible weight step as a
+    /// panel zooms through the size where one of the two caps takes over.
+    #[test]
+    fn the_ramp_is_continuous_in_size() {
+        let mut previous = mtsdf_edge_ramp(1.0, default_px_range(1.0));
+        for step in 1..=2000 {
+            let em = 1.0 + step as f32 * 0.05;
+            let next = mtsdf_edge_ramp(em, default_px_range(em));
+            for (i, (a, b)) in previous.iter().zip(next.iter()).enumerate() {
+                assert!((a - b).abs() < 0.02, "{em} px: component {i} jumped {a} -> {b}");
+            }
+            previous = next;
+        }
+    }
+
+    /// The compensation may only ever add ink. A negative offset, or a ramp
+    /// wider than the area-correct one, would thin small text instead.
+    #[test]
+    fn the_compensation_only_ever_darkens() {
+        for step in 0..=400 {
+            let em = 1.0 + step as f32 * 0.25;
+            let range = default_px_range(em);
+            let [scale, offset] = mtsdf_edge_ramp(em, range);
+            assert!(offset >= 0.0, "{em} px: negative offset {offset}");
+            assert!(scale >= range.max(1.0) - 1e-6, "{em} px: ramp widened to {scale}");
+            // Every coverage value is at least what the uncompensated shader
+            // would have produced for the same distance.
+            for i in 0..=64 {
+                let sd = -0.5 + i as f32 / 64.0;
+                let plain = (sd * range.max(1.0) + 0.5).clamp(0.0, 1.0);
+                assert!(coverage(sd, em) >= plain - 1e-6, "{em} px at sd {sd}");
+            }
+        }
+    }
+
+    /// Degenerate input reaches this from a malformed font, and a NaN here is a
+    /// black block on screen rather than a soft glyph.
+    #[test]
+    fn a_degenerate_size_or_range_still_produces_a_usable_ramp() {
+        for (em, range) in [
+            (0.0, 0.0),
+            (f32::NAN, 1.0),
+            (13.0, f32::NAN),
+            (-5.0, -5.0),
+            (f32::INFINITY, f32::INFINITY),
+            (13.0, 1e-3),
+        ] {
+            let [scale, offset] = mtsdf_edge_ramp(em, range);
+            assert!(scale.is_finite() && scale > 0.0, "({em}, {range}) gave scale {scale}");
+            assert!(offset.is_finite() && offset >= 0.0, "({em}, {range}) gave offset {offset}");
         }
     }
 

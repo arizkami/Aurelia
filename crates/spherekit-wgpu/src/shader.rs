@@ -179,6 +179,43 @@ mod tests {
         }
     }
 
+    /// `text.wgsl` and `spherekit_render::scene::mtsdf_edge_ramp` are the same
+    /// function written twice, because only the vertex stage knows a glyph's
+    /// on-screen size and only the CPU copy can be called from a test or from
+    /// `glyph_quad_probe`. The shape is short enough to transcribe safely; the
+    /// numbers are what would drift, so the numbers are what is checked.
+    ///
+    /// This is the same arrangement `alpha_from_coverage` lives under, and this
+    /// crate is the only one that can hold the test: `spherekit-render` cannot
+    /// see the WGSL, and `spherekit-text` does not depend on this crate.
+    #[test]
+    fn the_shader_and_the_cpu_agree_on_the_edge_ramp() {
+        let source = source("text.wgsl").expect("text.wgsl is embedded");
+        let constant = |name: &str| -> f32 {
+            let decl = format!("const {name}: f32 = ");
+            let start =
+                source.find(&decl).unwrap_or_else(|| panic!("{name} is not declared")) + decl.len();
+            let end = source[start..].find(';').expect("unterminated constant") + start;
+            source[start..end].trim().parse().unwrap_or_else(|e| panic!("{name}: {e}"))
+        };
+        assert_eq!(
+            constant("SMALL_TEXT_MAX_DEVICE_PX"),
+            spherekit_render::SMALL_TEXT_MAX_DEVICE_PX
+        );
+        assert_eq!(constant("MAX_EDGE_BIAS_PX"), spherekit_render::MAX_EDGE_BIAS_PX);
+        assert_eq!(constant("MIN_EDGE_RAMP_PX"), spherekit_render::MIN_EDGE_RAMP_PX);
+
+        // And the body still reads the two slots the CPU copy fills, in the
+        // order it fills them. A silent swap of scale and offset would pass
+        // every constant check above and render nothing but grey.
+        let body = source.find("fn mtsdf_edge_ramp").expect("the shader helper is gone");
+        let tail = &source[body..];
+        assert!(
+            tail.contains("return vec2<f32>(range / ramp, bias / ramp);"),
+            "the shader's return no longer matches [scale, offset]"
+        );
+    }
+
     #[test]
     fn composition_is_byte_stable_across_runs() {
         // A pipeline cache keyed on source text is only useful if the same

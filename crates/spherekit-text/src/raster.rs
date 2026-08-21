@@ -912,6 +912,43 @@ mod tests {
         assert_eq!(choose_raster_strategy(px(16.0), ScaleFactor::new(1.5)), RasterStrategy::Mtsdf);
     }
 
+    /// The two thresholds are the same number on purpose, and this is the only
+    /// place both are visible: `spherekit-render` cannot see this crate.
+    ///
+    /// What the equality buys is that the small-text edge compensation in
+    /// `text.wgsl` is *unreachable* under `TextRasterMode::Auto`. Every glyph
+    /// `Auto` sends to the field path is at least [`BITMAP_MAX_DEVICE_PX`]
+    /// device pixels, and the compensation is inert at and above
+    /// `SMALL_TEXT_MAX_DEVICE_PX`, so no interface drawn through the shipped
+    /// widgets renders one bit differently for it. The compensation exists for
+    /// callers who have taken the `TextRasterMode::Mtsdf` escape hatch — content
+    /// that zooms continuously, which cannot afford a per-size bitmap — and it
+    /// is only those callers who see it.
+    #[test]
+    fn auto_never_reaches_the_small_text_compensation() {
+        assert_eq!(
+            BITMAP_MAX_DEVICE_PX,
+            spherekit_render::SMALL_TEXT_MAX_DEVICE_PX,
+            "the raster threshold and the compensation ceiling have drifted apart"
+        );
+
+        // Swept rather than asserted: every size and scale a display can
+        // produce, checked against both halves of the rule at once.
+        for size in 1..=400 {
+            for scale in [0.5f32, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0] {
+                let font_size = px(size as f32 * 0.25);
+                let scale = ScaleFactor::new(scale);
+                if choose_raster_strategy(font_size, scale) != RasterStrategy::Mtsdf {
+                    continue;
+                }
+                let em_px = device_font_size(font_size, scale);
+                let px_range = em_px * crate::mtsdf::GlyphRasterConfig::default().range_em();
+                let [_, offset] = spherekit_render::mtsdf_edge_ramp(em_px, px_range);
+                assert_eq!(offset, 0.0, "Auto sent {em_px} device px into the compensation");
+            }
+        }
+    }
+
     #[test]
     fn bitmap_sizes_round_to_whole_device_pixels_and_never_reach_zero() {
         assert_eq!(bitmap_size_px(px(11.0), ScaleFactor::new(1.0)), 11);

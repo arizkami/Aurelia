@@ -283,8 +283,9 @@ collision shows the overshoots and the headrooms overlapping across faces.
 
 ### What is still missing
 
-**Stem darkening.** DirectWrite thickens stems slightly at small sizes to compensate for the eye
-reading thin dark strokes as lighter than they are. Not implemented.
+Nothing in this section. Stem darkening — thickening strokes slightly at small sizes, because the eye
+reads a thin dark stroke as lighter than it is — used to be listed here as unimplemented. It now
+exists on the field path, and has a section of its own below.
 
 ## The atlas
 
@@ -379,15 +380,135 @@ distance fields**. That zero is the whole point: keying a field by size would de
 multiply the atlas by the number of sizes in the interface. A test asserts that requesting the same
 glyph at 48 px and 96 px yields the same atlas placement.
 
+## Small text on the field path
+
+The bitmap fallback exists because of everything above, and it is the right answer for an interface
+whose type sizes are fixed. It is the wrong answer for content that zooms continuously, which is what
+`TextRasterMode::Mtsdf` is for — and a caller who takes that escape hatch at 100 % gets 10-to-16
+device-pixel glyphs on the field path, which is exactly where the field is weakest.
+
+### What is actually wrong there, measured
+
+The obvious diagnosis is that the field comes out thin, and it is **false**. Measured over seven
+faces and 88 glyphs each, against the analytic scanline rasteriser on the same outline at the same
+size:
+
+| device px | field ink ÷ exact ink | bias that would null it | RMS against exact |
+|---|---|---|---|
+| 10 | 1.014 | −0.006 px | 0.026 |
+| 13 | 1.011 | −0.005 px | 0.024 |
+| 16 | 1.002 | −0.001 px | 0.021 |
+| 32 | 1.000 | −0.000 px | 0.014 |
+
+The field carries the right amount of ink at every size, to within 1.7 %. Nor is it blurred:
+narrowing the antialiasing ramp *raises* the RMS error monotonically at every size, because a
+one-pixel ramp already is the area-correct answer for a straight edge — `clamp(d + 0.5)` and "fraction
+of the pixel on the ink side" are the same function.
+
+What is left is the thing no pixel metric measures, and the reason DirectWrite and FreeType both do
+something about it: a thin dark stroke reads lighter than its coverage says. At 13 device pixels a
+regular-weight stem is 1.44 px wide, so its coverage is spread across two partial pixels and never
+reaches a solid one. The coverage is right and the text still looks grey.
+
+### The edge bias, and why it costs the ramp
+
+The compensation is an outward bias on the field's threshold: render the level set at `d = −bias`
+rather than `d = 0`, so every stroke gains `2 × bias` of width. `MAX_EDGE_BIAS_PX` is **0.15**, half
+of what FreeType's CFF driver applies to a stem this wide, because SphereKit already applies a solved
+gamma-space correction and part of what FreeType's darkening substitutes for is the blend space that
+correction has fixed.
+
+The part that is not obvious is that **the bias has to be paid for out of the field's range**, and at
+1x there is almost nothing there to pay with. A texel stores `distance / range + 0.5` clamped into a
+byte, so the field carries real distances only within *half a range* of the outline and is saturated
+beyond that. With the default 4 texels of range at 48 texels per em, the range is one twelfth of an em:
+
+| device px | field range | ramp needs | left over for a bias |
+|---|---|---|---|
+| 10 | 0.833 px | 1.0 px | **none** |
+| 13 | 1.083 px | 1.0 px | 0.04 px |
+| 16 | 1.333 px | 1.0 px | 0.17 px |
+| 24 | 2.000 px | 1.0 px | 0.50 px |
+
+Add the bias without accounting for that and the result is not a heavier glyph but a grey box: at the
+saturated background the shader's coverage sits at *exactly* zero, so any positive offset lifts the
+whole padded quad off the background uniformly. Measured, a naive 0.05 px bias at 10 device pixels
+multiplies total ink by **1.75**, and at 13 px by 1.20, almost all of it flood rather than edge.
+
+So the bias is capped at the range's spare capacity and the ramp narrowed to absorb what it takes:
+
+```text
+bias = min(MAX_EDGE_BIAS_PX * (1 - em_px / 24),  (range - MIN_EDGE_RAMP_PX) / 2)
+ramp = min(1, range - 2 * bias)
+```
+
+which keeps the far background at hard zero by construction — `the_background_stays_at_hard_zero_at_every_size`
+sweeps it at quarter-pixel steps from 1 to 101 device pixels. `MIN_EDGE_RAMP_PX` is 0.65 px, the
+narrowest band before a near-horizontal contour starts to stair-step; it binds only under about 10
+device pixels, where the alternative is no compensation at all. Both caps are linear and they meet
+continuously, so a zooming panel sees no weight step.
+
+### Two properties that make it safe
+
+**At `bias == 0` the arithmetic is the old arithmetic.** `mtsdf_edge_ramp` returns
+`[range / ramp, bias / ramp]`, and at zero bias that is `[max(range, 1), 0]` — precisely the
+`screen_range` the shader clamped before. "Nothing at or above the ceiling changes" is therefore a
+property of the formula rather than a claim about it.
+
+**`Auto` cannot reach it.** The ceiling is the same number as [`BITMAP_MAX_DEVICE_PX`], so every glyph
+`Auto` sends to the field is already at or above it. `auto_never_reaches_the_small_text_compensation`
+sweeps 400 sizes across seven scale factors and asserts the bias is zero for every one that chooses
+the field. At a 2x scale factor that means the whole interface type scale from 12 logical pixels up is
+bit-identical; forced `Mtsdf` at 10 and 11 logical pixels is the only exception, and it moves the edge
+by at most 0.026 px.
+
+### What it buys
+
+Forced `Mtsdf`, Segoe UI, "Handgloves 0123 Preferences", light theme, compensated against not:
+
+| logical px | scale | device px | bias | ramp | ink | solid before | solid after |
+|---|---|---|---|---|---|---|---|
+| 10 | 1x | 10 | 0.088 | 0.66 | +23.8 % | 0.092 | 0.300 |
+| 11 | 1x | 11 | 0.081 | 0.75 | +20.0 % | 0.082 | 0.223 |
+| 13 | 1x | 13 | 0.069 | 0.95 | +15.7 % | 0.132 | 0.219 |
+| 16 | 1x | 16 | 0.050 | 1.00 | +9.2 % | 0.248 | 0.248 |
+| 10 | 2x | 20 | 0.025 | 1.00 | +3.6 % | 0.334 | 0.338 |
+| 11 | 2x | 22 | 0.012 | 1.00 | +1.6 % | 0.354 | 0.355 |
+| 13 | 2x | 26 | 0 | 1.00 | **0.0 %** | 0.430 | 0.430 |
+| 16 | 2x | 32 | 0 | 1.00 | **0.0 %** | 0.499 | 0.499 |
+
+`solid` is the fraction of the pixels a glyph touches that reach full opacity, which is what softness
+is the absence of. At 16 device pixels the ramp is already the full width, so the bias is a pure
+translation and moves weight without moving that fraction — the two columns have to be read together.
+
+```bash
+SPHEREKIT_PROBE_COMPARE=bias SPHEREKIT_PROBE_SIZE=13 SPHEREKIT_PROBE_SCALE=1 SPHEREKIT_PROBE_ZOOM=6   cargo run -p spherekit-text --example glyph_quad_probe --release
+```
+
+writes uncompensated against compensated and prints the table above for that size. `SPHEREKIT_PROBE_SCALE`
+is what makes the 1x-against-2x question askable at all: every threshold in this stack keys off the
+physical size, so the probe has to be able to separate the two.
+
+### What it does not fix
+
+Vertical grid-fitting, which is most of the remaining gap. Measured on the same corpus, the fitted
+bitmap path puts about four percentage points fewer of its pixels in the grey band than exact coverage
+does, purely by moving the x-height and cap lines onto whole pixels. A distance field is
+size-independent by construction and has no single size to fit to, so that improvement is not
+available to it at any bias. It is why the bitmap fallback exists and why the threshold is where it
+is.
+
 ## The shader
 
 Smoothing is derived from the glyph's actual on-screen size, never from a constant:
 
 ```wgsl
-// px_range arrives as the field's range in destination pixels at the nominal
-// size; the vertex stage multiplies it by the transform's scale.
-let screen_range = max(inst.params.x * transform_scale(inst.indices.z), 1.0);
-let alpha = clamp(sd * screen_range + 0.5, 0.0, 1.0);
+// px_range and em_px arrive as destination-pixel sizes at the glyph's nominal
+// scale; the vertex stage multiplies both by the transform's scale.
+let zoom = transform_scale(inst.indices.z);
+let ramp = mtsdf_edge_ramp(inst.params.w * zoom, inst.params.x * zoom);
+// ...and per fragment:
+let alpha = clamp(sd * edge_scale + edge_offset + 0.5, 0.0, 1.0);
 ```
 
 A fixed threshold produces text that is crisp at one size and either blurry or aliased at every
@@ -556,6 +677,19 @@ SPHEREKIT_PROBE_THEME=dark SPHEREKIT_PROBE_COMPARE=blend   cargo run -p sphereki
 ```
 
 A CPU transcription still cannot prove the GPU agreed. What it can do is stop disagreeing on purpose.
+
+### And it used to skip the baseline snap on the field path
+
+The same class of defect, found while measuring the small-size compensation above. `draw_glyph`
+snapped both axes for a bitmap and *neither* for a distance field, so the field panel sat on whatever
+fractional device y the layout produced while the renderer had been rounding it since `snap_glyph_quad`
+was written. Every MTSDF comparison the probe had ever drawn was therefore a little softer than the
+thing it was claiming to show, and the "forced MTSDF against `Auto`" panel — the one the raster
+threshold is justified by — was the comparison most affected.
+
+It now rounds the **pen**, not the quad's own top edge, exactly as the compiler does, and for the same
+reason: every glyph in a run shares the pen and none of them share an ink top, so rounding the top
+edge would hand each glyph a different sub-pixel shift and pull the shared baseline apart.
 
 ### Layers have to land on the device grid
 

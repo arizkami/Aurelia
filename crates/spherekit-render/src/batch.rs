@@ -942,7 +942,12 @@ impl BatchCompiler {
                 } else {
                     1.0
                 },
-                _pad_f: 0.0,
+                // The size the small-text compensation keys off. The vertex
+                // stage multiplies it by the transform's scale, exactly as it
+                // does `px_range`, so a zoomed panel is compensated for the
+                // size it actually appears at rather than the size it was
+                // recorded at.
+                em_px: size * scale,
                 flags,
                 atlas_page: p.page,
                 transform_index: transform,
@@ -1806,6 +1811,132 @@ mod tests {
         let (pad, ink_top) = (0.1 * 24.0, -0.8 * 24.0);
         let baseline = g.bounds[1] + pad - ink_top;
         assert!((baseline - baseline.round()).abs() < 1e-4, "baseline landed at {baseline}");
+    }
+
+    /// The two halves of the same rule, checked in *device* space at every
+    /// scale factor a Windows display actually reports.
+    ///
+    /// Snapping the baseline in logical space would leave 20.5 device pixels
+    /// alone at 2x and soften every glyph in the run identically; quantising x
+    /// would clump letter spacing at exactly the sizes where the field is the
+    /// only path available. The existing single-scale test covers 1x, where the
+    /// two spaces coincide and the distinction is invisible.
+    #[test]
+    fn a_field_baseline_lands_on_a_physical_pixel_while_x_keeps_its_fraction() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0, 3.0] {
+            let mut s = Scene::new(size2(px(800.0), px(600.0)), ScaleFactor::new(scale));
+            // Deliberately fractional in both axes, and fractional again once
+            // multiplied by every scale above.
+            let (pen_x, pen_y, size) = (10.3f32, 20.7f32, 24.0f32);
+            {
+                let mut c = Canvas::new(&mut s);
+                c.draw_glyph_run(
+                    crate::scene::GlyphRun {
+                        font: FontId::new(0, 1),
+                        font_size: px(size),
+                        glyphs: smallvec::smallvec![crate::scene::PositionedGlyph {
+                            glyph: GlyphId(1),
+                            position: Point::new(px(pen_x), px(pen_y)),
+                        }],
+                        raster: TextRasterMode::Mtsdf,
+                        outline_width: Px::ZERO,
+                        outline_color: Color::TRANSPARENT,
+                        coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
+                    },
+                    Color::WHITE,
+                );
+            }
+            let mut c = BatchCompiler::new();
+            let f = c.compile(&s, &mut StubGlyphs { page: 0, calls: 0 }, &mut StubTextures(true));
+            let g = &f.glyphs[0];
+
+            // Recover the baseline the quad implies, in device pixels: the top
+            // edge, plus the padding the field adds, minus the stub's ink top.
+            let (pad, ink_top) = (0.1 * size, -0.8 * size);
+            let baseline = (g.bounds[1] + pad - ink_top) * scale;
+            assert!(
+                (baseline - baseline.round()).abs() < 1e-3,
+                "scale {scale}: baseline landed at {baseline} device px"
+            );
+
+            // And x is untouched, which is only meaningful because it was
+            // fractional to begin with.
+            let device_x = (g.bounds[0] + pad) * scale;
+            assert!((g.bounds[0] + pad - pen_x).abs() < 1e-4, "scale {scale}: x moved");
+            assert!(
+                (device_x - device_x.round()).abs() > 1e-3,
+                "scale {scale}: x was quantised to {device_x}"
+            );
+        }
+    }
+
+    /// The compensation keys off the size the glyph appears at, so the size has
+    /// to travel with the instance. The vertex stage multiplies it by the
+    /// transform's scale, exactly as it does `px_range`.
+    #[test]
+    fn a_field_glyph_carries_its_device_em_size() {
+        for (scale, size) in [(1.0f32, 13.0f32), (2.0, 13.0), (1.5, 11.0), (1.0, 32.0)] {
+            let mut s = Scene::new(size2(px(800.0), px(600.0)), ScaleFactor::new(scale));
+            {
+                let mut c = Canvas::new(&mut s);
+                c.draw_glyph_run(
+                    crate::scene::GlyphRun {
+                        font: FontId::new(0, 1),
+                        font_size: px(size),
+                        glyphs: smallvec::smallvec![crate::scene::PositionedGlyph {
+                            glyph: GlyphId(1),
+                            position: Point::new(px(10.0), px(30.0)),
+                        }],
+                        raster: TextRasterMode::Mtsdf,
+                        outline_width: Px::ZERO,
+                        outline_color: Color::TRANSPARENT,
+                        coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
+                    },
+                    Color::WHITE,
+                );
+            }
+            let mut c = BatchCompiler::new();
+            let f = c.compile(&s, &mut StubGlyphs { page: 0, calls: 0 }, &mut StubTextures(true));
+            assert!(
+                (f.glyphs[0].em_px - size * scale).abs() < 1e-4,
+                "{size} px at {scale}x carried {}",
+                f.glyphs[0].em_px
+            );
+        }
+    }
+
+    /// What "2x is unchanged" means, stated exactly rather than approximately.
+    ///
+    /// The ceiling is a *device* pixel threshold, so at 2x it falls at 12
+    /// logical pixels. At or above that, forced `Mtsdf` renders bit-identically
+    /// to what it rendered before the compensation existed. Below it — 10 and 11
+    /// logical pixels, forced onto the field path against the engine's own
+    /// advice — a small bias does apply, and it is bounded here so the size of
+    /// the exception is on the record rather than assumed away.
+    ///
+    /// Under `TextRasterMode::Auto`, which is what every shipped widget uses,
+    /// there is no exception at all: the strategy threshold is the same number
+    /// as the ceiling, so no glyph the field path receives is ever below it.
+    /// `spherekit_text::raster` holds that test, where both constants are
+    /// visible at once.
+    #[test]
+    fn at_two_times_the_interface_type_scale_is_bit_identical() {
+        let ramp = |logical: f32| {
+            let em_px = logical * 2.0;
+            let px_range = em_px * (4.0 / 48.0);
+            (crate::scene::mtsdf_edge_ramp(em_px, px_range), px_range)
+        };
+        for logical in [12.0f32, 13.0, 14.0, 16.0, 20.0, 24.0] {
+            let ([scale, offset], px_range) = ramp(logical);
+            assert_eq!(offset, 0.0, "{logical} px at 2x was biased");
+            assert!((scale - px_range.max(1.0)).abs() < 1e-6, "{logical} px at 2x: scale {scale}");
+        }
+        // The bounded exception, in device pixels of edge movement.
+        for (logical, most) in [(10.0f32, 0.026f32), (11.0, 0.013)] {
+            let ([scale, offset], px_range) = ramp(logical);
+            let bias = offset / scale * px_range;
+            assert!(bias <= most, "{logical} px at 2x moved the edge by {bias}");
+        }
     }
 
     #[test]
