@@ -29,18 +29,48 @@ use sphere_core::{FontError, GlyphId, Point, Px, Rect, ScaleFactor, Size};
 
 /// Physical pixel size below which the grayscale fallback wins.
 ///
-/// Twelve device pixels per em is where a distance field stops having enough
-/// texels to place a stem edge consistently: at 12 px an `l` stem is a little
-/// over one pixel wide, and the field's reconstruction error is a visible
-/// fraction of that. Above it MTSDF is both sharper and cheaper, since one field
-/// serves every size while bitmaps must be re-rasterised per size and per scale
-/// factor.
+/// Twenty-four, because that is where **bilinear sampling stops being able to
+/// reconstruct the field**. A glyph field is generated at
+/// [`crate::mtsdf::DEFAULT_EM_SIZE_PX`] — 48 texels per em — and drawn at the
+/// device size, so rendering at *d* device pixels minifies it by `48 / d`. A
+/// bilinear tap averages a 2x2 texel footprint; once the true footprint is
+/// wider than that, most of the texels that should have contributed are simply
+/// not read, and what comes back is a low-pass blur of the outline rather than
+/// a reconstruction of it. `48 / 24 = 2`, so 24 is the exact size at which the
+/// footprint stops fitting.
 ///
-/// It is a threshold on *device* pixels deliberately: 11 logical pixels on a
-/// 200 % display is 22 physical pixels and wants the distance field, while 11
-/// logical pixels at 100 % wants the bitmap. Deciding on logical size would get
-/// exactly one of those two cases wrong.
-pub const BITMAP_MAX_DEVICE_PX: f32 = 12.0;
+/// The second reason lands at the same place. The shader's antialiasing ramp is
+/// one device pixel wide by construction (`screen_range` is clamped to 1), and a
+/// regular-weight stem is about `em / 9`. So the solid core of a stem is
+/// `d / 9 - 1` pixels:
+///
+/// | device px | field minified | stem | solid core |
+/// |---|---|---|---|
+/// | 13 | 3.7x | 1.44 px | **0.44 px** |
+/// | 16 | 3.0x | 1.78 px | 0.78 px |
+/// | 24 | 2.0x | 2.67 px | 1.67 px |
+/// | 26 | 1.9x | 2.89 px | 1.89 px |
+///
+/// At 13 device pixels — a 13 px label on a 100 % display, which is most
+/// interface text ever written — the two ramps very nearly meet in the middle
+/// and the stem never reaches full opacity. That is what soft text *is*, and no
+/// amount of gamma correction fixes it, because the coverage genuinely is grey.
+///
+/// The previous value of 12 was chosen from a different and incorrect premise:
+/// that the field runs short of *texels*. It does not. A 48-per-em field has
+/// plenty of texels at any interface size; the problem is reading them.
+///
+/// It is a threshold on *device* pixels deliberately: 13 logical pixels on a
+/// 200 % display is 26 physical pixels and reconstructs correctly, while 13
+/// logical pixels at 100 % does not. Deciding on logical size would get exactly
+/// one of those two cases wrong.
+///
+/// **What it costs.** Bitmaps are keyed per device size, so an interface with
+/// five type sizes at one scale factor holds five sets of glyphs instead of one
+/// size-independent set. That is the trade the fallback exists to make. Content
+/// that zooms continuously should ask for [`RasterStrategy::Mtsdf`] explicitly
+/// through `TextRasterMode::Mtsdf`, which is what that escape hatch is for.
+pub const BITMAP_MAX_DEVICE_PX: f32 = 24.0;
 
 /// Curve flattening tolerance in device pixels.
 ///
@@ -578,23 +608,31 @@ mod tests {
     fn the_policy_thresholds_on_physical_pixels_not_logical_ones() {
         let one = ScaleFactor::new(1.0);
         let two = ScaleFactor::new(2.0);
-        // The same logical size decides differently on a HiDPI display.
-        assert_eq!(choose_raster_strategy(px(11.0), one), RasterStrategy::Bitmap);
-        assert_eq!(choose_raster_strategy(px(11.0), two), RasterStrategy::Mtsdf);
+        // 13 logical pixels is ordinary body text, and it decides differently on
+        // the two displays: 13 device pixels minifies the field 3.7x and comes
+        // out soft, 26 minifies it 1.9x and comes out sharp. This is the exact
+        // case the threshold was moved for.
+        assert_eq!(choose_raster_strategy(px(13.0), one), RasterStrategy::Bitmap);
+        assert_eq!(choose_raster_strategy(px(13.0), two), RasterStrategy::Mtsdf);
         // ...and a large logical size at a tiny scale falls back.
         assert_eq!(choose_raster_strategy(px(20.0), ScaleFactor::new(0.5)), RasterStrategy::Bitmap);
     }
 
     #[test]
-    fn the_policy_boundary_is_exactly_twelve_device_pixels() {
+    fn the_policy_boundary_is_where_bilinear_sampling_gives_out() {
+        // 48 texels per em over 24 device pixels is exactly 2x minification,
+        // which is the widest footprint a 2x2 bilinear tap still covers.
         let one = ScaleFactor::new(1.0);
-        assert_eq!(choose_raster_strategy(px(11.99), one), RasterStrategy::Bitmap);
-        assert_eq!(choose_raster_strategy(px(12.0), one), RasterStrategy::Mtsdf);
-        assert_eq!(choose_raster_strategy(px(12.01), one), RasterStrategy::Mtsdf);
+        assert_eq!(choose_raster_strategy(px(23.99), one), RasterStrategy::Bitmap);
+        assert_eq!(choose_raster_strategy(px(24.0), one), RasterStrategy::Mtsdf);
+        assert_eq!(choose_raster_strategy(px(24.01), one), RasterStrategy::Mtsdf);
         // Fractional scaling, the case that actually ships: 1.25 and 1.5.
-        assert_eq!(choose_raster_strategy(px(10.0), ScaleFactor::new(1.25)), RasterStrategy::Mtsdf);
-        assert_eq!(choose_raster_strategy(px(9.0), ScaleFactor::new(1.25)), RasterStrategy::Bitmap);
-        assert_eq!(choose_raster_strategy(px(8.0), ScaleFactor::new(1.5)), RasterStrategy::Mtsdf);
+        assert_eq!(choose_raster_strategy(px(20.0), ScaleFactor::new(1.25)), RasterStrategy::Mtsdf);
+        assert_eq!(
+            choose_raster_strategy(px(16.0), ScaleFactor::new(1.25)),
+            RasterStrategy::Bitmap
+        );
+        assert_eq!(choose_raster_strategy(px(16.0), ScaleFactor::new(1.5)), RasterStrategy::Mtsdf);
     }
 
     #[test]

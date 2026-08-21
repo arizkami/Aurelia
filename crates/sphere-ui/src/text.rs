@@ -31,8 +31,13 @@ pub struct Label {
     raster: TextRasterMode,
     /// Synthetic outline, for text over a busy backdrop such as a waveform.
     outline: Option<(Px, Color)>,
-    /// Perceptual coverage exponent; see [`sphere_render::GlyphRun::coverage_gamma`].
-    coverage_gamma: f32,
+    /// Perceptual coverage exponent, or `None` to derive it from the contrast
+    /// between the text and the theme's background.
+    ///
+    /// Derived by default because the correction runs in opposite directions
+    /// for light-on-dark and dark-on-light, and a constant is therefore wrong
+    /// in one of the two themes every application ships.
+    coverage_gamma: Option<f32>,
 }
 
 /// Creates a [`Label`].
@@ -46,7 +51,7 @@ pub fn label(text: impl Into<String>) -> Label {
         color: None,
         raster: TextRasterMode::Auto,
         outline: None,
-        coverage_gamma: sphere_render::DEFAULT_COVERAGE_GAMMA,
+        coverage_gamma: None,
     }
 }
 
@@ -141,7 +146,7 @@ impl Label {
     /// light one. `1.0` leaves coverage physically linear. See
     /// [`sphere_render::GlyphRun::coverage_gamma`].
     pub fn coverage_gamma(mut self, gamma: f32) -> Self {
-        self.coverage_gamma = gamma;
+        self.coverage_gamma = Some(gamma);
         self
     }
 
@@ -208,46 +213,74 @@ impl Element for Label {
         let layout = cx.text.layout(&self.text, &self.text_style, Some(cx.bounds.width()));
         let origin = cx.bounds.origin;
         let (outline_width, outline_color) = self.outline.unwrap_or((Px::ZERO, Color::TRANSPARENT));
-        let coverage_gamma = self.coverage_gamma;
+        let coverage_gamma = self.coverage_gamma.unwrap_or_else(|| {
+            sphere_render::coverage_gamma_for(color, cx.theme.colors.background)
+        });
 
-        for line in &layout.lines {
-            for run in &line.runs {
-                if run.glyphs.is_empty() {
-                    continue;
-                }
-                // One `GlyphRun` per shaped run: the batch compiler needs a
-                // single face and size per run so it can resolve every glyph
-                // against the same atlas page.
-                let glyphs: SmallVec<[PositionedGlyph; 8]> = run
-                    .glyphs
-                    .iter()
-                    .map(|g| PositionedGlyph {
-                        glyph: g.glyph,
-                        position: sphere_core::Point::new(
-                            origin.x + g.position.x,
-                            origin.y + line.baseline + g.position.y,
-                        ),
-                    })
-                    .collect();
-
-                cx.canvas.draw_glyph_run(
-                    GlyphRun {
-                        font: run.font,
-                        font_size: run.font_size,
-                        glyphs,
-                        raster: self.raster,
-                        outline_width,
-                        outline_color,
-                        coverage_gamma,
-                    },
-                    Brush::Solid(color),
-                );
-            }
-        }
+        draw_layout(
+            cx.canvas,
+            &layout,
+            origin,
+            color,
+            self.raster,
+            (outline_width, outline_color),
+            coverage_gamma,
+        );
     }
 
     fn semantics(&self) -> Option<crate::semantics::Semantics> {
         Some(crate::semantics::Semantics::new(crate::semantics::Role::Label, self.text.clone()))
+    }
+}
+
+/// Records a laid-out paragraph into a canvas at `origin`.
+///
+/// Shared by [`Label`] and [`crate::widgets::TextField`] so that the two cannot
+/// disagree about where a glyph goes. A field draws a caret and a selection
+/// against the same layout it draws the text from, and a second copy of this
+/// loop would eventually drift from the first.
+pub fn draw_layout(
+    canvas: &mut sphere_render::Canvas<'_>,
+    layout: &sphere_text::TextLayout,
+    origin: sphere_core::Point<Px>,
+    color: Color,
+    raster: TextRasterMode,
+    outline: (Px, Color),
+    coverage_gamma: f32,
+) {
+    for line in &layout.lines {
+        for run in &line.runs {
+            if run.glyphs.is_empty() {
+                continue;
+            }
+            // One `GlyphRun` per shaped run: the batch compiler needs a single
+            // face and size per run so it can resolve every glyph against the
+            // same atlas page.
+            let glyphs: SmallVec<[PositionedGlyph; 8]> = run
+                .glyphs
+                .iter()
+                .map(|g| PositionedGlyph {
+                    glyph: g.glyph,
+                    position: sphere_core::Point::new(
+                        origin.x + g.position.x,
+                        origin.y + line.baseline + g.position.y,
+                    ),
+                })
+                .collect();
+
+            canvas.draw_glyph_run(
+                GlyphRun {
+                    font: run.font,
+                    font_size: run.font_size,
+                    glyphs,
+                    raster,
+                    outline_width: outline.0,
+                    outline_color: outline.1,
+                    coverage_gamma,
+                },
+                Brush::Solid(color),
+            );
+        }
     }
 }
 

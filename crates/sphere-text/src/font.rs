@@ -312,8 +312,17 @@ impl FontDatabase {
     /// should not pay a few hundred milliseconds of directory walking at
     /// startup for faces it will never use.
     pub fn new() -> Self {
+        let mut db = fontdb::Database::new();
+        // `fontdb`'s generic families default to Arial, Times New Roman and
+        // Courier New. Those are the Windows 95 defaults; the shell has not
+        // used any of them for interface text in decades, and on a non-Latin
+        // system they have no coverage for the language the user reads in. An
+        // unnamed `FontRequest` resolves through these, so leaving them is what
+        // made unstyled text come out in the wrong face everywhere.
+        db.set_sans_serif_family(crate::system_ui::family());
+        db.set_monospace_family(crate::system_ui::monospace_family());
         Self {
-            db: fontdb::Database::new(),
+            db,
             faces: GenerationalStore::new(),
             by_source: FxHashMap::default(),
             resolved: FxHashMap::default(),
@@ -725,6 +734,63 @@ fn map_style(s: FontStyle) -> fontdb::Style {
         FontStyle::Normal => fontdb::Style::Normal,
         FontStyle::Italic => fontdb::Style::Italic,
         FontStyle::Oblique => fontdb::Style::Oblique,
+    }
+}
+
+#[cfg(test)]
+mod weight_tests {
+    use super::*;
+
+    /// A database with real faces, or `None` on a machine with no fonts.
+    fn system() -> Option<FontDatabase> {
+        let mut db = FontDatabase::with_system_fonts();
+        db.resolve(&FontRequest::default())?;
+        Some(db)
+    }
+
+    #[test]
+    fn asking_for_bold_resolves_a_different_face_than_regular() {
+        // Weight travels all the way to `fontdb::Query`. If it did not, every
+        // heading in every interface would silently come out at book weight and
+        // there would be nothing to see but a flat-looking screen.
+        let Some(mut db) = system() else {
+            eprintln!("no system font; skipping");
+            return;
+        };
+        let regular = db.resolve(&FontRequest::default().weight(FontWeight::NORMAL));
+        let bold = db.resolve(&FontRequest::default().weight(FontWeight::BOLD));
+        let (Some(regular), Some(bold)) = (regular, bold) else {
+            eprintln!("no weighted faces; skipping");
+            return;
+        };
+        assert_ne!(regular, bold, "bold resolved to the regular face");
+        assert_ne!(
+            db.family_name(regular).map(str::to_string),
+            None,
+            "a resolved face must name its family"
+        );
+    }
+
+    #[test]
+    fn every_named_weight_resolves_to_something() {
+        let Some(mut db) = system() else {
+            eprintln!("no system font; skipping");
+            return;
+        };
+        for w in [
+            FontWeight::LIGHT,
+            FontWeight::NORMAL,
+            FontWeight::MEDIUM,
+            FontWeight::SEMI_BOLD,
+            FontWeight::BOLD,
+            FontWeight::BLACK,
+        ] {
+            assert!(
+                db.resolve(&FontRequest::default().weight(w)).is_some(),
+                "weight {} resolved to nothing",
+                w.0
+            );
+        }
     }
 }
 

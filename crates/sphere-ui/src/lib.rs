@@ -60,8 +60,10 @@
 
 #![deny(missing_docs)]
 
+pub mod edit;
 pub mod element;
 pub mod event;
+pub mod field;
 pub mod focus;
 pub mod input;
 pub mod semantics;
@@ -71,20 +73,22 @@ pub mod theme;
 pub mod tree;
 pub mod widgets;
 
+pub use edit::{Motion, Preedit, TextEdit};
 pub use element::{
-    AnyElement, Div, Element, Empty, EventContext, HandlerKind, Handlers, InteractionState,
-    Interactive, IntoElement, PaintContext, ParentElement, Styled, div,
+    AnyElement, Div, Element, Empty, EventContext, HandlerKind, Handlers, ImeArea,
+    InteractionState, Interactive, IntoElement, PaintContext, ParentElement, Styled, div,
 };
 pub use event::{
     ClickTracker, ElementState, EventFlow, HitChain, HitTarget, ImeEvent, Key, KeyEvent, Modifiers,
     MouseButton, MouseButtonEvent, MouseMoveEvent, Phase, ScrollDelta, ScrollEvent, TextInputEvent,
     UiEvent,
 };
+pub use field::{TextField, text_field};
 pub use focus::{FocusDirection, FocusHandle, FocusRegistry, Focusable, Scope, ScopeId};
 pub use input::InputTranslator;
 pub use semantics::{Action, Live, Role, SemanticNode, Semantics, ValueRange};
 pub use style::{Cursor, FocusRing, PaintStyle, StyledInteraction};
-pub use text::{Label, label};
+pub use text::{Label, draw_layout, label};
 pub use theme::{Palette, Radii, Shadows, Spacing, Theme, Typography};
 pub use tree::{DispatchResult, TreeStats, UiTree};
 pub use widgets::{

@@ -26,3 +26,13 @@ bytemuck.workspace = true
 
 [dev-dependencies]
 image.workspace = true
+
+# Windows-only, for reading the shell's own interface font out of
+# `NONCLIENTMETRICSW`. Hard-coding a family instead would put Latin metrics on a
+# Japanese or Thai desktop; see `system_ui`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }

@@ -28,7 +28,7 @@ use crate::keyboard::{
 };
 use crate::monitor::{MonitorInfo, MonitorList, RefreshRate, VideoMode};
 use crate::scheduler::ControlFlow;
-use crate::window::{WindowAttributes, WindowLevel, WindowPosition};
+use crate::window::{WindowAttributes, WindowChrome, WindowLevel, WindowPosition};
 
 /// How many Sphere events one platform event can expand into.
 ///
@@ -515,7 +515,11 @@ pub(crate) unsafe fn to_winit_attributes(
         .with_title(attrs.title.clone())
         .with_inner_size(logical(attrs.resolved_inner_size()))
         .with_resizable(attrs.resizable)
-        .with_decorations(attrs.decorations)
+        // `Custom` keeps the real WS_CAPTION | WS_SIZEBOX styles so that snap,
+        // the drop shadow and winit's own WM_GETMINMAXINFO arithmetic all keep
+        // working; the caption is removed later by the subclass answering
+        // WM_NCCALCSIZE. Only `None` actually asks winit to strip the frame.
+        .with_decorations(attrs.chrome != WindowChrome::None)
         .with_transparent(attrs.transparent)
         .with_window_level(window_level_to_winit(attrs.level))
         .with_visible(attrs.visible)
@@ -568,6 +572,13 @@ pub struct Window {
     inner: ::winit::window::Window,
     /// The registry-assigned identity, stable for the window's whole life.
     id: WindowId,
+    /// State shared with the custom-frame window procedure.
+    ///
+    /// Present only where there is a custom frame to run: `None` on a platform
+    /// with no such mechanism, and on a window whose chrome was never anything
+    /// but [`WindowChrome::System`].
+    #[cfg(windows)]
+    chrome: Option<std::sync::Arc<super::ffi::ChromeState>>,
 }
 
 impl core::fmt::Debug for Window {
@@ -597,7 +608,14 @@ impl Window {
         let inner = event_loop
             .create_window(winit_attrs)
             .map_err(|e| PlatformError::WindowCreation(e.to_string()))?;
-        Ok(Self { inner, id })
+
+        #[cfg(windows)]
+        let chrome = install_chrome(&inner, attrs);
+        #[cfg(windows)]
+        let window = Self { inner, id, chrome };
+        #[cfg(not(windows))]
+        let window = Self { inner, id };
+        Ok(window)
     }
 
     /// The platform's own window id, for routing incoming events.
@@ -648,8 +666,33 @@ impl Window {
     /// Asks for a new inner size, returning the size actually applied when the
     /// platform can answer synchronously. On the platforms that cannot, a
     /// `Resized` event follows instead.
+    ///
+    /// Under [`WindowChrome::Custom`] the request is reduced by the caption the
+    /// custom frame reclaimed. The platform still believes there is a title bar
+    /// and sizes the outer window for one, while the subclass has already given
+    /// that strip back to the client — so an uncompensated request comes out
+    /// about thirty logical pixels too tall at 96 dpi, and more at higher DPI.
     pub fn request_inner_size(&self, size: Size<Px>) -> Option<Size<DevicePx>> {
-        self.inner.request_inner_size(logical(size)).map(physical_size)
+        self.inner.request_inner_size(logical(self.compensate_for_caption(size))).map(physical_size)
+    }
+
+    /// Removes the reclaimed caption from a requested inner size.
+    fn compensate_for_caption(&self, size: Size<Px>) -> Size<Px> {
+        #[cfg(windows)]
+        {
+            if self.chrome() == WindowChrome::Custom
+                && let Some(hwnd) = self.hwnd()
+            {
+                let metrics = super::ffi::frame_metrics(super::ffi::window_dpi(hwnd));
+                let scale = self.inner.scale_factor() as f32;
+                let reclaimed = metrics.reclaimed_top() as f32 / scale.max(0.01);
+                // Never below one pixel: a window whose height collapses to zero
+                // cannot be recovered by resizing it.
+                let height = (size.height.get() - reclaimed).max(1.0);
+                return Size::new(size.width, Px(height));
+            }
+        }
+        size
     }
 
     /// Asks the platform to deliver a redraw event for this window.
@@ -836,6 +879,203 @@ impl HasWindowHandle for Window {
 impl HasDisplayHandle for Window {
     fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
         self.inner.display_handle()
+    }
+}
+/// Installs the custom-frame procedure, if this window wants one.
+///
+/// Returns `None` for [`WindowChrome::System`], where the platform's own frame
+/// is already what the application asked for and a subclass would be pure cost.
+#[cfg(windows)]
+fn install_chrome(
+    inner: &::winit::window::Window,
+    attrs: &WindowAttributes,
+) -> Option<std::sync::Arc<super::ffi::ChromeState>> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    if attrs.chrome == WindowChrome::System {
+        return None;
+    }
+    // A window with no HWND is a foreign or headless target. Subclassing
+    // something the host owns is explicitly out of scope: it owns that window's
+    // lifetime and its message loop.
+    let handle = inner.window_handle().ok()?;
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return None;
+    };
+
+    let state = std::sync::Arc::new(super::ffi::ChromeState::new(
+        attrs.chrome,
+        attrs.resizable,
+        inner.scale_factor() as f32,
+    ));
+    state.publish_regions(&attrs.caption);
+    let hwnd = win32.hwnd.get() as *mut core::ffi::c_void;
+    Some(super::ffi::install(hwnd, state))
+}
+
+/// Turns a winit move-or-resize error into a `'static` capability name.
+///
+/// `PlatformError::Unsupported` names a capability rather than an incident, and
+/// every one of these failures is the same capability whatever the platform
+/// said about it.
+#[allow(dead_code)]
+fn drag_unsupported(_e: ::winit::error::ExternalError) -> PlatformError {
+    PlatformError::Unsupported("user-driven window move or resize")
+}
+
+impl Window {
+    /// Who draws the title bar and border.
+    pub fn chrome(&self) -> WindowChrome {
+        #[cfg(windows)]
+        {
+            self.chrome.as_ref().map_or(WindowChrome::System, |c| c.chrome())
+        }
+        #[cfg(not(windows))]
+        {
+            if self.inner.is_decorated() { WindowChrome::System } else { WindowChrome::None }
+        }
+    }
+
+    /// Switches the frame at runtime.
+    ///
+    /// A window created with [`WindowChrome::System`] has no custom-frame
+    /// procedure installed and cannot gain one: the subclass has to be in place
+    /// before the first `WM_NCCALCSIZE`, and retrofitting it would leave the
+    /// platform and the application disagreeing about where the client area is.
+    /// Ask for the chrome you want in [`WindowAttributes`].
+    pub fn set_chrome(&self, chrome: WindowChrome) {
+        #[cfg(windows)]
+        if let Some(state) = self.chrome.as_ref() {
+            state.set_chrome(chrome);
+            if let Some(hwnd) = self.hwnd() {
+                // Without this the old frame survives until the next resize.
+                super::ffi::recalculate_frame(hwnd);
+            }
+            return;
+        }
+        self.inner.set_decorations(chrome == WindowChrome::System);
+    }
+
+    /// Publishes where the custom caption is.
+    ///
+    /// Republish whenever the caption's layout changes. Returns `()` rather than
+    /// a result because storing geometry cannot fail: on a platform with no
+    /// notion of a custom caption the store is simply never read.
+    pub fn set_caption_regions(&self, regions: &crate::window::CaptionRegions) {
+        #[cfg(windows)]
+        if let Some(state) = self.chrome.as_ref() {
+            state.publish_regions(regions);
+        }
+        #[cfg(not(windows))]
+        let _ = regions;
+    }
+
+    /// Starts a user-driven window move.
+    ///
+    /// Enters the platform's modal move loop, which pumps its own messages, so
+    /// frames during the drag are the platform's business rather than the frame
+    /// scheduler's. A caption published through [`Window::set_caption_regions`]
+    /// does not need this — the platform starts the drag itself — so this is for
+    /// a caption that would rather drive the gesture explicitly.
+    pub fn begin_drag(&self) -> Result<(), PlatformError> {
+        self.inner.drag_window().map_err(drag_unsupported)
+    }
+
+    /// Starts a user-driven resize from an edge or corner.
+    ///
+    /// Only needed where the platform cannot hit-test the edge itself, which on
+    /// Windows means [`WindowChrome::None`].
+    pub fn begin_resize(&self, edge: crate::window::ResizeEdge) -> Result<(), PlatformError> {
+        use crate::window::ResizeEdge as E;
+        use ::winit::window::ResizeDirection as D;
+        let direction = match edge {
+            E::North => D::North,
+            E::South => D::South,
+            E::East => D::East,
+            E::West => D::West,
+            E::NorthEast => D::NorthEast,
+            E::NorthWest => D::NorthWest,
+            E::SouthEast => D::SouthEast,
+            E::SouthWest => D::SouthWest,
+        };
+        self.inner.drag_resize_window(direction).map_err(drag_unsupported)
+    }
+}
+
+impl Window {
+    /// Opens the platform's window menu at a client-logical position.
+    ///
+    /// Item states are corrected against the window's own state first: measured,
+    /// a maximised window still reports Move and Size as enabled until someone
+    /// fixes them up, so an uncorrected menu offers actions that silently do
+    /// nothing.
+    ///
+    /// A right-click on a region published through
+    /// [`Window::set_caption_regions`] already does this without the application
+    /// asking. This is for a caption that wants to offer the menu from somewhere
+    /// else, such as an application button.
+    pub fn show_system_menu(&self, at: Point<Px>) -> Result<(), PlatformError> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::POINT;
+            let Some(hwnd) = self.hwnd() else {
+                return Err(PlatformError::Unsupported("system window menu"));
+            };
+            let origin = self
+                .inner
+                .inner_position()
+                .map_err(|_| PlatformError::Unsupported("system window menu"))?;
+            let scale = self.inner.scale_factor() as f32;
+            let screen = POINT {
+                x: origin.x + (at.x.get() * scale) as i32,
+                y: origin.y + (at.y.get() * scale) as i32,
+            };
+            let states = match self.chrome.as_ref() {
+                Some(state) => {
+                    state.set_maximized(self.inner.is_maximized());
+                    state.menu_states()
+                }
+                None => super::nc::menu_states(
+                    self.inner.is_maximized(),
+                    self.inner.is_resizable(),
+                    true,
+                    true,
+                ),
+            };
+            if super::ffi::show_system_menu(hwnd, screen, states) {
+                return Ok(());
+            }
+            Err(PlatformError::Unsupported("system window menu"))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = at;
+            Err(PlatformError::Unsupported("system window menu"))
+        }
+    }
+
+    /// Tells the custom frame what the window's state is now.
+    ///
+    /// The window procedure reads these on `WM_NCHITTEST`, which fires on every
+    /// mouse move, so they are pushed on state changes rather than queried in
+    /// the hot path.
+    pub(crate) fn sync_chrome_state(&self) {
+        #[cfg(windows)]
+        if let Some(state) = self.chrome.as_ref() {
+            state.set_maximized(self.inner.is_maximized());
+            state.set_resizable(self.inner.is_resizable());
+            state.set_scale(self.inner.scale_factor() as f32);
+        }
+    }
+
+    /// The raw `HWND`, when there is one.
+    #[cfg(windows)]
+    fn hwnd(&self) -> Option<*mut core::ffi::c_void> {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        match self.inner.window_handle().ok()?.as_raw() {
+            RawWindowHandle::Win32(w) => Some(w.hwnd.get() as *mut core::ffi::c_void),
+            _ => None,
+        }
     }
 }
 
@@ -1205,7 +1445,7 @@ mod tests {
         let w = unsafe { to_winit_attributes(&attrs) };
         assert_eq!(w.title, "EQ");
         assert!(!w.resizable);
-        assert!(!w.decorations);
+        assert!(!w.decorations, "None chrome strips the platform frame");
         assert!(!w.visible);
         assert_eq!(w.window_level, ::winit::window::WindowLevel::AlwaysOnTop);
         assert_eq!(

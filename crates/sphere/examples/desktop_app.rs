@@ -16,20 +16,25 @@
 //! Keyboard: Tab and Shift-Tab move focus, Space and Enter activate, arrow keys
 //! adjust a focused slider, Ctrl+T switches theme, Escape quits.
 
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
+use sphere::core::animate::{Drive, Motion};
+use sphere::core::time::{Clock, SystemClock, Timeline};
 use sphere::core::{Color, Px, px, relative, size};
 use sphere::platform::{
     App, AppContext, AppHandler, RedrawPolicy, WindowAttributes, WindowEvent, WindowId,
 };
+use sphere::platform::{CaptionRegions, WindowChrome};
 use sphere::svg::SvgCache;
 use sphere::ui::{
-    AnyElement, ButtonVariant, Cursor, EventContext, InputTranslator, Interactive, IntoElement,
-    ParentElement, Role, Semantics, Styled, StyledInteraction, Theme, button, checkbox, div, label,
-    progress, scroll_view, separator, slider, toggle,
+    AnyElement, ButtonVariant, Cursor, Element, EventContext, InputTranslator, Interactive,
+    IntoElement, ParentElement, Role, Semantics, Styled, StyledInteraction, TextEdit, Theme,
+    button, checkbox, div, label, progress, scroll_view, separator, slider, text_field, toggle,
 };
 use sphere::{SphereSurface, SurfaceOptions};
 
@@ -111,6 +116,29 @@ struct State {
     ui_scale: Cell<f32>,
     volume: Cell<f32>,
     download: Cell<f32>,
+    /// Editable buffers. `RefCell` rather than `Cell` because a `TextEdit` is
+    /// not `Copy`; the field takes a clone each frame and hands back the edited
+    /// one, which is the same shape as a slider reporting an `f32`.
+    /// Whether the window is maximised, so the restore glyph is right.
+    maximized: Cell<bool>,
+    /// Whether the pointer is over each caption button. Written by the button's
+    /// event handler, read by the frame loop.
+    wco_hovered: [Cell<bool>; CAPTION_BUTTONS],
+    /// The hover fade for each caption button.
+    ///
+    /// A spring rather than a fixed-duration fade, because a pointer sweeping
+    /// across three buttons interrupts every one of them: a spring retargets
+    /// from wherever it is with whatever momentum it has, and a tween would
+    /// have to restart and jump.
+    wco_fade: [Cell<Motion<f32>>; CAPTION_BUTTONS],
+    /// A window command the caption asked for, drained by the runner.
+    ///
+    /// Queued rather than executed inline because a widget callback has no
+    /// window: the element tree is deliberately free of platform types, so the
+    /// request travels as data and the runner performs it.
+    pending: Cell<Option<WindowCommand>>,
+    server: RefCell<TextEdit>,
+    passphrase: RefCell<TextEdit>,
     log: RefCell<Vec<String>>,
 }
 
@@ -125,6 +153,12 @@ impl State {
             ui_scale: Cell::new(100.0),
             volume: Cell::new(65.0),
             download: Cell::new(0.0),
+            maximized: Cell::new(false),
+            wco_hovered: [const { Cell::new(false) }; CAPTION_BUTTONS],
+            wco_fade: core::array::from_fn(|_| Cell::new(Motion::at(0.0, Drive::SMOOTH))),
+            pending: Cell::new(None),
+            server: RefCell::new(TextEdit::from_text("sync.futureboard.local")),
+            passphrase: RefCell::new(TextEdit::new()),
             log: RefCell::new(vec!["Ready.".into()]),
         })
     }
@@ -154,6 +188,13 @@ struct DesktopApp {
     frames: u64,
     frame_limit: Option<u64>,
     reported: bool,
+    /// Last input-method state pushed to the window, so it is only pushed when
+    /// it changes. Re-enabling an input method can cancel a composition.
+    ime_allowed: bool,
+    ime_caret: Option<sphere::core::Rect<Px>>,
+    /// One clock and one delta for every animation in the window.
+    timeline: Timeline,
+    clock: SystemClock,
 }
 
 impl DesktopApp {
@@ -166,6 +207,10 @@ impl DesktopApp {
             state: State::new(),
             // Populated in `resumed`, against the same cache the painter uses.
             icons: Vec::new(),
+            ime_allowed: false,
+            ime_caret: None,
+            timeline: Timeline::new(),
+            clock: SystemClock::new(),
             frames: 0,
             frame_limit: std::env::var("SPHERE_DEMO_FRAMES").ok().and_then(|v| v.parse().ok()),
             reported: false,
@@ -207,10 +252,14 @@ impl DesktopApp {
             .flex_row()
             .items_center()
             .gap(theme.spacing.md)
-            .h(px(52.0))
-            .px_(theme.spacing.lg)
+            .h(px(CAPTION_HEIGHT))
+            // Padded on the left only: the window buttons run flush to the
+            // right edge, exactly as the shell's do.
+            .pl(theme.spacing.lg)
             .bg(c.surface)
-            .child(label("Preferences").text_size(theme.typography.xl).text_color(c.text).no_wrap())
+            // Thirteen pixels: a window title is a label, not a heading. The
+            // page's own heading lives in the content area below.
+            .child(label("Preferences").text_size(theme.typography.md).text_color(c.text).no_wrap())
             .child(div().flex_1())
             .child({
                 let s = Rc::clone(&state);
@@ -237,6 +286,28 @@ impl DesktopApp {
                     s.download.set(0.0);
                 })
             })
+            // The window buttons sit inside the caption strip, which is exactly
+            // why they have to be published as exclusions: a press the platform
+            // routes as caption is swallowed by the modal move loop and never
+            // reaches the button at all.
+            .child(
+                div()
+                    .flex_row()
+                    .items_center()
+                    .child(CaptionButton::element(
+                        wco::MINIMIZE,
+                        WindowCommand::Minimize,
+                        0,
+                        &state,
+                    ))
+                    .child(CaptionButton::element(
+                        if self.state.maximized.get() { wco::RESTORE } else { wco::MAXIMIZE },
+                        WindowCommand::ToggleMaximize,
+                        1,
+                        &state,
+                    ))
+                    .child(CaptionButton::element(wco::CLOSE, WindowCommand::Close, 2, &state)),
+            )
             .into_element()
     }
 
@@ -480,7 +551,12 @@ impl DesktopApp {
                     .rounded(theme.radii.lg)
                     .border(px(1.0), c.border)
                     .shadow(theme.shadows.sm)
-                    .child(label("Sync status").text_size(theme.typography.md).text_color(c.text))
+                    .child(
+                        label("Sync status")
+                            .text_size(theme.typography.md)
+                            .weight(theme.typography.strong)
+                            .text_color(c.text),
+                    )
                     .child(progress(downloaded))
                     .child(
                         label(if downloaded >= 1.0 {
@@ -498,6 +574,52 @@ impl DesktopApp {
                             s.say("Sync started.");
                         })
                     })),
+            )
+            .child(
+                div()
+                    .flex_col()
+                    .gap(theme.spacing.md)
+                    .p(theme.spacing.lg)
+                    .bg(c.surface)
+                    .rounded(theme.radii.lg)
+                    .border(px(1.0), c.border)
+                    .shadow(theme.shadows.sm)
+                    .child(
+                        label("Server")
+                            .text_size(theme.typography.md)
+                            .weight(theme.typography.strong)
+                            .text_color(c.text),
+                    )
+                    .child({
+                        let s = Rc::clone(&state);
+                        let commit = Rc::clone(&state);
+                        text_field(state.server.borrow().clone())
+                            .id("server")
+                            .placeholder("host name or address")
+                            .on_change(move |e| *s.server.borrow_mut() = e.clone())
+                            .on_submit(move |text| commit.say(format!("Server set to {text}.")))
+                    })
+                    .child(
+                        label(
+                            "Try an input method here — the composition is underlined until it                              is committed, and the candidate window follows the caret.",
+                        )
+                        .text_size(theme.typography.sm)
+                        .text_color(c.text_muted),
+                    )
+                    .child(
+                        label("Passphrase")
+                            .text_size(theme.typography.md)
+                            .weight(theme.typography.strong)
+                            .text_color(c.text),
+                    )
+                    .child({
+                        let s = Rc::clone(&state);
+                        text_field(state.passphrase.borrow().clone())
+                            .id("passphrase")
+                            .placeholder("optional")
+                            .mask(true)
+                            .on_change(move |e| *s.passphrase.borrow_mut() = e.clone())
+                    }),
             )
             .into_element()
     }
@@ -558,9 +680,220 @@ impl DesktopApp {
     }
 }
 
+/// What a caption button asks the runner to do.
+///
+/// A command rather than a direct call: the element tree has no window and is
+/// not going to grow one, so the request travels as data.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum WindowCommand {
+    Minimize,
+    ToggleMaximize,
+    Close,
+}
+
+/// The window-control glyphs, from Segoe Fluent Icons.
+///
+/// The same codepoints Windows uses for its own caption buttons, so a custom
+/// title bar drawn with them is identical to the real one rather than an
+/// approximation made of box-drawing characters.
+mod wco {
+    /// `ChromeMinimize`.
+    pub const MINIMIZE: &str = "\u{E921}";
+    /// `ChromeMaximize`.
+    pub const MAXIMIZE: &str = "\u{E922}";
+    /// `ChromeRestore`, shown while the window is maximised.
+    pub const RESTORE: &str = "\u{E923}";
+    /// `ChromeClose`.
+    pub const CLOSE: &str = "\u{E8BB}";
+}
+
+/// The icon families, in priority order.
+///
+/// Segoe Fluent Icons ships with Windows 11; Segoe MDL2 Assets is its Windows
+/// 10 predecessor and carries the same codepoints for these four glyphs, so
+/// naming it second makes the caption correct on both with no version check.
+const ICON_FONT: [&str; 2] = ["Segoe Fluent Icons", "Segoe MDL2 Assets"];
+
+/// Width and height of a caption button.
+const CAPTION_BUTTON: f32 = 32.0;
+/// Height of the caption strip.
+///
+/// Thirty-two logical pixels is what Windows itself uses. A taller strip is
+/// what makes a custom title bar read as "an application that drew its own"
+/// rather than as part of the system.
+const CAPTION_HEIGHT: f32 = 32.0;
+/// Size the caption glyphs are drawn at.
+const CAPTION_GLYPH: f32 = 10.0;
+/// How many caption buttons there are, and therefore how many hover springs.
+const CAPTION_BUTTONS: usize = 3;
+
+/// The colour Windows uses for a hovered close button.
+const CLOSE_HOVER: Color = Color::hex(0xC4_2B1C);
+/// The same, pressed.
+const CLOSE_PRESSED: Color = Color::hex(0xB2_2719);
+
+/// A window button that fades on hover.
+///
+/// A custom element rather than a [`button`] because it needs three things the
+/// stock one does not offer: square corners, a background driven by an
+/// animation rather than by the interaction state directly, and a hover signal
+/// the frame loop can see.
+///
+/// The split is deliberate. `handle_event` records *intent* — the pointer is
+/// over this button — and nothing else. The frame loop advances the spring.
+/// `paint` reads whatever the spring currently says. That keeps paint a pure
+/// function of state, which is the engine's rule, and it is the only way an
+/// animation can outlive the event that started it.
+struct CaptionButton {
+    glyph: &'static str,
+    command: WindowCommand,
+    index: usize,
+    state: Rc<State>,
+    /// The spring's value this frame, sampled at build time.
+    fade: f32,
+}
+
+impl CaptionButton {
+    /// Builds one, already boxed. Returns an element rather than `Self` because
+    /// nothing ever wants a bare `CaptionButton`.
+    fn element(
+        glyph: &'static str,
+        command: WindowCommand,
+        index: usize,
+        state: &Rc<State>,
+    ) -> AnyElement {
+        let fade = state.wco_fade[index].get().value();
+        CaptionButton { glyph, command, index, state: Rc::clone(state), fade }.into_element()
+    }
+}
+
+impl Element for CaptionButton {
+    fn id(&self) -> Option<sphere::core::ElementId> {
+        Some(sphere::core::ElementId::from_key(("wco", self.index)))
+    }
+
+    fn layout_style(&self) -> sphere::layout::Style {
+        let mut style = sphere::layout::Style::DEFAULT;
+        style.size.width = sphere::core::Length::Px(px(CAPTION_BUTTON));
+        style.size.height = sphere::core::Length::Px(px(CAPTION_BUTTON));
+        style
+    }
+
+    fn paint(&mut self, cx: &mut sphere::ui::PaintContext<'_, '_>) {
+        let c = cx.theme.colors;
+        cx.keep_interactive();
+        let danger = self.command == WindowCommand::Close;
+
+        let (hover, pressed) =
+            if danger { (CLOSE_HOVER, CLOSE_PRESSED) } else { (c.hover, c.pressed) };
+        let end = if cx.state.active { pressed } else { hover };
+        // Faded from the target colour at zero alpha rather than from
+        // `Color::TRANSPARENT`: interpolating out of fully transparent black
+        // loses the hue and takes the fade through grey on its way to red.
+        let background = Color::lerp(end.with_alpha(0.0), end, self.fade);
+
+        // Square on purpose. A rounded caption button reads as a control
+        // floating on the title bar; the shell's are flush to the edge and to
+        // each other.
+        cx.canvas.fill_rect(cx.bounds, background);
+        // The glyph sits on the button, not on the window, so the coverage
+        // correction is measured against whichever the fade has arrived at.
+        let background = Color::lerp(c.surface, end, self.fade);
+
+        let colour = if danger && self.fade > 0.5 { Color::WHITE } else { c.text };
+        let style = sphere_text_style(px(CAPTION_GLYPH));
+        let layout = cx.text.layout(self.glyph, &style, None);
+        let origin = sphere::core::Point::new(
+            cx.bounds.min_x() + (cx.bounds.width() - layout.size.width) * 0.5,
+            cx.bounds.min_y() + (cx.bounds.height() - layout.size.height) * 0.5,
+        );
+        sphere::ui::text::draw_layout(
+            cx.canvas,
+            &layout,
+            origin,
+            colour,
+            sphere::render::TextRasterMode::Auto,
+            (Px::ZERO, Color::TRANSPARENT),
+            sphere::render::coverage_gamma_for(colour, background),
+        );
+    }
+
+    fn handle_event(&mut self, cx: &mut EventContext<'_>) -> sphere::ui::EventFlow {
+        use sphere::ui::{EventFlow, UiEvent};
+        cx.set_cursor(Cursor::Pointer);
+        match cx.event {
+            // Intent only. The spring is advanced by the frame loop, because an
+            // animation has to keep running after the event that started it.
+            UiEvent::MouseEnter(_) => {
+                self.state.wco_hovered[self.index].set(true);
+                cx.notify();
+                EventFlow::Continue
+            }
+            UiEvent::MouseLeave(_) => {
+                self.state.wco_hovered[self.index].set(false);
+                cx.notify();
+                EventFlow::Continue
+            }
+            UiEvent::MouseUp(e) if e.button == sphere::ui::MouseButton::Primary => {
+                if cx.bounds.contains(e.position) {
+                    self.state.pending.set(Some(self.command));
+                }
+                cx.notify();
+                EventFlow::Stop
+            }
+            UiEvent::MouseDown(e) if e.button == sphere::ui::MouseButton::Primary => {
+                cx.focus();
+                cx.notify();
+                EventFlow::Stop
+            }
+            UiEvent::Key(k)
+                if k.state.is_pressed()
+                    && matches!(k.key, sphere::ui::Key::Enter | sphere::ui::Key::Space) =>
+            {
+                self.state.pending.set(Some(self.command));
+                EventFlow::Stop
+            }
+            _ => EventFlow::Continue,
+        }
+    }
+
+    /// Not in the tab order, and drawn with no focus ring.
+    ///
+    /// The shell's own caption buttons are not tab stops either: minimise,
+    /// maximise and close are reachable from the window menu, which Alt+Space
+    /// and a right-click on the caption both open. A ring here would also be
+    /// clipped by the 32-pixel strip and show as two stray vertical bars.
+    fn focusable(&self) -> bool {
+        false
+    }
+
+    fn semantics(&self) -> Option<Semantics> {
+        let name = match self.command {
+            WindowCommand::Minimize => "Minimise",
+            WindowCommand::ToggleMaximize => "Maximise",
+            WindowCommand::Close => "Close",
+        };
+        Some(Semantics::new(Role::Button, name))
+    }
+}
+
+/// The text style the caption glyphs are drawn with.
+fn sphere_text_style(size: Px) -> sphere::text::TextStyle {
+    sphere::text::TextStyle {
+        font_size: size,
+        font: sphere::text::FontRequest {
+            families: ICON_FONT.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        },
+        wrap: sphere::text::WrapMode::None,
+        ..Default::default()
+    }
+}
+
 fn section_title(text: &str, theme: &Theme) -> AnyElement {
     label(text.to_string())
         .text_size(theme.typography.lg)
+        .weight(theme.typography.strong)
         .text_color(theme.colors.text)
         .into_element()
 }
@@ -592,7 +925,14 @@ fn setting_row(title: &str, description: &str, theme: &Theme, control: AnyElemen
                 .flex_col()
                 .flex_1()
                 .gap(theme.spacing.xs)
-                .child(label(title.to_string()).text_size(theme.typography.md).text_color(c.text))
+                // The row's title carries the weight; its description stays at
+                // book weight and muted, which is the whole of the hierarchy.
+                .child(
+                    label(title.to_string())
+                        .text_size(theme.typography.md)
+                        .weight(theme.typography.strong)
+                        .text_color(c.text),
+                )
                 .child(
                     label(description.to_string())
                         .text_size(theme.typography.sm)
@@ -661,6 +1001,10 @@ impl AppHandler for DesktopApp {
         let attrs = WindowAttributes::new("SphereGraphicEngine — Preferences")
             .with_inner_size(size(px(980.0), px(640.0)))
             .with_min_inner_size(size(px(560.0), px(380.0)))
+            // The header is the title bar. The platform keeps the resize
+            // borders, snap, the drop shadow and the window menu; only the
+            // caption strip becomes ours to draw.
+            .with_chrome(WindowChrome::Custom)
             .with_visible(false);
         let window = match cx.create_window(&attrs) {
             Ok(w) => w,
@@ -682,6 +1026,7 @@ impl AppHandler for DesktopApp {
                 println!("adapter: {}", s.adapter_name());
                 println!("scale factor: {}", window.scale_factor().get());
                 println!("init: gpu {:.0} ms, fonts {:.0} ms", t.gpu_ms, t.fonts_ms);
+                println!("chrome: {:?}", window.chrome());
                 self.surface = Some(s);
             }
             Err(e) => {
@@ -739,6 +1084,7 @@ impl AppHandler for DesktopApp {
 
     fn window_event(&mut self, cx: &mut AppContext<'_>, _id: WindowId, event: WindowEvent) {
         self.input.set_time(self.started.elapsed().as_millis() as u64);
+        self.run_window_command(cx);
 
         match &event {
             WindowEvent::CloseRequested => {
@@ -749,6 +1095,10 @@ impl AppHandler for DesktopApp {
                 if let (Some(surface), Some(window)) = (self.surface.as_mut(), self.window.as_ref())
                 {
                     let _ = surface.resize(*new_size, window.scale_factor());
+                    // Snap, a double-click on the caption and Win+Up all
+                    // maximise without asking, so the glyph is refreshed from
+                    // the window rather than only from the button.
+                    self.state.maximized.set(window.is_maximized());
                 }
                 self.draw();
                 return;
@@ -805,6 +1155,7 @@ impl AppHandler for DesktopApp {
             }
         }
 
+        self.run_window_command(cx);
         if needs_redraw {
             self.draw();
         }
@@ -866,6 +1217,7 @@ impl DesktopApp {
     }
 
     fn draw(&mut self) {
+        let moving = self.advance_motion();
         let root = self.build();
         let clear = self.state.theme().colors.background;
         let Some(surface) = self.surface.as_mut() else { return };
@@ -873,6 +1225,127 @@ impl DesktopApp {
             Ok(Some(_)) => self.frames += 1,
             Ok(None) => {}
             Err(e) => eprintln!("frame failed: {e}"),
+        }
+        self.apply_ime();
+        self.publish_caption();
+        // A spring that has not settled owes another frame. A settled one owes
+        // nothing, which is what lets the window go back to a blocking wait
+        // the moment the pointer stops moving.
+        if moving && let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    /// Performs whatever the caption asked for, if anything.
+    ///
+    /// The queue exists because a widget callback has no window to act on. It
+    /// is drained here, where one is in scope.
+    fn run_window_command(&mut self, cx: &mut AppContext<'_>) {
+        let Some(command) = self.state.pending.take() else { return };
+        let Some(window) = self.window.as_ref() else { return };
+        match command {
+            WindowCommand::Minimize => window.set_minimized(true),
+            WindowCommand::ToggleMaximize => {
+                let now = !window.is_maximized();
+                window.set_maximized(now);
+                self.state.maximized.set(now);
+            }
+            WindowCommand::Close => cx.exit(),
+        }
+    }
+
+    /// Tells the platform which part of the client area behaves as a title bar.
+    ///
+    /// Republished after every paint, because the caption's contents are laid
+    /// out by flexbox and move with the window's width. It is a cheap store —
+    /// the platform reads the newest value on its next hit test — and
+    /// republishing unconditionally removes a whole class of bug where a caption
+    /// drags in the wrong place after a resize nobody remembered to hook.
+    ///
+    /// The exclusions are **not** listed by hand. Every interactive widget
+    /// declares itself during paint through `PaintContext::keep_interactive`,
+    /// and the tree collects them, so a button added to the header later is
+    /// clickable without anyone remembering this function exists. Hand-listing
+    /// them is how "Light theme" and "Apply" ended up swallowed by the modal
+    /// move loop, with no error and no way to notice but trying to click them.
+    fn publish_caption(&self) {
+        let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_ref()) else {
+            return;
+        };
+        if window.chrome() != WindowChrome::Custom {
+            return;
+        }
+        let strip = sphere::core::Rect::new(
+            sphere::core::Point::new(Px::ZERO, Px::ZERO),
+            size(surface.viewport().width, px(CAPTION_HEIGHT)),
+        );
+        let regions = CaptionRegions {
+            drag: vec![strip],
+            // Filtered to the strip so the platform's hit test, which runs on
+            // every mouse move, walks three rectangles rather than thirty.
+            exclude: surface
+                .tree()
+                .caption_exclusions()
+                .iter()
+                .copied()
+                .filter(|r| r.intersects(strip))
+                .collect(),
+        };
+        window.set_caption_regions(&regions);
+    }
+
+    /// Advances every running animation by one frame.
+    ///
+    /// The only place a spring is stepped. Events set targets and paint reads
+    /// values; this is what sits between them, and it is what lets an animation
+    /// outlive the event that started it.
+    ///
+    /// `Timeline` owns the clock so that one delta drives everything and a
+    /// stall — a debugger pause, a minimised window — is clamped once rather
+    /// than at every call site.
+    fn advance_motion(&mut self) -> bool {
+        let frame = self.timeline.advance_to(self.clock.now());
+        let mut moving = false;
+        for i in 0..CAPTION_BUTTONS {
+            let mut motion = self.state.wco_fade[i].get();
+            motion.retarget(if self.state.wco_hovered[i].get() { 1.0 } else { 0.0 });
+            motion.step(frame.delta);
+            moving |= !motion.is_settled();
+            self.state.wco_fade[i].set(motion);
+        }
+        moving
+    }
+
+    /// Tells the window whether to compose, and where.
+    ///
+    /// Read after rendering, because the caret's position is a paint-time fact:
+    /// a text field can only say where its caret is once it has laid its string
+    /// out, and it lays it out while painting.
+    ///
+    /// Both halves matter. Without `set_ime_allowed` nothing composes at all;
+    /// without `set_ime_cursor_area` a CJK candidate window opens in a corner of
+    /// the screen rather than under the caret, which makes the feature useless
+    /// for the languages that need it. The state is diffed rather than pushed
+    /// every frame, because a platform is entitled to treat re-enabling an input
+    /// method as a reason to cancel the composition in progress.
+    fn apply_ime(&mut self) {
+        let (Some(surface), Some(window)) = (self.surface.as_ref(), self.window.as_ref()) else {
+            return;
+        };
+        let area = surface.ime();
+        let allowed = area.is_some();
+        if allowed != self.ime_allowed {
+            window.set_ime_allowed(allowed);
+            self.ime_allowed = allowed;
+        }
+        if let Some(area) = area
+            && self.ime_caret != Some(area.caret)
+        {
+            window.set_ime_cursor_area(area.caret);
+            self.ime_caret = Some(area.caret);
+        }
+        if area.is_none() {
+            self.ime_caret = None;
         }
     }
 }

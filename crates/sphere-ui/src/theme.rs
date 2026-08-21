@@ -65,6 +65,14 @@ pub struct Typography {
     pub xl: Px,
     /// Line height as a multiple of font size.
     pub line_height: f32,
+    /// Weight for body text.
+    pub weight: sphere_text::FontWeight,
+    /// Weight for headings and for the emphasised half of a label pair.
+    ///
+    /// Semibold rather than bold: at interface sizes bold is heavier than the
+    /// hierarchy needs, and Segoe UI, SF Pro and Inter all ship a semibold that
+    /// is the weight their own shells use for this.
+    pub strong: sphere_text::FontWeight,
 }
 
 /// Spacing tokens, in logical pixels.
@@ -204,6 +212,8 @@ impl Theme {
                 lg: Px(16.0),
                 xl: Px(20.0),
                 line_height: 1.35,
+                weight: sphere_text::FontWeight::NORMAL,
+                strong: sphere_text::FontWeight::SEMI_BOLD,
             },
             spacing: Spacing { xs: Px(2.0), sm: Px(4.0), md: Px(8.0), lg: Px(16.0), xl: Px(24.0) },
             radii: Radii { sm: Px(3.0), md: Px(5.0), lg: Px(8.0) },

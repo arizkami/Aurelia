@@ -1526,6 +1526,8 @@ mod tests {
                     state: Default::default(),
                     theme: &theme,
                     time: 0.0,
+                    ime: &mut None,
+                    caption_exclusions: &mut Vec::new(),
                 };
                 node.paint(&mut cx);
             }

@@ -39,12 +39,14 @@
 
 pub mod atlas;
 pub mod cache;
+pub mod caret;
 pub mod font;
 pub mod layout;
 pub mod mtsdf;
 pub mod raster;
 pub mod shape;
 pub mod system;
+pub mod system_ui;
 pub mod types;
 
 pub use system::{TextSystem, TextSystemStats};

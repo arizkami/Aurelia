@@ -81,6 +81,11 @@ pub struct Button {
     variant: ButtonVariant,
     style: Style,
     disabled: bool,
+    /// Overrides the theme's body size. For an icon button, whose glyph is
+    /// designed at a size unrelated to the body text around it.
+    text_size: Option<Px>,
+    /// Overrides the default family, for an icon font.
+    font: Option<sphere_text::FontRequest>,
     on_press: Option<OnAction>,
 }
 
@@ -92,6 +97,8 @@ pub fn button(text: impl Into<String>) -> Button {
         variant: ButtonVariant::default(),
         style: Style::DEFAULT,
         disabled: false,
+        text_size: None,
+        font: None,
         on_press: None,
     }
 }
@@ -128,6 +135,31 @@ impl Button {
         self.style.size.width = width.into();
         self
     }
+
+    /// Sets the button's height, overriding the default.
+    pub fn height(mut self, height: impl Into<sphere_core::Length>) -> Self {
+        self.style.size.height = height.into();
+        self
+    }
+
+    /// Overrides the label's size.
+    pub fn text_size(mut self, size: Px) -> Self {
+        self.text_size = Some(size);
+        self
+    }
+
+    /// Draws the label in a specific font family.
+    ///
+    /// For an icon button, where the label is a codepoint in an icon font
+    /// rather than text. Falls back through the list in order, so a Windows 11
+    /// icon font can name its Windows 10 predecessor after it.
+    pub fn font(mut self, families: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.font = Some(sphere_text::FontRequest {
+            families: families.into_iter().map(Into::into).collect(),
+            ..Default::default()
+        });
+        self
+    }
 }
 
 impl Button {
@@ -136,9 +168,10 @@ impl Button {
     /// One function so the two can never drift apart. `measure` reserves the
     /// box and `paint` fills it; if they disagree on the font size the text
     /// ends up outside the box the layout engine agreed to.
-    fn label_style(theme: &crate::theme::Theme) -> sphere_text::TextStyle {
+    fn label_style(&self, theme: &crate::theme::Theme) -> sphere_text::TextStyle {
         sphere_text::TextStyle {
-            font_size: theme.typography.md,
+            font_size: self.text_size.unwrap_or(theme.typography.md),
+            font: self.font.clone().unwrap_or_default(),
             wrap: sphere_text::WrapMode::None,
             ..Default::default()
         }
@@ -165,7 +198,7 @@ impl Element for Button {
         }
         // Content size only: taffy adds the padding and border from
         // `layout_style` on top of whatever comes back from here.
-        Some(text.layout(&self.text, &Self::label_style(theme), None).size)
+        Some(text.layout(&self.text, &self.label_style(theme), None).size)
     }
 
     fn layout_style(&self) -> Style {
@@ -212,12 +245,15 @@ impl Element for Button {
         let mut state = cx.state;
         state.disabled = self.disabled;
         style.paint_box(cx.canvas, cx.bounds, state);
+        // A button inside a custom title bar has to keep its clicks. Off the
+        // caption this costs one push and changes nothing.
+        cx.keep_interactive();
 
         if self.text.is_empty() {
             return;
         }
         let color = if self.disabled { c.text_muted } else { text };
-        let style_for_text = Self::label_style(cx.theme);
+        let style_for_text = self.label_style(cx.theme);
         let mut content = label(self.text.clone())
             .text_size(style_for_text.font_size)
             .text_color(color)
@@ -240,6 +276,11 @@ impl Element for Button {
             state,
             theme: cx.theme,
             time: cx.time,
+            // Forwarded rather than dropped: a nested paint context must be able
+            // to reach the same slot, or a widget that wraps an editable one
+            // would silently swallow its request for an input method.
+            ime: cx.ime,
+            caption_exclusions: cx.caption_exclusions,
         };
         content.paint(&mut inner);
     }
@@ -362,6 +403,7 @@ impl Element for Toggle {
     }
 
     fn paint(&mut self, cx: &mut PaintContext<'_, '_>) {
+        cx.keep_interactive();
         let c = cx.theme.colors;
         let bounds = cx.bounds;
         if bounds.is_empty() {
@@ -722,6 +764,7 @@ impl Element for ValueControl {
     }
 
     fn paint(&mut self, cx: &mut PaintContext<'_, '_>) {
+        cx.keep_interactive();
         let c = cx.theme.colors;
         let b = cx.bounds;
         if b.is_empty() {

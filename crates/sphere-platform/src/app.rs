@@ -378,6 +378,17 @@ impl<H: AppHandler> ::winit::application::ApplicationHandler for Driver<H> {
             let is_redraw = matches!(sphere_event, WindowEvent::RedrawRequested);
             let is_terminal = sphere_event.is_terminal();
             self.windows.apply(id, &sphere_event);
+
+            // A custom frame answers `WM_NCHITTEST` from state it was pushed
+            // rather than state it queries, because that message fires on every
+            // mouse move. Maximise, resizability and the scale factor are
+            // exactly what can change out from under it, and all three arrive
+            // as one of these two events.
+            if matches!(sphere_event, WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged(_))
+                && let Some(window) = self.windows.window(id)
+            {
+                window.sync_chrome_state();
+            }
             if is_redraw {
                 // The platform delivered the frame that was owed, and the
                 // handler is about to draw it, so the debt is settled *before*

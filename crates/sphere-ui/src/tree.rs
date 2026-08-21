@@ -143,6 +143,13 @@ pub struct UiTree {
     captured: Option<usize>,
     hovered_chain: SmallVec<[usize; 12]>,
     theme: Theme,
+    /// Where the focused editable element wants an input method, as of the last
+    /// paint. `None` means nothing on screen accepts text, and the platform's
+    /// input method should be switched off.
+    ime: Option<crate::element::ImeArea>,
+    /// Boxes that must keep receiving clicks under a custom window frame.
+    /// Rebuilt every paint; the allocation is kept.
+    caption_exclusions: Vec<Rect<Px>>,
     stats: TreeStats,
     /// Scratch for hit testing, reused so a mouse move never allocates.
     hit_scratch: Vec<NodeId>,
@@ -170,6 +177,8 @@ impl UiTree {
             captured: None,
             hovered_chain: SmallVec::new(),
             theme: Theme::dark(),
+            ime: None,
+            caption_exclusions: Vec::new(),
             stats: TreeStats::default(),
             hit_scratch: Vec::new(),
         }
@@ -179,6 +188,27 @@ impl UiTree {
     #[inline]
     pub fn theme(&self) -> &Theme {
         &self.theme
+    }
+
+    /// Where the focused editable element wants an input method.
+    ///
+    /// Valid after [`UiTree::paint`] and not before: the caret's position is a
+    /// paint-time fact. `None` means nothing focused accepts text, and the
+    /// window should turn its input method off.
+    #[inline]
+    pub fn ime(&self) -> Option<crate::element::ImeArea> {
+        self.ime
+    }
+
+    /// Boxes the platform must not treat as a title bar.
+    ///
+    /// Valid after [`UiTree::paint`]. Every interactive widget that painted this
+    /// frame is here, wherever it is on screen; filter to the caption strip
+    /// before publishing if the count matters. See
+    /// [`crate::PaintContext::keep_interactive`].
+    #[inline]
+    pub fn caption_exclusions(&self) -> &[Rect<Px>] {
+        &self.caption_exclusions
     }
 
     /// Replaces the theme. Marks everything paint-dirty, not layout-dirty:
@@ -393,6 +423,15 @@ impl UiTree {
     ) {
         self.stats.elements_painted = 0;
         self.stats.elements_culled = 0;
+        // Rebuilt every pass rather than remembered: a field that was destroyed,
+        // scrolled out of view or blurred since the last frame must stop asking
+        // for an input method, and the only reliable signal for that is that it
+        // did not ask again.
+        self.ime = None;
+        // Cleared, not dropped: this runs every frame and reallocating a vector
+        // per frame in the paint path is exactly what the engine avoids
+        // everywhere else.
+        self.caption_exclusions.clear();
         if self.built.is_empty() {
             return;
         }
@@ -465,6 +504,8 @@ impl UiTree {
                             state: interaction,
                             theme: &self.theme,
                             time,
+                            ime: &mut self.ime,
+                            caption_exclusions: &mut self.caption_exclusions,
                         };
                         built.element.paint(&mut cx);
                     }
@@ -502,10 +543,33 @@ impl UiTree {
 
     /// Dispatches an event.
     pub fn dispatch(&mut self, event: &UiEvent) -> DispatchResult {
+        self.dispatch_inner(event, None)
+    }
+
+    /// Dispatches with the window's text system available to handlers.
+    ///
+    /// The pair mirrors [`UiTree::compute_layout`] and
+    /// [`UiTree::compute_layout_with_text`], and for the same reason: a text
+    /// field cannot turn a click into a caret position without shaping the
+    /// string, and a tree with no text in it should not have to own a font
+    /// stack to be dispatched to.
+    pub fn dispatch_with_text(
+        &mut self,
+        event: &UiEvent,
+        text: &mut sphere_text::TextSystem,
+    ) -> DispatchResult {
+        self.dispatch_inner(event, Some(text))
+    }
+
+    fn dispatch_inner(
+        &mut self,
+        event: &UiEvent,
+        mut text: Option<&mut sphere_text::TextSystem>,
+    ) -> DispatchResult {
         let mut result = DispatchResult::default();
 
         if event.is_focus_routed() {
-            if let Some(handled) = self.dispatch_to_focused(event) {
+            if let Some(handled) = self.dispatch_to_focused(event, text.as_deref_mut()) {
                 result.merge(handled);
             }
             result.focus_changed |= self.focus.take_changed();
@@ -542,7 +606,14 @@ impl UiTree {
 
         // Capture: outermost to innermost.
         for index in indices.iter() {
-            let flow = self.deliver(*index, event, Phase::Capture, &chain, &mut result);
+            let flow = self.deliver(
+                *index,
+                event,
+                Phase::Capture,
+                &chain,
+                &mut result,
+                text.as_deref_mut(),
+            );
             if flow.is_stopped() {
                 result.consumed = true;
                 result.focus_changed |= self.focus.take_changed();
@@ -551,7 +622,14 @@ impl UiTree {
         }
         // Bubble: innermost to outermost.
         for index in indices.iter().rev() {
-            let flow = self.deliver(*index, event, Phase::Bubble, &chain, &mut result);
+            let flow = self.deliver(
+                *index,
+                event,
+                Phase::Bubble,
+                &chain,
+                &mut result,
+                text.as_deref_mut(),
+            );
             if flow.is_stopped() {
                 result.consumed = true;
                 break;
@@ -562,7 +640,11 @@ impl UiTree {
         result
     }
 
-    fn dispatch_to_focused(&mut self, event: &UiEvent) -> Option<DispatchResult> {
+    fn dispatch_to_focused(
+        &mut self,
+        event: &UiEvent,
+        mut text: Option<&mut sphere_text::TextSystem>,
+    ) -> Option<DispatchResult> {
         let node = self.focus.focused_node()?;
         let index = *self.index_for_node.get(&node)?;
         let mut result = DispatchResult::default();
@@ -591,7 +673,8 @@ impl UiTree {
             .collect();
 
         for index in chain_indices {
-            let flow = self.deliver(index, event, Phase::Bubble, &chain, &mut result);
+            let flow =
+                self.deliver(index, event, Phase::Bubble, &chain, &mut result, text.as_deref_mut());
             if flow.is_stopped() {
                 result.consumed = true;
                 break;
@@ -607,6 +690,7 @@ impl UiTree {
         phase: Phase,
         chain: &[HitTarget],
         result: &mut DispatchResult,
+        text: Option<&mut sphere_text::TextSystem>,
     ) -> EventFlow {
         let Some(built) = self.built.get(index) else { return EventFlow::Continue };
         let node = built.node;
@@ -630,6 +714,8 @@ impl UiTree {
                 capture_pointer: false,
                 release_pointer: false,
                 cursor: None,
+                text,
+                theme: &self.theme,
             };
             let flow = self.built[index].element.handle_event(&mut cx);
             let outputs = EventOutputs {
@@ -708,7 +794,7 @@ impl UiTree {
                 self.layout.mark_dirty(node, DirtyFlags::PAINT);
             }
             let ev = synth(UiEvent::MouseLeave);
-            self.deliver(index, &ev, Phase::Bubble, &[], &mut result);
+            self.deliver(index, &ev, Phase::Bubble, &[], &mut result, None);
             result.repaint = true;
         }
         for index in entered {
@@ -718,7 +804,7 @@ impl UiTree {
                 self.layout.mark_dirty(node, DirtyFlags::PAINT);
             }
             let ev = synth(UiEvent::MouseEnter);
-            self.deliver(index, &ev, Phase::Bubble, &[], &mut result);
+            self.deliver(index, &ev, Phase::Bubble, &[], &mut result, None);
             result.repaint = true;
         }
 

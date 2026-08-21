@@ -72,8 +72,9 @@ Hover, click, drag, scroll, focus, keyboard, text input, IME architecture.
 dispatch, pointer capture, a click tracker with both a time and a distance window, a focus registry
 with scopes and traps, and an `InputTranslator` bridging platform events.
 
-IME is *architecturally* complete — the event types, the pre-edit model and `set_ime_cursor_area`
-all exist — but no text field consumes them yet, because there is no text field.
+IME is complete end to end as of the text field: platform event, translated event, buffer,
+composition, caret rectangle and the two `Window` calls that make a candidate window appear in the
+right place. See `docs/platform.md`.
 
 ### Phase 5 — Widgets · **PARTIAL**
 
@@ -88,7 +89,8 @@ all exist — but no text field consumes them yet, because there is no text fiel
 | Separator, progress, panel | Done |
 | ScrollView | Done |
 | Label | Done |
-| **Text input** | **Not started** |
+| Text field, with IME | Done |
+| Custom window chrome + system menu | Done (Windows) |
 | **Menu, dropdown** | **Not started** |
 | **Tabs, tooltip, modal, popover** | **Not started** |
 | **List, tree, dock container** | **Not started** |
@@ -99,8 +101,14 @@ double-click to reset, arrow/Page/Home/End keyboard support, scroll-wheel adjust
 quantisation relative to the minimum, and full semantic reporting including a caller-supplied value
 string so a fader announces "−6.0 dB" rather than "79 %".
 
-Text input is the significant gap. Everything it needs exists — IME events, the cluster mapping in
-shaped runs, `TextLayout::hit_test`, focus, per-node scratch — but the widget itself is not written.
+`TextField` is single-line and covers selection by click, drag, double-click and triple-click,
+grapheme-correct arrow and word motion, Home/End, backspace and delete, select-all, submit-on-Enter,
+masking for passwords, and input-method composition with an underlined pre-edit. `TextEdit` under it
+holds no pixels and is tested without a font.
+
+Still missing: a multi-line editor, which needs vertical caret motion and therefore the laid-out
+lines; clipboard integration, which needs a platform clipboard call the field does not yet make; and
+undo.
 
 ### Phase 6 — Realtime audio UI · **DONE**
 
@@ -168,16 +176,25 @@ yet run the two-pass blur between a layer's render and its composite.
 
 ## Known gaps, in the order they should be closed
 
-1. **Text input.** The largest functional hole. Everything it depends on exists.
-2. **Benchmarks.** No Criterion suite. The engine reports counters and the demo measures itself, but
+1. **Clipboard, undo, and multi-line editing.** The text field handles selection, motion and
+   composition; cut/copy/paste, an undo stack and vertical caret motion are not written. Vertical
+   motion is the one that needs new machinery, because it has to walk the laid-out lines.
+2. **Animation core integration.** `sphere-core::animate` is built and tested — analytic springs,
+   tweens as the degenerate case, `Animatable` for the scalar, geometry and colour types — and
+   `sphere-core::time` gives it one clock. What is *not* built is the retained layer that would let a
+   stock widget animate without the application holding the `Motion`. The `desktop_app` caption shows
+   the app-owned pattern working end to end; `Styled::transition` does not exist yet.
+3. **A native Win32 backend.** Deliberately deferred, with the reasoning written down in
+   `docs/platform.md`. The custom chrome it was supposed to enable did not need it.
+4. **Benchmarks.** No Criterion suite. The engine reports counters and the demo measures itself, but
    there is no regression harness.
-3. **More examples.** Two exist — a desktop settings window and a plug-in editor. Small focused
+5. **More examples.** Two exist — a desktop settings window and a plug-in editor. Small focused
    examples for individual subsystems would still teach the pieces better.
-4. **Blur wiring.** The shader and pipeline exist and are GPU-validated; the pass is not run.
-5. **Remaining widgets.** Menu, tabs, tooltip, modal, list, tree.
-6. **Accessibility bridge.** Every element already reports role, value, state and actions. No
+6. **Blur wiring.** The shader and pipeline exist and are GPU-validated; the pass is not run.
+7. **Remaining widgets.** Menu, tabs, tooltip, modal, list, tree.
+8. **Accessibility bridge.** Every element already reports role, value, state and actions. No
    platform bridge (UI Automation, AT-SPI, NSAccessibility) consumes them yet.
-7. **Golden-image tests.** Visual regressions are currently caught by eye.
+9. **Golden-image tests.** Visual regressions are currently caught by eye.
 
 ## Beyond v0.1
 

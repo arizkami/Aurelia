@@ -39,3 +39,17 @@ winit = { workspace = true, optional = true }
 # `default-features = false` drops arboard's image-data support, which would
 # otherwise pull the whole `image` crate in for a text clipboard.
 arboard = { version = "3.6", default-features = false, optional = true }
+
+# Windows-only, and not optional: it costs nothing elsewhere, and gating it on a
+# backend feature would mean the custom-frame decision functions in
+# `backend::nc` stop being compiled in exactly the configuration that has the
+# fewest other tests covering them.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }

@@ -11,6 +11,18 @@
 //! (on by default). A native per-platform backend would live beside it and
 //! provide the same `Window` surface.
 
+// Custom-frame decisions. Compiled on every Windows build, backend or not: the
+// functions are pure and their tests are the only thing standing between a
+// transcription error in an `HT*` code and a window whose edges are subtly
+// wrong.
+#[cfg(windows)]
+pub(crate) mod nc;
+
+// Every unsafe call the custom frame makes. Needs a backend to have produced a
+// window to subclass, so unlike `nc` it is gated on one.
+#[cfg(all(windows, feature = "winit-backend"))]
+pub(crate) mod ffi;
+
 #[cfg(feature = "winit-backend")]
 pub mod winit;
 

@@ -74,9 +74,70 @@ pub struct PaintContext<'a, 'canvas> {
     pub theme: &'a crate::theme::Theme,
     /// Seconds since the engine started, for animated painting.
     pub time: f32,
+    /// Where a focused editable element wants the input method to appear.
+    ///
+    /// Written through [`PaintContext::request_ime`] rather than assigned. A
+    /// widget that draws no caret leaves it alone, and the tree reads whatever
+    /// the pass left behind.
+    pub ime: &'a mut Option<ImeArea>,
+    /// Boxes the platform must not treat as a title bar.
+    ///
+    /// Written through [`PaintContext::keep_interactive`]. Appended to rather
+    /// than replaced, because every interactive element in the pass contributes.
+    pub caption_exclusions: &'a mut Vec<Rect<Px>>,
+}
+
+/// An editable element's request for input-method composition.
+///
+/// Produced during paint rather than asked for through a trait method, because
+/// both halves of the answer — *whether* this element edits text and *where* its
+/// caret is on screen — are only known once it has been laid out and is drawing
+/// itself. A trait method would have to be answered before layout, when the
+/// caret has no position yet.
+///
+/// The application turns this into [`sphere_platform::Window::set_ime_allowed`]
+/// and [`sphere_platform::Window::set_ime_cursor_area`]. The second one is not
+/// optional: without it a CJK candidate window opens in the corner of the screen
+/// instead of under the caret, which is a usability failure for exactly the
+/// languages that need an input method at all.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ImeArea {
+    /// The caret, in window-logical pixels, where the candidate window goes.
+    pub caret: Rect<Px>,
 }
 
 impl PaintContext<'_, '_> {
+    /// Asks the platform to enable input-method composition, with the caret
+    /// here.
+    ///
+    /// Call it only while focused: enabling an input method for an unfocused
+    /// field would put a candidate window over a control the user is not typing
+    /// into. The last call in a paint pass wins, which is the right rule because
+    /// only one element can hold focus.
+    #[inline]
+    pub fn request_ime(&mut self, caret: Rect<Px>) {
+        *self.ime = Some(ImeArea { caret });
+    }
+
+    /// Declares that this element must keep receiving clicks.
+    ///
+    /// Only matters under a custom window frame. A press the platform resolves
+    /// as the title bar is swallowed by its modal move loop, so a button inside
+    /// the caption that has not said this receives no click **ever** — not
+    /// merely a delayed one, and with no error to notice.
+    ///
+    /// Declared here rather than listed by the application because the
+    /// application does not know where its buttons ended up: flexbox does.
+    /// Hand-maintaining the list is the whole bug class this removes.
+    ///
+    /// Harmless off the caption. An exclusion nowhere near the title bar can
+    /// never change a hit test, because the point would have to be inside a drag
+    /// region to be affected and it is not.
+    #[inline]
+    pub fn keep_interactive(&mut self) {
+        self.caption_exclusions.push(self.bounds);
+    }
+
     /// True when this element's box is entirely outside the visible region.
     ///
     /// Widgets that generate expensive content — a waveform, a long list —
@@ -114,6 +175,25 @@ pub struct EventContext<'a> {
     pub release_pointer: bool,
     /// A cursor to show while over this element.
     pub cursor: Option<crate::style::Cursor>,
+    /// The window's text system, when the caller supplied one.
+    ///
+    /// Present for events dispatched through [`crate::tree::UiTree::dispatch_with_text`]
+    /// and absent otherwise. A text field needs it to turn a click into a byte
+    /// offset, which cannot be done without shaping the string — and shaping it
+    /// here is cheap, because paint shaped the same string with the same style
+    /// moments earlier and the shaping cache still holds it.
+    ///
+    /// `Option` rather than required, so a tree can still be driven, tested and
+    /// dispatched to without a font stack.
+    pub text: Option<&'a mut sphere_text::TextSystem>,
+    /// The active theme.
+    ///
+    /// Needed because a widget's *geometry* can depend on it. A text field turns
+    /// a click into a caret index by laying its string out again, and it has to
+    /// lay it out at the same size it painted at or the caret lands on the wrong
+    /// character. Without the theme here that size would have to be duplicated
+    /// on the widget and kept in sync by hand.
+    pub theme: &'a crate::theme::Theme,
 }
 
 impl EventContext<'_> {
@@ -427,6 +507,26 @@ pub trait Styled: Sized {
         let p = &mut self.style_mut().padding;
         p.top = Length::Px(v);
         p.bottom = Length::Px(v);
+        self
+    }
+    /// Padding on the left only.
+    fn pl(mut self, v: Px) -> Self {
+        self.style_mut().padding.left = Length::Px(v);
+        self
+    }
+    /// Padding on the right only.
+    fn pr(mut self, v: Px) -> Self {
+        self.style_mut().padding.right = Length::Px(v);
+        self
+    }
+    /// Padding on the top only.
+    fn pt(mut self, v: Px) -> Self {
+        self.style_mut().padding.top = Length::Px(v);
+        self
+    }
+    /// Padding on the bottom only.
+    fn pb(mut self, v: Px) -> Self {
+        self.style_mut().padding.bottom = Length::Px(v);
         self
     }
     /// Margin on all sides.
@@ -857,8 +957,12 @@ mod tests {
             capture_pointer: false,
             release_pointer: false,
             cursor: None,
+            text: None,
+            theme: TEST_THEME.get_or_init(crate::theme::Theme::dark),
         }
     }
+
+    static TEST_THEME: std::sync::OnceLock<crate::theme::Theme> = std::sync::OnceLock::new();
 
     fn mouse_up_at(x: f32, y: f32) -> UiEvent {
         UiEvent::MouseUp(MouseButtonEvent {
@@ -1029,6 +1133,8 @@ mod tests {
             state: InteractionState::default(),
             theme: &theme,
             time: 0.0,
+            ime: &mut None,
+            caption_exclusions: &mut Vec::new(),
         };
         assert!(cx.is_culled());
     }

@@ -19,7 +19,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.87"
 license = "BSD-3-Clause"
-repository = "https://github.com/arizkami/sphere_graphicengine"
+repository = "https://github.com/futureboard/sphere_graphicengine"
 authors = ["Futureboard Digital Technologies"]
 
 [workspace.dependencies]

@@ -44,12 +44,14 @@
 #![deny(missing_docs)]
 #![warn(clippy::doc_markdown)]
 
+pub mod animate;
 pub mod color;
 pub mod error;
 pub mod geometry;
 pub mod id;
 pub mod paint;
 pub mod path;
+pub mod time;
 pub mod transform;
 pub mod unit;
 

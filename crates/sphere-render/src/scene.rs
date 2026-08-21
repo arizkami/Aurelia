@@ -105,8 +105,41 @@ pub struct GlyphRun {
     pub coverage_gamma: f32,
 }
 
-/// The default glyph coverage exponent. See [`GlyphRun::coverage_gamma`].
+/// The coverage exponent for light text on a dark background.
+///
+/// See [`GlyphRun::coverage_gamma`]. Prefer [`coverage_gamma_for`], which picks
+/// the right end of the range from the two colours involved.
 pub const DEFAULT_COVERAGE_GAMMA: f32 = 1.25;
+
+/// The coverage exponent for dark text on a light background.
+///
+/// Below 1.0, because the correction genuinely runs the other way. Linear-light
+/// blending makes light-on-dark text bloom, and it makes dark-on-light text
+/// *thin* by the same mechanism — the midtones land closer to the background
+/// than a gamma-space rasteriser would put them, so the strokes read as washed
+/// out rather than as heavy.
+pub const LIGHT_MODE_COVERAGE_GAMMA: f32 = 0.8;
+
+/// The coverage exponent for text of one colour drawn on another.
+///
+/// [`GlyphRun::coverage_gamma`] has always documented that "dark text on a light
+/// background wants the opposite adjustment"; this is what works that out
+/// instead of leaving every caller to remember it. Applying the light-on-dark
+/// constant to a light theme does not merely fail to help — it applies the
+/// correction backwards and makes the text visibly thinner than it should be.
+///
+/// Interpolates on relative luminance, so it is right for a dark label on a
+/// light card inside a dark theme, not only for whole-theme changes. Text on a
+/// background of the same luminance gets 1.0: there is no correction to make
+/// when there is no contrast to correct.
+pub fn coverage_gamma_for(text: Color, background: Color) -> f32 {
+    let delta = (text.luminance() - background.luminance()).clamp(-1.0, 1.0);
+    if delta >= 0.0 {
+        1.0 + delta * (DEFAULT_COVERAGE_GAMMA - 1.0)
+    } else {
+        1.0 + delta * (1.0 - LIGHT_MODE_COVERAGE_GAMMA)
+    }
+}
 
 /// One glyph placed at a baseline-relative position.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -528,6 +561,36 @@ pub struct SceneStats {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_coverage_correction_reverses_between_light_and_dark_themes() {
+        // The bug this exists for: applying the light-on-dark constant to a
+        // light theme does not merely fail to help, it corrects backwards and
+        // makes dark text visibly thinner than the rasteriser intended.
+        let on_dark = coverage_gamma_for(Color::WHITE, Color::BLACK);
+        let on_light = coverage_gamma_for(Color::BLACK, Color::WHITE);
+        assert!(on_dark > 1.0, "light on dark must thin the strokes: {on_dark}");
+        assert!(on_light < 1.0, "dark on light must fatten them: {on_light}");
+        assert!((on_dark - DEFAULT_COVERAGE_GAMMA).abs() < 1e-4);
+        assert!((on_light - LIGHT_MODE_COVERAGE_GAMMA).abs() < 1e-4);
+    }
+
+    #[test]
+    fn text_with_no_contrast_gets_no_correction() {
+        // There is nothing to correct when there is nothing to see, and a
+        // nonzero correction there would be an arbitrary thinning.
+        let g = coverage_gamma_for(Color::WHITE, Color::WHITE);
+        assert!((g - 1.0).abs() < 1e-4, "{g}");
+    }
+
+    #[test]
+    fn the_correction_scales_with_contrast_rather_than_switching_at_a_threshold() {
+        // So a dark label on a light card inside a dark theme gets the right
+        // answer, not the theme's answer.
+        let strong = coverage_gamma_for(Color::WHITE, Color::BLACK);
+        let weak = coverage_gamma_for(Color::WHITE, Color::hex(0x808080));
+        assert!(weak > 1.0 && weak < strong, "weak {weak}, strong {strong}");
+    }
     use super::*;
     use sphere_core::{ScaleFactor, px, rect, size};
 

@@ -47,7 +47,7 @@ use raw_window_handle::{
     AppKitDisplayHandle, DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle,
     RawDisplayHandle, RawWindowHandle, UiKitDisplayHandle, WindowHandle, WindowsDisplayHandle,
 };
-use sphere_core::{DevicePx, PlatformError, Point, Px, ScaleFactor, Size, px, size};
+use sphere_core::{DevicePx, PlatformError, Point, Px, Rect, ScaleFactor, Size, px, size};
 
 use crate::event::Theme;
 
@@ -347,6 +347,117 @@ impl From<ForeignWindow> for WindowTarget {
 /// Sizes are logical: a plug-in editor that is "600 x 400" is 600 x 400 at
 /// 100 % and 1200 x 800 at 200 %, and the author should not have to think
 /// about which. The platform resolves them against the target display's scale
+/// Who draws the title bar and the border.
+///
+/// Replaces a plain `decorations: bool`, which could not express the middle
+/// case — and the middle case is the one worth having.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
+#[non_exhaustive]
+pub enum WindowChrome {
+    /// The platform draws everything. The default.
+    #[default]
+    System,
+    /// The application paints the caption; the platform keeps the resize
+    /// borders, snap, the window menu and the drop shadow.
+    ///
+    /// This is what a modern application with a custom title bar wants. It is
+    /// strictly better than [`WindowChrome::None`] for anything with a window
+    /// frame, because none of what it keeps costs anything to keep.
+    Custom,
+    /// No frame at all.
+    ///
+    /// Gives up resize borders, snap, the window menu and the drop shadow along
+    /// with the title bar. On Windows a fully stripped frame reports the whole
+    /// window as client area, so nothing resizes it but an explicit
+    /// `Window::begin_resize`. For splash screens and HUDs, not for
+    /// applications.
+    None,
+}
+
+/// Which edge or corner a user-initiated resize grabs.
+///
+/// Named to match the eight resize shapes in [`crate::Cursor`], so the two
+/// never need cross-referencing.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
+pub enum ResizeEdge {
+    /// Top edge.
+    North,
+    /// Bottom edge.
+    South,
+    /// Right edge.
+    East,
+    /// Left edge.
+    West,
+    /// Top-right corner.
+    NorthEast,
+    /// Top-left corner.
+    NorthWest,
+    /// Bottom-right corner.
+    SouthEast,
+    /// Bottom-left corner.
+    SouthWest,
+}
+
+/// Where a custom caption is, in logical pixels relative to the client area.
+///
+/// Pushed down as geometry rather than answered as an event, because the
+/// platform asks for a hit test *synchronously, from inside its own dispatch*.
+/// There is no point at which the interface thread could be called back to
+/// answer it. Republish whenever the caption's layout changes: it is a cheap
+/// store, and the platform reads the newest value on its next query.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CaptionRegions {
+    /// Rectangles that behave as a title bar: drag to move, double-click to
+    /// maximise, right-click for the system menu.
+    pub drag: Vec<Rect<Px>>,
+    /// Rectangles *inside* `drag` that stay interactive.
+    ///
+    /// Caption buttons, tabs and menus must be listed here. A press the
+    /// platform routes as caption never reaches the client at all, so an
+    /// unlisted button receives no click **ever** — not merely a delayed one.
+    pub exclude: Vec<Rect<Px>>,
+}
+
+impl CaptionRegions {
+    /// Nothing is a caption.
+    pub const fn new() -> Self {
+        Self { drag: Vec::new(), exclude: Vec::new() }
+    }
+
+    /// A full-width strip across the top, the common case.
+    pub fn strip(width: Px, height: Px) -> Self {
+        Self {
+            drag: vec![Rect::new(Point::new(Px::ZERO, Px::ZERO), Size::new(width, height))],
+            exclude: Vec::new(),
+        }
+    }
+
+    /// Carves an interactive rectangle out of the caption.
+    #[must_use]
+    pub fn with_button(mut self, rect: Rect<Px>) -> Self {
+        self.exclude.push(rect);
+        self
+    }
+
+    /// True when a point should be treated as the title bar.
+    ///
+    /// Exclusions win over drag regions, and this is the exact function the
+    /// platform-side hit test calls, so what the application reasons about and
+    /// what the window manager does cannot diverge.
+    pub fn hits_caption(&self, point: Point<Px>) -> bool {
+        if self.exclude.iter().any(|r| r.contains(point)) {
+            return false;
+        }
+        self.drag.iter().any(|r| r.contains(point))
+    }
+
+    /// True when no caption has been published.
+    pub fn is_empty(&self) -> bool {
+        self.drag.is_empty()
+    }
+}
+
 /// factor at creation time.
 #[derive(Clone, Debug)]
 pub struct WindowAttributes {
@@ -362,8 +473,18 @@ pub struct WindowAttributes {
     pub position: Option<WindowPosition>,
     /// Whether the user may resize the window.
     pub resizable: bool,
-    /// Whether the platform draws a title bar and border.
-    pub decorations: bool,
+    /// Who draws the title bar and border.
+    ///
+    /// Replaces the old `decorations: bool`, which could not express the middle
+    /// case. [`WindowChrome::Custom`] is the one worth having.
+    pub chrome: WindowChrome,
+    /// Caption geometry for [`WindowChrome::Custom`], when it is known at
+    /// creation time.
+    ///
+    /// Usually left empty and published later through
+    /// `Window::set_caption_regions`, because a caption only has a size once
+    /// the interface has been laid out.
+    pub caption: CaptionRegions,
     /// Whether the window's background may be see-through. Requires the
     /// renderer to clear with a non-opaque alpha as well; setting it here only
     /// asks the compositor to respect the alpha channel.
@@ -402,7 +523,8 @@ impl Default for WindowAttributes {
             max_inner_size: None,
             position: None,
             resizable: true,
-            decorations: true,
+            chrome: WindowChrome::System,
+            caption: CaptionRegions::default(),
             transparent: false,
             level: WindowLevel::Normal,
             visible: true,
@@ -463,9 +585,30 @@ impl WindowAttributes {
     }
 
     /// Sets whether the platform draws decorations.
+    ///
+    /// Kept under its old name with its old meaning — `true` is
+    /// [`WindowChrome::System`], `false` is [`WindowChrome::None`] — so
+    /// existing call sites are unaffected. Prefer
+    /// [`WindowAttributes::with_chrome`]: `false` is almost never what you
+    /// want, because it gives up resize borders, snap and the drop shadow to
+    /// get rid of a title bar.
     #[must_use]
     pub fn with_decorations(mut self, decorations: bool) -> Self {
-        self.decorations = decorations;
+        self.chrome = if decorations { WindowChrome::System } else { WindowChrome::None };
+        self
+    }
+
+    /// Sets who draws the title bar and border.
+    #[must_use]
+    pub fn with_chrome(mut self, chrome: WindowChrome) -> Self {
+        self.chrome = chrome;
+        self
+    }
+
+    /// Sets the caption geometry used by [`WindowChrome::Custom`].
+    #[must_use]
+    pub fn with_caption(mut self, caption: CaptionRegions) -> Self {
+        self.caption = caption;
         self
     }
 
@@ -580,7 +723,7 @@ mod tests {
         assert_eq!(a.title, "Sphere");
         assert_eq!(a.inner_size, size(px(1024.0), px(640.0)));
         assert!(a.resizable);
-        assert!(a.decorations);
+        assert_eq!(a.chrome, WindowChrome::System);
         assert!(a.visible);
         assert!(a.active);
         assert!(!a.transparent);
@@ -610,7 +753,7 @@ mod tests {
         assert_eq!(a.theme, Some(Theme::Dark));
         assert_eq!(a.position, Some(WindowPosition::Centered));
         // Untouched fields keep their defaults.
-        assert!(a.decorations);
+        assert_eq!(a.chrome, WindowChrome::System);
         assert!(a.active);
         assert_eq!(a.with_always_on_top(false).level, WindowLevel::Normal);
     }

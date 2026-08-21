@@ -101,23 +101,63 @@ file contents.
 
 ## The small-text exception
 
-Below roughly 12 **device** pixels, a distance field runs out of resolution before a glyph runs out
-of detail, and stems start to shimmer. DAW interfaces live at 10, 11, 12 and 13 px, so this is not
-an edge case.
+Below [`BITMAP_MAX_DEVICE_PX`] — **24 device pixels** — a distance field is the wrong tool, and the
+reason is sampling, not resolution.
+
+A field is generated at 48 texels per em and drawn at the device size, so rendering at *d* device
+pixels minifies it by `48 / d`. A bilinear tap averages a 2x2 texel footprint. Once the true
+footprint is wider than that, most of the texels that should have contributed are never read, and
+what comes back is a low-pass blur of the outline rather than a reconstruction of it. `48 / 24 = 2`,
+so 24 is exactly where the footprint stops fitting.
+
+The second reason lands in the same place. The shader's antialiasing ramp is one device pixel wide
+by construction — `screen_range` is clamped to 1 — and a regular-weight stem is about `em / 9`:
+
+| device px | field minified | stem | solid core between the two ramps |
+|---|---|---|---|
+| 13 | 3.7x | 1.44 px | **0.44 px** |
+| 16 | 3.0x | 1.78 px | 0.78 px |
+| 24 | 2.0x | 2.67 px | 1.67 px |
+| 26 | 1.9x | 2.89 px | 1.89 px |
+
+At 13 device pixels — a 13 px label on a 100 % display, which is most interface text ever written —
+the two ramps very nearly meet and the stem never reaches full opacity. That *is* soft text, and no
+amount of gamma correction fixes it, because the coverage genuinely is grey. At 26, the same label on
+a 200 % display, there is nearly two pixels of solid core and it looks the way it should.
+
+```bash
+SPHERE_PROBE_SIZE=13 SPHERE_PROBE_ZOOM=4 cargo run -p sphere-text --example glyph_quad_probe --release -- out.png
+```
+
+writes the comparison: forced MTSDF on the left, what `Auto` picks on the right, magnified with
+nearest-neighbour *after* compositing so the pixels shown are the pixels rendered.
+
+An earlier threshold of 12 came from a different and incorrect premise — that the field runs short of
+*texels*. It does not; a 48-per-em field has plenty at any interface size. The problem is reading
+them.
 
 ```rust
 pub enum TextRasterMode { Auto, Mtsdf, Bitmap }
 ```
 
-`Auto` chooses per glyph on the *physical* size — `font_size × scale_factor` — not the logical one.
-That distinction matters: 10 logical px on a 2× display is 20 device px and belongs on the field
-path. There is a test asserting exactly that, because choosing on the logical size alone would
-wrongly send crisp HiDPI text to the fallback.
+`Auto` chooses on the *physical* size — `font_size x scale_factor` — not the logical one. That
+distinction is the whole point: 13 logical px at 2x is 26 device px and belongs on the field path,
+while the same 13 px at 1x does not. There is a test asserting exactly that pair.
 
 The fallback is an analytic-coverage scanline rasteriser: signed area accumulated per cell, then
-prefix-summed along each scanline. Exact for polygons, no supersampling. It is deliberately
-isolated in `raster.rs` and its output goes to separate atlas pages — it exists to make 11 px labels
-crisp, not to become the main path.
+prefix-summed along each scanline. Exact for polygons, no supersampling. Its output goes to separate
+atlas pages, and the batch compiler snaps its quads to the pixel grid in both axes and to the exact
+texel count — that 1:1 alignment is most of why it is sharp.
+
+**What it costs.** Bitmaps are keyed per device size, so an interface with five type sizes at one
+scale factor holds five sets of glyphs rather than one size-independent set. That is the trade the
+fallback exists to make, and it is why the threshold is a threshold rather than "always bitmap".
+Content that zooms continuously should ask for `TextRasterMode::Mtsdf` explicitly.
+
+**What is still missing.** There is no hinting. DirectWrite grid-fits the x-height and stem positions
+onto pixel boundaries, and this does not; only the baseline is snapped, which is the single most
+valuable part of it. Expect this to be close to DirectWrite's "natural" mode rather than to its
+hinted one.
 
 ## The atlas
 
@@ -141,6 +181,36 @@ demo reports `glyph texels up: 0`.
 
 **Graceful failure.** A glyph larger than a page, or a full atlas at the page limit, returns
 `FontError::AtlasFull`. It never panics. One missing glyph is recoverable; a blank window is not.
+
+## The default family
+
+A [`TextStyle`] with no family named resolves through `fontdb`'s generic sans-serif, whose default is
+**Arial**. That is the Windows 95 interface font: the shell has not used it in decades, and on a
+non-Latin system it has no coverage for the language the user actually reads in, so every unstyled
+string fell through to a fallback chosen by accident.
+
+`sphere-text::system_ui` fixes it by asking the platform. On Windows that means reading
+`NONCLIENTMETRICSW::lfMessageFont` through `SPI_GETNONCLIENTMETRICS`, because the interface font
+there is **not a constant** — the shell picks it per locale:
+
+| Locale | `lfMessageFont` |
+|---|---|
+| Latin | Segoe UI |
+| Japanese | Yu Gothic UI |
+| Korean | Malgun Gothic |
+| Traditional Chinese | Microsoft JhengHei UI |
+| Thai | Leelawadee UI |
+
+Hard-coding `Segoe UI` would put Latin metrics on a Japanese desktop. Reading it also picks up a
+user's own font change, which is an accessibility setting on Windows and not merely a preference.
+
+The monospace generic moves too, from `Courier New` — a typewriter face that hints badly at
+interface sizes — to Consolas on Windows, SF Mono on macOS and DejaVu Sans Mono elsewhere. That one
+*is* a constant, because no platform exposes a system-monospace setting to query, and the code says
+so rather than pretending otherwise.
+
+`cargo run -p sphere-text --example glyph_quad_probe` reports both the queried family and the family
+that actually resolved, which is how to check this on a machine rather than assume it.
 
 ## Fallback
 
@@ -229,14 +299,11 @@ A line came out about a quarter too small with correct spacing, which reads as t
 tiny and tracked out — and because the ratio varies per glyph, narrow letters shrank more than wide
 ones, so the letterforms were distorted rather than merely scaled.
 
-```bash
-cargo run -p sphere-text --example glyph_quad_probe --release -- out.png
-```
-
-prints that table for the fonts on the machine it runs on, and writes a side-by-side render of one
-line under both quad rules. The probe re-implements `text.wgsl` on the CPU, so it demonstrates that
-the geometry handed to the GPU is right; it is not a capture of what the GPU drew, and it says so at
-the top of the file. There are still no golden-image tests — see the gaps in `performance.md`.
+The probe that now lives at `glyph_quad_probe` renders the same comparison for the *rasterisation
+path* rather than the quad rule, since the quad bug is fixed and has a regression test. It
+re-implements `text.wgsl` on the CPU, so it demonstrates that the geometry and the path choice handed
+to the GPU are right; it is not a capture of what the GPU drew, and it says so at the top of the
+file. There are still no golden-image tests — see the gaps in `performance.md`.
 
 `range_em` is zero on the bitmap path, so the outset is unconditional. A test asserts that, because
 the correctness of the snapping below depends on a bitmap quad staying exactly 1:1 with its texels.

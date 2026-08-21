@@ -57,19 +57,19 @@ impl Color {
 
     /// Builds from 8-bit sRGB components.
     #[inline]
-    pub fn rgba8(r: u8, g: u8, b: u8, a: u8) -> Self {
+    pub const fn rgba8(r: u8, g: u8, b: u8, a: u8) -> Self {
         Self { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a: a as f32 / 255.0 }
     }
 
     /// Parses `0xRRGGBB`, opaque.
     #[inline]
-    pub fn hex(v: u32) -> Self {
+    pub const fn hex(v: u32) -> Self {
         Self::rgba8((v >> 16) as u8, (v >> 8) as u8, v as u8, 255)
     }
 
     /// Parses `0xRRGGBBAA`.
     #[inline]
-    pub fn hex_rgba(v: u32) -> Self {
+    pub const fn hex_rgba(v: u32) -> Self {
         Self::rgba8((v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8, v as u8)
     }
 

@@ -236,6 +236,18 @@ impl SphereSurface {
         self.init_timing
     }
 
+    /// Where the focused editable element wants the platform's input method.
+    ///
+    /// Valid after [`SphereSurface::render`], because the caret's position is a
+    /// paint-time fact. Apply it with
+    /// [`sphere_platform::Window::set_ime_allowed`] and
+    /// [`sphere_platform::Window::set_ime_cursor_area`]; `None` means nothing
+    /// focused accepts text and the input method should be switched off.
+    #[inline]
+    pub fn ime(&self) -> Option<sphere_ui::ImeArea> {
+        self.tree.ime()
+    }
+
     /// Whether a frame has reached the screen yet.
     ///
     /// The condition for revealing a window that was created hidden. Waiting on
@@ -345,7 +357,10 @@ impl SphereSurface {
     /// Dispatches an input event to the UI tree.
     #[inline]
     pub fn dispatch(&mut self, event: &UiEvent) -> DispatchResult {
-        self.tree.dispatch(event)
+        // The text-aware form: a text field turns a click into a caret index by
+        // shaping the string, and the shaping cache makes that a lookup rather
+        // than work.
+        self.tree.dispatch_with_text(event, &mut self.text)
     }
 
     /// True when a repaint is needed.

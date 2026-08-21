@@ -406,15 +406,15 @@ mod tests {
 
     #[test]
     fn a_high_dpi_display_keeps_small_logical_text_on_the_field_path() {
-        // 10 logical px at 2x is 20 device px, which is comfortably above the
-        // resolution floor. Choosing on the logical size alone would wrongly
-        // send crisp HiDPI text down the bitmap path.
+        // 13 logical px at 2x is 26 device px, where the field is minified only
+        // 1.9x and reconstructs correctly. Choosing on the logical size alone
+        // would wrongly send crisp HiDPI text down the bitmap path.
         let Some((mut system, font)) = with_font() else {
             eprintln!("no system font; skipping");
             return;
         };
         let Some(glyph) = system.fonts().glyph_index(font, 'o') else { return };
-        let p = system.place_glyph(request(font, glyph, 10.0, 2.0)).expect("10 px at 2x");
+        let p = system.place_glyph(request(font, glyph, 13.0, 2.0)).expect("13 px at 2x");
         assert!(!p.is_bitmap, "HiDPI small text was sent to the bitmap fallback");
     }
 

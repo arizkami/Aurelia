@@ -14,6 +14,7 @@ sphere-render.workspace = true
 sphere-layout.workspace = true
 sphere-text.workspace = true
 sphere-platform.workspace = true
+unicode-segmentation.workspace = true
 smallvec.workspace = true
 rustc-hash.workspace = true
 bitflags.workspace = true
