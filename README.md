@@ -1,3 +1,7 @@
+<img width="2542" height="1696" alt="image" src="https://github.com/user-attachments/assets/091e0d6c-9b7b-4d34-8498-9038d8e428c1" />
+
+---
+
 # SphereKit
 
 > SphereKit is a GPU-first graphics and UI engine written in Rust for realtime creative
