@@ -134,25 +134,81 @@ pub struct GlyphKey {
     /// whole point of MTSDF, and caching one field per size would defeat it.
     /// Nonzero only for the small-size bitmap fallback.
     pub bitmap_size: u16,
+    /// Pixel format this key was rasterised into.
+    ///
+    /// Grayscale and RGB-subpixel coverage of the same outline are different
+    /// images and must never alias in the atlas.
+    pub format: GlyphFormat,
+    /// Quarter-pixel horizontal phase, in `0..=3`.
+    ///
+    /// Distance fields are position-independent and always use zero. Bitmap
+    /// rasterisation applies this offset before snapping the ink box, so each
+    /// nonzero phase names a distinct cached image.
+    pub subpixel_phase: u8,
 }
 
 impl GlyphKey {
     /// A key for a size-independent distance field.
     #[inline]
     pub fn mtsdf(font: FontId, glyph: GlyphId, variation_hash: u64) -> Self {
-        Self { font, glyph, variation_hash, bitmap_size: 0 }
+        Self {
+            font,
+            glyph,
+            variation_hash,
+            bitmap_size: 0,
+            format: GlyphFormat::Mtsdf,
+            subpixel_phase: 0,
+        }
     }
 
     /// A key for a size-specific grayscale bitmap.
     #[inline]
     pub fn bitmap(font: FontId, glyph: GlyphId, variation_hash: u64, size_px: u16) -> Self {
-        Self { font, glyph, variation_hash, bitmap_size: size_px.max(1) }
+        Self::bitmap_with_phase(font, glyph, variation_hash, size_px, 0)
+    }
+
+    /// A key for a size-specific grayscale bitmap at a quarter-pixel phase.
+    #[inline]
+    pub fn bitmap_with_phase(
+        font: FontId,
+        glyph: GlyphId,
+        variation_hash: u64,
+        size_px: u16,
+        subpixel_phase: u8,
+    ) -> Self {
+        Self {
+            font,
+            glyph,
+            variation_hash,
+            bitmap_size: size_px.max(1),
+            format: GlyphFormat::Grayscale,
+            subpixel_phase: subpixel_phase.min(3),
+        }
+    }
+
+    /// A key for size-specific RGB subpixel coverage at a quarter-pixel phase.
+    #[inline]
+    pub fn subpixel_bitmap(
+        font: FontId,
+        glyph: GlyphId,
+        variation_hash: u64,
+        size_px: u16,
+        subpixel_phase: u8,
+    ) -> Self {
+        Self {
+            font,
+            glyph,
+            variation_hash,
+            bitmap_size: size_px.max(1),
+            format: GlyphFormat::Subpixel,
+            subpixel_phase: subpixel_phase.min(3),
+        }
     }
 
     /// True when this key names a distance field rather than a bitmap.
     #[inline]
     pub fn is_mtsdf(self) -> bool {
-        self.bitmap_size == 0
+        self.format == GlyphFormat::Mtsdf
     }
 }
 
@@ -163,6 +219,8 @@ pub enum GlyphFormat {
     Mtsdf,
     /// One channel of coverage.
     Grayscale,
+    /// Three channels of independently filtered RGB-stripe coverage.
+    Subpixel,
     /// Full color, for emoji.
     ColorBitmap,
 }
@@ -174,6 +232,7 @@ impl GlyphFormat {
         match self {
             GlyphFormat::Mtsdf | GlyphFormat::ColorBitmap => 4,
             GlyphFormat::Grayscale => 1,
+            GlyphFormat::Subpixel => 3,
         }
     }
 }
@@ -573,6 +632,19 @@ mod tests {
     }
 
     #[test]
+    fn bitmap_phase_and_format_are_part_of_the_cache_key() {
+        let gray0 = GlyphKey::bitmap_with_phase(fid(0), GlyphId(5), 0, 12, 0);
+        let gray1 = GlyphKey::bitmap_with_phase(fid(0), GlyphId(5), 0, 12, 1);
+        let rgb1 = GlyphKey::subpixel_bitmap(fid(0), GlyphId(5), 0, 12, 1);
+        assert_ne!(gray0, gray1, "quarter-pixel positions need separate bitmaps");
+        assert_ne!(gray1, rgb1, "grayscale and RGB coverage must not alias");
+        assert_eq!(GlyphKey::subpixel_bitmap(fid(0), GlyphId(5), 0, 12, 9).subpixel_phase, 3);
+        assert_eq!(GlyphKey::mtsdf(fid(0), GlyphId(5), 0).subpixel_phase, 0);
+        assert!(GlyphKey::mtsdf(fid(0), GlyphId(5), 0).is_mtsdf());
+        assert!(!rgb1.is_mtsdf());
+    }
+
+    #[test]
     fn metrics_scale_linearly() {
         let m = FontMetrics {
             ascent: 0.8,
@@ -592,6 +664,7 @@ mod tests {
     fn glyph_format_pixel_sizes() {
         assert_eq!(GlyphFormat::Mtsdf.bytes_per_pixel(), 4);
         assert_eq!(GlyphFormat::Grayscale.bytes_per_pixel(), 1);
+        assert_eq!(GlyphFormat::Subpixel.bytes_per_pixel(), 3);
     }
 
     #[test]

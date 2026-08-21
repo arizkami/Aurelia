@@ -105,14 +105,15 @@ const MAX_PAGE_SIZE: u32 = 16384;
 const MAX_DIRTY_BANDS: usize = 16;
 
 /// Number of distinct [`GlyphFormat`] page sets.
-const FORMAT_COUNT: usize = 3;
+const FORMAT_COUNT: usize = 4;
 
 #[inline]
 fn format_index(f: GlyphFormat) -> usize {
     match f {
         GlyphFormat::Mtsdf => 0,
         GlyphFormat::Grayscale => 1,
-        GlyphFormat::ColorBitmap => 2,
+        GlyphFormat::Subpixel => 2,
+        GlyphFormat::ColorBitmap => 3,
     }
 }
 
@@ -589,7 +590,7 @@ impl GlyphAtlas {
         Self {
             config: config.sanitized(),
             pages: Vec::new(),
-            sets: [Vec::new(), Vec::new(), Vec::new()],
+            sets: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             residency: FxHashMap::default(),
             frame: 0,
             generation: 0,
@@ -1453,11 +1454,16 @@ mod tests {
         let mut atlas = small_atlas(64, 4);
         let a = atlas.insert(key(0), &gray(8, 8)).expect("fits");
         let b = atlas.insert(key(1), &img(8, 8, GlyphFormat::Mtsdf, 0x11)).expect("fits");
+        let c = atlas.insert(key(2), &img(8, 8, GlyphFormat::Subpixel, 0x22)).expect("fits");
         assert_ne!(a.page, b.page, "an R8 and an RGBA8 glyph cannot share storage");
+        assert_ne!(a.page, c.page, "an R8 and an RGB8 glyph cannot share storage");
+        assert_ne!(b.page, c.page, "an RGBA8 and an RGB8 glyph cannot share storage");
         assert_eq!(atlas.page_format(a.page), Some(GlyphFormat::Grayscale));
         assert_eq!(atlas.page_format(b.page), Some(GlyphFormat::Mtsdf));
+        assert_eq!(atlas.page_format(c.page), Some(GlyphFormat::Subpixel));
+        assert_eq!(atlas.page_pixels(c.page).unwrap().len(), 64 * 64 * 3);
         // The per-format limit is per-format, so both sets can be full at once.
-        assert_eq!(atlas.page_count(), 2);
+        assert_eq!(atlas.page_count(), 3);
     }
 
     #[test]
@@ -1984,6 +1990,7 @@ mod tests {
         assert_eq!(AtlasConfig::default().clamped_to_device(16384).page_size, 2048);
         assert_eq!(AtlasConfig::default().page_bytes(GlyphFormat::Mtsdf), 2048 * 2048 * 4);
         assert_eq!(AtlasConfig::default().page_bytes(GlyphFormat::Grayscale), 2048 * 2048);
+        assert_eq!(AtlasConfig::default().page_bytes(GlyphFormat::Subpixel), 2048 * 2048 * 3);
     }
 
     #[test]

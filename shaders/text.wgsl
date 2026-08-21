@@ -13,6 +13,7 @@
 const BITMAP: u32 = 1u;
 const OUTLINE: u32 = 2u;
 const CLIP_ROUNDED: u32 = 4u;
+const SUBPIXEL: u32 = 8u;
 
 @group(1) @binding(0) var glyph_atlas: texture_2d<f32>;
 @group(1) @binding(1) var glyph_sampler: sampler;

@@ -150,6 +150,13 @@ pub struct BackendCapabilities {
     pub offscreen_targets: bool,
     /// Whether compute shaders are available, used by the faster blur path.
     pub compute: bool,
+    /// Whether the backend can use two fragment outputs as independent blend
+    /// sources.
+    ///
+    /// RGB subpixel text uses the first source for premultiplied colour and the
+    /// second for per-channel coverage. Backends without this feature must
+    /// compile those glyphs through the grayscale text path instead.
+    pub dual_source_blending: bool,
     /// Maximum number of instances in a single draw call.
     pub max_instances_per_draw: u32,
     /// The highest multisample count the surface format actually supports.
@@ -163,6 +170,7 @@ impl Default for BackendCapabilities {
             timestamp_queries: false,
             offscreen_targets: true,
             compute: false,
+            dual_source_blending: false,
             max_instances_per_draw: u32::MAX,
             max_msaa_samples: 1,
         }

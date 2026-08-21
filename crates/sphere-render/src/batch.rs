@@ -60,6 +60,18 @@ pub struct GlyphRequest {
     pub device_scale: f32,
     /// The caller's rasterisation preference.
     pub mode: TextRasterMode,
+    /// Whether an RGB-stripe subpixel bitmap may be returned.
+    ///
+    /// This is only set for direct rendering to an opaque surface with a
+    /// translation-only transform and a backend that supports dual-source
+    /// blending. Providers must fall back to grayscale for bitmap glyphs when
+    /// it is false.
+    pub subpixel: bool,
+    /// Quarter-pixel horizontal raster phase in `0..=3`.
+    ///
+    /// Bitmap providers include this in their cache key and offset the outline
+    /// by `subpixel_phase / 4` before rasterisation. Distance fields ignore it.
+    pub subpixel_phase: u8,
 }
 
 /// Where a glyph lives in the atlas and how to draw it.
@@ -73,8 +85,14 @@ pub struct GlyphPlacement {
     pub bounds_em: [f32; 4],
     /// The distance field's range in em units. Zero for a bitmap.
     pub range_em: f32,
-    /// True when the placement is a grayscale bitmap rather than a field.
+    /// True when the placement is a size-specific coverage bitmap rather than
+    /// a distance field. This includes grayscale and RGB subpixel bitmaps.
     pub is_bitmap: bool,
+    /// True when the bitmap stores independent RGB subpixel coverage.
+    ///
+    /// This implies [`GlyphPlacement::is_bitmap`] and selects the dual-source
+    /// text pipeline.
+    pub is_subpixel: bool,
     /// The glyph's size in atlas texels.
     ///
     /// A bitmap glyph is only crisp when its quad covers exactly this many
@@ -100,9 +118,12 @@ pub enum BatchKind {
     Glyph {
         /// The atlas page this batch samples.
         page: u32,
-        /// True when the page holds grayscale bitmaps rather than distance
+        /// True when the page holds coverage bitmaps rather than distance
         /// fields, which the shader needs to know.
         bitmap: bool,
+        /// True when this page stores RGB subpixel coverage and therefore needs
+        /// the dual-source blend pipeline.
+        subpixel: bool,
     },
     /// Textured quads.
     Image {
@@ -258,6 +279,12 @@ pub struct BatchCompiler {
     current_batch: Option<OpenBatch>,
     pass_start: u32,
     time: f32,
+    /// Whether the final surface can accept RGB subpixel coverage.
+    ///
+    /// Defaults off so non-wgpu and test backends degrade safely. The surface
+    /// integration enables it only for an opaque target backed by a device with
+    /// dual-source blending.
+    subpixel_text_enabled: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -314,12 +341,21 @@ impl BatchCompiler {
             current_batch: None,
             pass_start: 0,
             time: 0.0,
+            subpixel_text_enabled: false,
         }
     }
 
     /// Sets the animation clock handed to shaders via [`FrameUniforms::time`].
     pub fn set_time(&mut self, seconds: f32) {
         self.time = seconds;
+    }
+
+    /// Enables RGB subpixel text on eligible direct-to-surface glyph runs.
+    ///
+    /// Eligibility is checked again per run: offscreen layers and transforms
+    /// other than a translation always use grayscale coverage.
+    pub fn set_subpixel_text_enabled(&mut self, enabled: bool) {
+        self.subpixel_text_enabled = enabled;
     }
 
     /// The most recently compiled frame.
@@ -794,14 +830,37 @@ impl BatchCompiler {
         let affine = scene.transform(transform);
         let snappable = affine.is_translation_only();
         let translation = affine.translation();
+        // RGB coverage is tied to the physical stripes of the final opaque
+        // surface. An intermediate texture would collapse those three coverage
+        // values into ordinary RGBA before its opacity/filter/transform is
+        // known, producing coloured fringes when it is composited later.
+        let allow_subpixel = self.subpixel_text_enabled
+            && self.target_stack.is_empty()
+            && snappable
+            // The RGB coverage bitmap has no signed-distance information from
+            // which the text shader could reconstruct a synthetic outline.
+            && !outline;
 
         for g in &run.glyphs {
+            // Split the device-space pen into an integral placement plus one of
+            // four cached raster phases. The outline is shifted by the phase in
+            // the provider while the resulting bitmap is drawn at the integral
+            // pen, so the fractional position is applied exactly once.
+            let (bitmap_pen_x, subpixel_phase) = if snappable && scale > 0.0 {
+                let device_pen = (g.position.x.get() + translation.width.get()) * scale;
+                let (integral, phase) = quarter_pixel_bin(device_pen);
+                (Px(integral as f32 / scale - translation.width.get()), phase)
+            } else {
+                (g.position.x, 0)
+            };
             let Some(p) = provider.place_glyph(GlyphRequest {
                 font: run.font,
                 glyph: g.glyph,
                 font_size: run.font_size,
                 device_scale: scale,
                 mode: run.raster,
+                subpixel: allow_subpixel,
+                subpixel_phase,
             }) else {
                 continue;
             };
@@ -818,10 +877,12 @@ impl BatchCompiler {
             // letter -- while its advance stays correct, so a line comes out
             // small and tracked out. `range_em` is zero for a bitmap, so one
             // unconditional outset is right for both paths.
+            debug_assert!(!p.is_subpixel || p.is_bitmap);
             let pad = p.range_em * size;
+            let pen_x = if p.is_bitmap { bitmap_pen_x } else { g.position.x };
             let mut bounds = Rect::new(
                 Point::new(
-                    Px(g.position.x.get() + p.bounds_em[0] * size - pad),
+                    Px(pen_x.get() + p.bounds_em[0] * size - pad),
                     Px(g.position.y.get() + p.bounds_em[1] * size - pad),
                 ),
                 Size::new(
@@ -847,8 +908,15 @@ impl BatchCompiler {
             if rc.needs_shader_clip {
                 flags |= glyph_flags::CLIP_ROUNDED;
             }
+            if p.is_subpixel {
+                flags |= glyph_flags::SUBPIXEL;
+            }
 
-            self.push_instance(BatchKind::Glyph { page: p.page, bitmap: p.is_bitmap }, scissor, 1);
+            self.push_instance(
+                BatchKind::Glyph { page: p.page, bitmap: p.is_bitmap, subpixel: p.is_subpixel },
+                scissor,
+                1,
+            );
             self.frame.glyphs.push(GlyphInstance {
                 bounds: [
                     bounds.min_x().get(),
@@ -1163,6 +1231,20 @@ fn snap_glyph_quad(
     Rect::new(Point::new(bounds.min_x(), Px(bounds.min_y().get() + dy)), bounds.size)
 }
 
+/// Quantises a horizontal device-space pen to the nearest quarter pixel.
+///
+/// Returning the integral part separately is important for negative positions:
+/// `-0.25` is represented as `(-1, 3)`, not `(0, -1)`. Exact eighth-pixel ties
+/// round away from zero, matching Rust's `f32::round` and the established egui
+/// binning convention.
+fn quarter_pixel_bin(position: f32) -> (i32, u8) {
+    if !position.is_finite() {
+        return (0, 0);
+    }
+    let quarters = (position * 4.0).round() as i32;
+    (quarters.div_euclid(4), quarters.rem_euclid(4) as u8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1185,6 +1267,7 @@ mod tests {
                 bounds_em: [0.0, -0.8, 0.6, 0.8],
                 range_em: 0.1,
                 is_bitmap: false,
+                is_subpixel: false,
                 texel_size: [24, 32],
             })
         }
@@ -1506,6 +1589,7 @@ mod tests {
                 bounds_em: [0.0, top, 0.6, -top],
                 range_em: 0.1,
                 is_bitmap: false,
+                is_subpixel: false,
                 texel_size: [24, 32],
             })
         }
@@ -1522,7 +1606,31 @@ mod tests {
                 bounds_em: [0.13, -0.61, 0.37, 0.72],
                 range_em: 0.0,
                 is_bitmap: true,
+                is_subpixel: false,
                 texel_size: [4, 8],
+            })
+        }
+    }
+
+    /// Mirrors the compiler's subpixel request into the placement so tests can
+    /// observe both the request-side eligibility guard and the batch it selects.
+    #[derive(Default)]
+    struct EchoSubpixelGlyphs {
+        requests: Vec<GlyphRequest>,
+    }
+
+    impl GlyphProvider for EchoSubpixelGlyphs {
+        fn place_glyph(&mut self, request: GlyphRequest) -> Option<GlyphPlacement> {
+            let is_subpixel = request.subpixel;
+            self.requests.push(request);
+            Some(GlyphPlacement {
+                page: u32::from(is_subpixel),
+                uv: [0.0, 0.0, 0.1, 0.1],
+                bounds_em: [0.0, -0.75, 0.5, 0.75],
+                range_em: 0.0,
+                is_bitmap: true,
+                is_subpixel,
+                texel_size: [6, 9],
             })
         }
     }
@@ -1564,6 +1672,88 @@ mod tests {
         assert_eq!(g.bounds[1].fract(), 0.0, "y was not snapped: {}", g.bounds[1]);
         assert_eq!(g.bounds[2], 4.0, "width must equal the texel count exactly");
         assert_eq!(g.bounds[3], 8.0, "height must equal the texel count exactly");
+    }
+
+    #[test]
+    fn quarter_pixel_bins_round_consistently_on_both_sides_of_zero() {
+        assert_eq!(quarter_pixel_bin(10.12), (10, 0));
+        assert_eq!(quarter_pixel_bin(10.13), (10, 1));
+        assert_eq!(quarter_pixel_bin(10.49), (10, 2));
+        assert_eq!(quarter_pixel_bin(10.76), (10, 3));
+        assert_eq!(quarter_pixel_bin(10.99), (11, 0));
+        assert_eq!(quarter_pixel_bin(-0.12), (0, 0));
+        assert_eq!(quarter_pixel_bin(-0.13), (-1, 3));
+        assert_eq!(quarter_pixel_bin(-0.49), (-1, 2));
+        assert_eq!(quarter_pixel_bin(-0.76), (-1, 1));
+        assert_eq!(quarter_pixel_bin(-0.99), (-1, 0));
+    }
+
+    #[test]
+    fn eligible_bitmap_text_requests_rgb_coverage_and_carries_its_phase() {
+        let s = glyph_run_at(10.3, 20.0, 11.0);
+        let mut compiler = BatchCompiler::new();
+        compiler.set_subpixel_text_enabled(true);
+        let mut glyphs = EchoSubpixelGlyphs::default();
+        let frame = compiler.compile(&s, &mut glyphs, &mut StubTextures(true));
+
+        assert_eq!(glyphs.requests.len(), 1);
+        assert!(glyphs.requests[0].subpixel);
+        assert_eq!(glyphs.requests[0].subpixel_phase, 1);
+        assert_ne!(frame.glyphs[0].flags & glyph_flags::SUBPIXEL, 0);
+        assert!(matches!(frame.batches[0].kind, BatchKind::Glyph { subpixel: true, .. }));
+        // The phase is baked into the cached bitmap. Its quad remains aligned
+        // 1:1 with atlas texels rather than being translated by the phase again.
+        assert_eq!(frame.glyphs[0].bounds[0].fract(), 0.0);
+    }
+
+    #[test]
+    fn rgb_coverage_is_disabled_inside_an_offscreen_layer() {
+        let mut s = scene();
+        {
+            let mut canvas = Canvas::new(&mut s);
+            canvas.push_opacity_layer(rect(px(0.0), px(0.0), px(100.0), px(100.0)), 0.5);
+            canvas.draw_glyph_run(
+                crate::scene::GlyphRun {
+                    font: FontId::new(0, 1),
+                    font_size: px(11.0),
+                    glyphs: smallvec::smallvec![crate::scene::PositionedGlyph {
+                        glyph: GlyphId(1),
+                        position: Point::new(px(10.3), px(20.0)),
+                    }],
+                    raster: TextRasterMode::Bitmap,
+                    outline_width: Px::ZERO,
+                    outline_color: Color::TRANSPARENT,
+                    coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
+                },
+                Color::WHITE,
+            );
+            canvas.end_layer();
+        }
+
+        let mut compiler = BatchCompiler::new();
+        compiler.set_subpixel_text_enabled(true);
+        let mut glyphs = EchoSubpixelGlyphs::default();
+        compiler.compile(&s, &mut glyphs, &mut StubTextures(true));
+
+        assert_eq!(glyphs.requests.len(), 1);
+        assert!(!glyphs.requests[0].subpixel);
+        // Quarter positioning is safe for grayscale and remains enabled.
+        assert_eq!(glyphs.requests[0].subpixel_phase, 1);
+    }
+
+    #[test]
+    fn outlined_text_does_not_request_an_rgb_coverage_bitmap() {
+        let mut s = glyph_run_at(10.3, 20.0, 11.0);
+        s.runs[0].outline_width = px(1.0);
+        s.runs[0].outline_color = Color::BLACK;
+
+        let mut compiler = BatchCompiler::new();
+        compiler.set_subpixel_text_enabled(true);
+        let mut glyphs = EchoSubpixelGlyphs::default();
+        compiler.compile(&s, &mut glyphs, &mut StubTextures(true));
+
+        assert_eq!(glyphs.requests.len(), 1);
+        assert!(!glyphs.requests[0].subpixel);
     }
 
     #[test]

@@ -82,6 +82,20 @@ pub const BITMAP_MAX_DEVICE_PX: f32 = 24.0;
 /// segments as the sloppier tenth-of-a-pixel tolerance rasterisers often use.
 const FLATTEN_TOLERANCE_PX: f32 = 0.02;
 
+/// FreeType's default five-tap LCD filter, normalised to 256.
+///
+/// Filtering neighbouring colour samples suppresses the colour fringes that a
+/// raw three-times-horizontal coverage mask would otherwise show at every
+/// vertical edge. The two-sample radius is accounted for in the ink-box padding
+/// below, so no filtered coverage is clipped.
+const LCD_FILTER_WEIGHTS: [u16; 5] = [0x08, 0x4d, 0x56, 0x4d, 0x08];
+
+/// Three RGB stripe samples per device pixel.
+const LCD_HORIZONTAL_SCALE: f32 = 3.0;
+
+/// The five-tap filter reaches two high-resolution samples in either direction.
+const LCD_FILTER_RADIUS_PX: f32 = 2.0 / LCD_HORIZONTAL_SCALE;
+
 /// Which rasterisation path a glyph should take.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RasterStrategy {
@@ -304,6 +318,25 @@ pub fn rasterize_shape(shape: &Shape, size_px: f32) -> GlyphImage {
     rasterize_shape_fitted(shape, size_px, None)
 }
 
+/// Rasterises grayscale coverage at one of four quarter-pixel x positions.
+///
+/// `subpixel_phase` is clamped to `0..=3` and represents `phase / 4` of a
+/// device pixel. The offset is applied before the ink box is floored; the
+/// returned `bounds_em.x` deliberately retains that floored coordinate so a
+/// renderer can draw the bitmap relative to an integer pen position.
+pub fn rasterize_shape_at_phase(shape: &Shape, size_px: f32, subpixel_phase: u8) -> GlyphImage {
+    rasterize_shape_fitted_for_format(shape, size_px, None, GlyphFormat::Grayscale, subpixel_phase)
+}
+
+/// Rasterises RGB-stripe subpixel coverage at a quarter-pixel x position.
+///
+/// The outline is rasterised at three times horizontal resolution, passed
+/// through the default five-tap LCD filter, then stored as interleaved RGB
+/// coverage. The output remains one atlas texel per device pixel.
+pub fn rasterize_shape_subpixel(shape: &Shape, size_px: f32, subpixel_phase: u8) -> GlyphImage {
+    rasterize_shape_fitted_for_format(shape, size_px, None, GlyphFormat::Subpixel, subpixel_phase)
+}
+
 /// Rasterises an outline with an optional vertical grid fit.
 ///
 /// The fit is applied to the *flattened* polylines rather than to the curve
@@ -312,7 +345,19 @@ pub fn rasterize_shape(shape: &Shape, size_px: f32) -> GlyphImage {
 /// flattened vertices is exact for the geometry actually rasterised, and the
 /// flattening tolerance was already chosen against the pixel grid.
 pub fn rasterize_shape_fitted(shape: &Shape, size_px: f32, fit: Option<&GridFit>) -> GlyphImage {
-    let empty = GlyphImage::empty(GlyphFormat::Grayscale);
+    rasterize_shape_fitted_for_format(shape, size_px, fit, GlyphFormat::Grayscale, 0)
+}
+
+/// Shared grayscale/RGB bitmap rasterisation.
+fn rasterize_shape_fitted_for_format(
+    shape: &Shape,
+    size_px: f32,
+    fit: Option<&GridFit>,
+    format: GlyphFormat,
+    subpixel_phase: u8,
+) -> GlyphImage {
+    debug_assert!(matches!(format, GlyphFormat::Grayscale | GlyphFormat::Subpixel));
+    let empty = GlyphImage::empty(format);
     if shape.is_empty() || !size_px.is_finite() || size_px <= 0.0 {
         return empty;
     }
@@ -332,8 +377,10 @@ pub fn rasterize_shape_fitted(shape: &Shape, size_px: f32, fit: Option<&GridFit>
     // Only `y` goes through the fit, and only a fitted `y` has a round trip to
     // undo, so the unfitted path keeps the exact `floor`/`ceil` it always had.
     // `x` is a raw outline coordinate on both paths and is untouched.
-    let x0 = (ink.min_x() * size_px).floor();
-    let x1 = (ink.max_x() * size_px).ceil();
+    let phase_px = f32::from(subpixel_phase.min(3)) * 0.25;
+    let filter_radius = if format == GlyphFormat::Subpixel { LCD_FILTER_RADIUS_PX } else { 0.0 };
+    let x0 = (ink.min_x() * size_px + phase_px - filter_radius).floor();
+    let x1 = (ink.max_x() * size_px + phase_px + filter_radius).ceil();
     let (y0, y1) = match fit {
         Some(_) => (snap_out(ink_top * size_px, false), snap_out(ink_bottom * size_px, true)),
         None => ((ink_top * size_px).floor(), (ink_bottom * size_px).ceil()),
@@ -349,8 +396,13 @@ pub fn rasterize_shape_fitted(shape: &Shape, size_px: f32, fit: Option<&GridFit>
         return empty;
     }
 
-    let mut rasterizer = Rasterizer::new(width as u32, height as u32);
-    let tolerance = FLATTEN_TOLERANCE_PX / size_px;
+    let horizontal_scale = if format == GlyphFormat::Subpixel { LCD_HORIZONTAL_SCALE } else { 1.0 };
+    let raster_width = width * horizontal_scale;
+    if raster_width > 4096.0 * LCD_HORIZONTAL_SCALE {
+        return empty;
+    }
+    let mut rasterizer = Rasterizer::new(raster_width as u32, height as u32);
+    let tolerance = FLATTEN_TOLERANCE_PX / (size_px * horizontal_scale);
     let mut buffer: Vec<Point<f32>> = Vec::new();
     for polyline in shape.flatten(tolerance) {
         buffer.clear();
@@ -359,16 +411,23 @@ pub fn rasterize_shape_fitted(shape: &Shape, size_px: f32, fit: Option<&GridFit>
                 Some(f) => f.apply(p.y),
                 None => p.y,
             };
-            Point::new(p.x * size_px - x0, y * size_px - y0)
+            Point::new((p.x * size_px + phase_px - x0) * horizontal_scale, y * size_px - y0)
         }));
         rasterizer.add_polyline(&buffer);
     }
 
+    let coverage = rasterizer.coverage();
+    let data = if format == GlyphFormat::Subpixel {
+        filter_lcd_coverage(&coverage, raster_width as u32, height as u32)
+    } else {
+        coverage
+    };
+
     GlyphImage {
         width: width as u32,
         height: height as u32,
-        format: GlyphFormat::Grayscale,
-        data: rasterizer.coverage(),
+        format,
+        data,
         bounds_em: Rect::new(
             Point::new(x0 / size_px, y0 / size_px),
             Size::new(width / size_px, height / size_px),
@@ -376,6 +435,27 @@ pub fn rasterize_shape_fitted(shape: &Shape, size_px: f32, fit: Option<&GridFit>
         // Coverage is not a distance field; there is no range to travel with it.
         range_em: 0.0,
     }
+}
+
+/// Applies the LCD FIR independently to each row of a 3x-horizontal mask.
+fn filter_lcd_coverage(coverage: &[u8], width: u32, height: u32) -> Vec<u8> {
+    debug_assert_eq!(coverage.len(), width as usize * height as usize);
+    let width = width as usize;
+    let mut filtered = vec![0; coverage.len()];
+    for y in 0..height as usize {
+        let row = y * width;
+        for x in 0..width {
+            let mut sum = 0u32;
+            for (tap, &weight) in LCD_FILTER_WEIGHTS.iter().enumerate() {
+                let source_x = x as isize + tap as isize - 2;
+                if (0..width as isize).contains(&source_x) {
+                    sum += u32::from(coverage[row + source_x as usize]) * u32::from(weight);
+                }
+            }
+            filtered[row + x] = ((sum + 128) >> 8).min(255) as u8;
+        }
+    }
+    filtered
 }
 
 /// Rounds one ink-box edge outward, tolerating a value that is already a whole
@@ -418,6 +498,38 @@ pub fn rasterize_glyph(
     rasterize_glyph_with_zones(face, glyph, size_px, VerticalZones::from_face(face))
 }
 
+/// Rasterises one glyph as grayscale coverage at a quarter-pixel x position.
+pub fn rasterize_glyph_at_phase(
+    face: &ttf_parser::Face<'_>,
+    glyph: GlyphId,
+    size_px: f32,
+    subpixel_phase: u8,
+) -> Result<GlyphImage, FontError> {
+    rasterize_glyph_with_zones_at_phase(
+        face,
+        glyph,
+        size_px,
+        subpixel_phase,
+        VerticalZones::from_face(face),
+    )
+}
+
+/// Rasterises one glyph as filtered RGB-stripe coverage.
+pub fn rasterize_glyph_subpixel(
+    face: &ttf_parser::Face<'_>,
+    glyph: GlyphId,
+    size_px: f32,
+    subpixel_phase: u8,
+) -> Result<GlyphImage, FontError> {
+    rasterize_glyph_subpixel_with_zones(
+        face,
+        glyph,
+        size_px,
+        subpixel_phase,
+        VerticalZones::from_face(face),
+    )
+}
+
 /// Rasterises one glyph with zones the caller has already measured.
 ///
 /// The zones cost five to twelve microseconds to read and do not depend on the
@@ -436,6 +548,46 @@ pub fn rasterize_glyph_with_zones(
     // which is size-independent and therefore has no single size to fit to.
     let fit = zones.and_then(|z| GridFit::new(&z, size_px));
     Ok(rasterize_shape_fitted(&shape, size_px, fit.as_ref()))
+}
+
+/// Rasterises one glyph as grayscale coverage with cached vertical zones and a
+/// quarter-pixel horizontal phase.
+pub fn rasterize_glyph_with_zones_at_phase(
+    face: &ttf_parser::Face<'_>,
+    glyph: GlyphId,
+    size_px: f32,
+    subpixel_phase: u8,
+    zones: Option<VerticalZones>,
+) -> Result<GlyphImage, FontError> {
+    let shape = extract_shape(face, glyph)?;
+    let fit = zones.and_then(|z| GridFit::new(&z, size_px));
+    Ok(rasterize_shape_fitted_for_format(
+        &shape,
+        size_px,
+        fit.as_ref(),
+        GlyphFormat::Grayscale,
+        subpixel_phase,
+    ))
+}
+
+/// Rasterises one glyph as filtered RGB-stripe coverage with cached vertical
+/// zones and a quarter-pixel horizontal phase.
+pub fn rasterize_glyph_subpixel_with_zones(
+    face: &ttf_parser::Face<'_>,
+    glyph: GlyphId,
+    size_px: f32,
+    subpixel_phase: u8,
+    zones: Option<VerticalZones>,
+) -> Result<GlyphImage, FontError> {
+    let shape = extract_shape(face, glyph)?;
+    let fit = zones.and_then(|z| GridFit::new(&z, size_px));
+    Ok(rasterize_shape_fitted_for_format(
+        &shape,
+        size_px,
+        fit.as_ref(),
+        GlyphFormat::Subpixel,
+        subpixel_phase,
+    ))
 }
 
 #[cfg(test)]
@@ -650,6 +802,53 @@ mod tests {
         assert!(img.bounds_em.min_x() <= 0.13 && img.bounds_em.max_x() >= 0.61);
         assert_eq!(img.width, (img.bounds_em.size.width * size).round() as u32);
         assert_eq!(img.height, (img.bounds_em.size.height * size).round() as u32);
+    }
+
+    #[test]
+    fn grayscale_quarter_phase_moves_the_outline_before_snapping_bounds() {
+        let square = Shape::from_polygon(&[p(0.0, 0.0), p(0.0, 1.0), p(0.5, 1.0), p(0.5, 0.0)]);
+        let zero = rasterize_shape_at_phase(&square, 8.0, 0);
+        let quarter = rasterize_shape_at_phase(&square, 8.0, 1);
+        let three_quarters = rasterize_shape_at_phase(&square, 8.0, 3);
+
+        assert_eq!((zero.width, quarter.width, three_quarters.width), (4, 5, 5));
+        assert_eq!(quarter.bounds_em.min_x(), 0.0);
+        assert_eq!(quarter.data[0], 191, "a quarter shift leaves 3/4 of the first pixel covered");
+        assert_eq!(three_quarters.data[0], 64);
+        assert_eq!(
+            rasterize_shape_at_phase(&square, 8.0, u8::MAX),
+            three_quarters,
+            "invalid phases clamp to the final quarter bin"
+        );
+    }
+
+    #[test]
+    fn default_lcd_filter_has_the_freetype_five_tap_impulse_response() {
+        assert_eq!(LCD_FILTER_WEIGHTS.iter().sum::<u16>(), 256);
+        let mut impulse = vec![0; 7];
+        impulse[3] = 255;
+        assert_eq!(filter_lcd_coverage(&impulse, 7, 1), [0, 8, 77, 86, 77, 8, 0]);
+    }
+
+    #[test]
+    fn subpixel_raster_is_rgb_interleaved_and_keeps_filter_padding() {
+        let square = Shape::from_polygon(&[p(0.0, 0.0), p(0.0, 1.0), p(0.5, 1.0), p(0.5, 0.0)]);
+        let img = rasterize_shape_subpixel(&square, 8.0, 0);
+
+        // Four pixels of ink plus a one-pixel guard on either side for the
+        // two-subpixel filter radius.
+        assert_eq!((img.width, img.height), (6, 8));
+        assert_eq!(img.format, GlyphFormat::Subpixel);
+        assert_eq!(img.data.len(), (img.width * img.height * 3) as usize);
+        assert_eq!(img.bounds_em.min_x(), -1.0 / 8.0);
+        assert!(img.data[..3].iter().any(|&v| v != 0), "left filter tail was clipped");
+        let right = (img.width as usize - 1) * 3;
+        assert!(
+            img.data[right..right + 3].iter().any(|&v| v != 0),
+            "right filter tail was clipped"
+        );
+        // A pixel well inside the stem has equal, fully covered RGB channels.
+        assert_eq!(&img.data[2 * 3..3 * 3], &[255, 255, 255]);
     }
 
     #[test]

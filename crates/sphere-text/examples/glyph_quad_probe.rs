@@ -1,14 +1,16 @@
 //! Renders one line of text twice — distance field on the left, whatever the
-//! automatic strategy picks on the right — and writes the pair to a PNG.
+//! automatic strategy picks with RGB subpixel coverage enabled on the right —
+//! and writes the pair to a PNG.
 //!
 //! This is a probe, not a test: it needs system fonts, which CI does not have.
 //! It exists so the claims in `docs/text.md` about which rasterisation path is
 //! sharp at which size are a picture and a measurement rather than an assertion.
 //!
-//! **It re-implements `text.wgsl` on the CPU.** The sampling, the median, the
-//! screen range and the coverage correction below are transcriptions of the
-//! shader, not captures of what the GPU produced. It shows that the geometry and
-//! the path choice handed to the GPU are right; it cannot prove the GPU agreed.
+//! **It re-implements `text.wgsl` and `text_subpixel.wgsl` on the CPU.** The
+//! sampling, the median, the screen range, the coverage correction and the
+//! per-channel dual-source blend below are transcriptions of the shaders, not
+//! captures of what the GPU produced. It shows that the geometry and the path
+//! choice handed to the GPU are right; it cannot prove the GPU agreed.
 //!
 //! It also transcribes the *blend*, which is the part that used to be wrong.
 //! Compositing happens in linear light against an sRGB surface, so this walks
@@ -32,7 +34,7 @@ use sphere_core::{Color, linear_to_srgb};
 use sphere_render::batch::{GlyphPlacement, GlyphProvider, GlyphRequest};
 use sphere_render::scene::{TextRasterMode, alpha_from_coverage, coverage_contrast_for};
 use sphere_text::raster::{BITMAP_MAX_DEVICE_PX, choose_raster_strategy};
-use sphere_text::{GlyphFormat, TextStyle, TextSystem};
+use sphere_text::{TextStyle, TextSystem};
 
 const DEFAULT_TEXT: &str = "Handgloves 0123 Preferences";
 const PAD: usize = 16;
@@ -89,6 +91,22 @@ impl Canvas {
         let a = (src.a * alpha).clamp(0.0, 1.0);
         for (k, s) in [src.r, src.g, src.b].into_iter().enumerate() {
             dst[k] = s * alpha + dst[k] * (1.0 - a);
+        }
+    }
+
+    /// The dual-source equation used by `text_subpixel.wgsl`:
+    /// `foreground + destination * (1 - coverage)` independently for R, G and
+    /// B. `Color::to_linear` is premultiplied, so the destination factor also
+    /// includes the text alpha exactly as source one does in the shader.
+    fn blend_subpixel(&mut self, x: usize, y: usize, color: Color, coverage: [f32; 3]) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let src = color.to_linear();
+        let dst = &mut self.pixels[y * self.width + x];
+        for (k, (s, c)) in [src.r, src.g, src.b].into_iter().zip(coverage).enumerate() {
+            let c = c.clamp(0.0, 1.0);
+            dst[k] = s * c + dst[k] * (1.0 - src.a * c);
         }
     }
 
@@ -196,16 +214,26 @@ fn place(
     text: &mut TextSystem,
     line: &sphere_text::TextLine,
     mode: TextRasterMode,
+    subpixel: bool,
 ) -> Vec<(f32, GlyphPlacement)> {
     let mut placed = Vec::new();
     for run in &line.runs {
         for g in &run.glyphs {
+            // Mirror the batch compiler: bake the nearest quarter-pixel
+            // remainder into the cached bitmap, then draw that bitmap at its
+            // integral pen. Distance fields ignore the phase and keep the
+            // original fractional pen.
+            let quarters = (g.position.x.get() * 4.0).round() as i32;
+            let bitmap_pen_x = quarters.div_euclid(4) as f32;
+            let subpixel_phase = quarters.rem_euclid(4) as u8;
             let Some(p) = text.place_glyph(GlyphRequest {
                 font: run.font,
                 glyph: g.glyph,
                 font_size: run.font_size,
                 device_scale: 1.0,
                 mode,
+                subpixel,
+                subpixel_phase,
             }) else {
                 continue;
             };
@@ -213,7 +241,7 @@ fn place(
                 // A zero-area placement is a space or a control character.
                 continue;
             }
-            placed.push((g.position.x.get(), p));
+            placed.push((if p.is_bitmap { bitmap_pen_x } else { g.position.x.get() }, p));
         }
     }
     placed.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -246,8 +274,12 @@ fn compare_raster(
     size: f32,
     ink: Ink,
 ) {
-    let panels =
-        [place(text, line, TextRasterMode::Mtsdf), place(text, line, TextRasterMode::Auto)];
+    let panels = [
+        place(text, line, TextRasterMode::Mtsdf, false),
+        place(text, line, TextRasterMode::Auto, true),
+    ];
+    let subpixel_glyphs = panels[1].iter().filter(|(_, p)| p.is_subpixel).count();
+    println!("subpixel:        {subpixel_glyphs} RGB glyphs in the right panel");
     let width = line.width.get().ceil() as usize + PAD * 2;
     let height = (baseline * 2.0).ceil() as usize + PAD * 2;
 
@@ -267,7 +299,13 @@ fn compare_raster(
     });
 
     let (rgba, w, h) = canvas.into_rgba(zoom());
-    save("glyph_quad_probe.png", &rgba, w, h, "left: forced MTSDF, right: what Auto chooses");
+    save(
+        "glyph_quad_probe.png",
+        &rgba,
+        w,
+        h,
+        "left: forced MTSDF, right: Auto with RGB subpixel coverage",
+    );
 }
 
 /// Uncorrected coverage against corrected: the blend-space question.
@@ -284,7 +322,7 @@ fn compare_blend(
     size: f32,
     ink: Ink,
 ) {
-    let placed = place(text, line, TextRasterMode::Auto);
+    let placed = place(text, line, TextRasterMode::Auto, true);
     let width = line.width.get().ceil() as usize + PAD * 2;
     let height = (baseline * 2.0).ceil() as usize + PAD * 2;
     let inks = [ink.uncorrected(), ink];
@@ -330,7 +368,7 @@ fn draw_glyph(
     let Some(format) = atlas.page_format(p.page) else { return };
     let Some(pixels) = atlas.page_pixels(p.page) else { return };
     let page = atlas.page_size() as usize;
-    let bpp = if format == GlyphFormat::Mtsdf { 4 } else { 1 };
+    let bpp = format.bytes_per_pixel();
 
     // The quad covers the ink box outset by the field's range. `range_em` is
     // zero on the bitmap path, so this is unconditional.
@@ -368,6 +406,16 @@ fn draw_glyph(
             let u = (p.uv[0] + (p.uv[2] - p.uv[0]) * fx) * page as f32 - 0.5;
             let v = (p.uv[1] + (p.uv[3] - p.uv[1]) * fy) * page as f32 - 0.5;
             let s = bilinear(pixels, page, bpp, u, v);
+
+            if p.is_subpixel {
+                let coverage = [
+                    alpha_from_coverage(s[0], ink.contrast),
+                    alpha_from_coverage(s[1], ink.contrast),
+                    alpha_from_coverage(s[2], ink.contrast),
+                ];
+                canvas.blend_subpixel(px + x_offset, py, ink.text, coverage);
+                continue;
+            }
 
             let coverage = if p.is_bitmap {
                 s[0]

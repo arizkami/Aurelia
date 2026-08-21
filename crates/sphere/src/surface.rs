@@ -41,6 +41,14 @@ pub struct SurfaceOptions {
     pub vsync: VsyncMode,
     /// Whether the window composites with what is behind it.
     pub transparent: bool,
+    /// Enables RGB-stripe subpixel antialiasing when the backend and draw state
+    /// can preserve it.
+    ///
+    /// This is opt-in because graphics APIs cannot report the physical panel's
+    /// stripe order or whether the display is rotated. Leave it off for BGR,
+    /// PenTile/non-striped, rotated, remotely displayed, or subsequently scaled
+    /// output; ordinary grayscale antialiasing remains available everywhere.
+    pub rgb_subpixel_text: bool,
     /// Byte budget for decoded images.
     pub image_budget_bytes: usize,
     /// Multisample count for tessellated path geometry.
@@ -63,6 +71,7 @@ impl Default for SurfaceOptions {
             present: PresentPreference::LowLatency,
             vsync: VsyncMode::On,
             transparent: false,
+            rgb_subpixel_text: false,
             image_budget_bytes: 64 * 1024 * 1024,
             msaa_samples: sphere_render::DEFAULT_MSAA_SAMPLES,
             load_system_fonts: true,
@@ -142,7 +151,8 @@ pub struct SphereSurface {
     /// The atlas generation the textures were built against. A bump means every
     /// placement was invalidated and the textures must be rebuilt.
     atlas_generation: u64,
-    /// Scratch for expanding grayscale atlas rows to RGBA, reused per frame.
+    /// Scratch for expanding compact grayscale/RGB atlas rows to RGBA, reused
+    /// per frame.
     expand_scratch: Vec<u8>,
     /// Images loaded through this surface that have no GPU texture yet.
     pending_uploads: Vec<ImageId>,
@@ -200,12 +210,23 @@ impl SphereSurface {
         // the failure appears at upload time rather than at allocation time.
         text.set_max_texture_size(renderer.capabilities().max_texture_size);
 
+        let mut compiler = BatchCompiler::new();
+        // LCD coverage is meaningful only on the final opaque surface, and its
+        // three independent destination factors require dual-source blending.
+        // The batch compiler applies the remaining per-run transform/layer
+        // guards before it asks the text system for an RGB glyph.
+        compiler.set_subpixel_text_enabled(
+            options.rgb_subpixel_text
+                && renderer.capabilities().dual_source_blending
+                && !options.transparent,
+        );
+
         let viewport =
             Size::new(scale_factor.to_logical(size.width), scale_factor.to_logical(size.height));
 
         Ok(Self {
             renderer,
-            compiler: BatchCompiler::new(),
+            compiler,
             scene: Scene::new(viewport, scale_factor),
             text,
             images: ImageCache::new(options.image_budget_bytes),
@@ -510,12 +531,23 @@ impl SphereSurface {
                     }
                     &self.expand_scratch
                 }
+                GlyphFormat::Subpixel => {
+                    expand_subpixel_region(
+                        &data,
+                        bytes_per_row,
+                        rect.origin.x,
+                        width,
+                        height,
+                        &mut self.expand_scratch,
+                    );
+                    &self.expand_scratch
+                }
             };
 
             // For an RGBA page the region spans the full page width, so the
             // rows are already contiguous and start at x = 0.
             let x = match format {
-                GlyphFormat::Grayscale => rect.origin.x,
+                GlyphFormat::Grayscale | GlyphFormat::Subpixel => rect.origin.x,
                 _ => 0,
             };
             let expected = (width as usize) * (height as usize) * 4;
@@ -554,6 +586,32 @@ impl SphereSurface {
     }
 }
 
+/// Expands compact RGB LCD coverage into the RGBA8 atlas texture layout.
+fn expand_subpixel_region(
+    data: &[u8],
+    bytes_per_row: u32,
+    x: u32,
+    width: u32,
+    height: u32,
+    out: &mut Vec<u8>,
+) {
+    out.clear();
+    out.reserve((width as usize).saturating_mul(height as usize).saturating_mul(4));
+    for row in 0..height as usize {
+        let start = row
+            .saturating_mul(bytes_per_row as usize)
+            .saturating_add((x as usize).saturating_mul(3));
+        let end = start.saturating_add((width as usize).saturating_mul(3)).min(data.len());
+        for rgb in data[start.min(data.len())..end].chunks_exact(3) {
+            // Alpha is used only for the render target's alpha equation; max
+            // coverage is conservative at coloured edge pixels and keeps
+            // src0.a == src1.a.
+            let alpha = rgb[0].max(rgb[1]).max(rgb[2]);
+            out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], alpha]);
+        }
+    }
+}
+
 use sphere_core::Px;
 
 #[cfg(test)]
@@ -575,6 +633,7 @@ mod tests {
         assert_eq!(o.present, PresentPreference::LowLatency);
         assert_eq!(o.present.max_frame_latency(), 1);
         assert!(o.load_system_fonts);
+        assert!(!o.rgb_subpixel_text, "panel-dependent RGB AA must be opt-in");
     }
 
     #[test]
@@ -583,5 +642,17 @@ mod tests {
         assert_eq!(s.nodes_laid_out, 0);
         assert_eq!(s.glyph_texels_uploaded, 0);
         assert_eq!(s.frame.draw_calls, 0);
+    }
+
+    #[test]
+    fn subpixel_atlas_rows_expand_rgb_and_use_max_coverage_for_alpha() {
+        // Two rows of three RGB texels, selecting the final two from each row.
+        let rgb = [
+            0, 0, 0, 10, 20, 30, 90, 40, 50, // row 0
+            1, 2, 3, 70, 60, 50, 4, 8, 2, // row 1
+        ];
+        let mut rgba = Vec::new();
+        expand_subpixel_region(&rgb, 9, 1, 2, 2, &mut rgba);
+        assert_eq!(rgba, [10, 20, 30, 30, 90, 40, 50, 90, 70, 60, 50, 70, 4, 8, 2, 8]);
     }
 }

@@ -167,12 +167,21 @@ impl WgpuRenderer {
         required.max_storage_buffer_binding_size = adapter_limits.max_storage_buffer_binding_size;
         required.max_buffer_size = adapter_limits.max_buffer_size;
 
-        let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let adapter_features = adapter.features();
+        let timestamps = adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY);
+        let required_features = required_device_features(adapter_features);
+        let dual_source_blending = required_features.contains(wgpu::Features::DUAL_SOURCE_BLENDING);
+        if !dual_source_blending {
+            tracing::info!(
+                target: "sphere_wgpu",
+                "dual-source blending unavailable; RGB subpixel text will use grayscale AA"
+            );
+        }
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("sphere.device"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: required,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -242,6 +251,7 @@ impl WgpuRenderer {
             timestamp_queries: timestamps,
             offscreen_targets: true,
             compute: limits.max_compute_workgroup_size_x > 0,
+            dual_source_blending,
             max_instances_per_draw: u32::MAX,
             max_msaa_samples: max_msaa,
         };
@@ -1121,10 +1131,20 @@ fn pipeline_kind_for(batch: &Batch) -> PipelineKind {
     match batch.kind {
         BatchKind::Quad => PipelineKind::Quad,
         BatchKind::Image { .. } => PipelineKind::Image,
-        BatchKind::Glyph { .. } => PipelineKind::Text,
+        BatchKind::Glyph { subpixel: true, .. } => PipelineKind::TextSubpixel,
+        BatchKind::Glyph { subpixel: false, .. } => PipelineKind::Text,
         BatchKind::Mesh { texture: None } => PipelineKind::Mesh,
         BatchKind::Mesh { texture: Some(_) } => PipelineKind::MeshTextured,
     }
+}
+
+/// Optional features requested from the logical device.
+///
+/// Sphere always has a grayscale text fallback, so dual-source blending is
+/// enabled only when the selected adapter advertises it rather than turning an
+/// optional quality improvement into a device-creation failure.
+fn required_device_features(adapter_features: wgpu::Features) -> wgpu::Features {
+    adapter_features & wgpu::Features::DUAL_SOURCE_BLENDING
 }
 
 /// Clamps a batch's scissor into its attachment.
@@ -1284,13 +1304,28 @@ mod tests {
         let b = |k| Batch { kind: k, scissor: Rect::ZERO, range: 0..1, base_vertex: 0, target: 0 };
         assert_eq!(pipeline_kind_for(&b(BatchKind::Quad)), PipelineKind::Quad);
         assert_eq!(
-            pipeline_kind_for(&b(BatchKind::Glyph { page: 0, bitmap: false })),
+            pipeline_kind_for(&b(BatchKind::Glyph { page: 0, bitmap: false, subpixel: false })),
             PipelineKind::Text
+        );
+        assert_eq!(
+            pipeline_kind_for(&b(BatchKind::Glyph { page: 0, bitmap: true, subpixel: true })),
+            PipelineKind::TextSubpixel
         );
         assert_eq!(pipeline_kind_for(&b(BatchKind::Mesh { texture: None })), PipelineKind::Mesh);
         assert_eq!(
             pipeline_kind_for(&b(BatchKind::Mesh { texture: Some(TextureId::new(0, 1)) })),
             PipelineKind::MeshTextured
+        );
+    }
+
+    #[test]
+    fn device_features_request_dual_source_only_when_supported() {
+        assert_eq!(required_device_features(wgpu::Features::empty()), wgpu::Features::empty());
+        assert_eq!(
+            required_device_features(
+                wgpu::Features::DUAL_SOURCE_BLENDING | wgpu::Features::TIMESTAMP_QUERY
+            ),
+            wgpu::Features::DUAL_SOURCE_BLENDING
         );
     }
 }

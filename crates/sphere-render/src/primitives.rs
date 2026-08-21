@@ -41,6 +41,12 @@ pub mod glyph_flags {
     pub const OUTLINE: u32 = 1 << 1;
     /// The active clip is a rounded rectangle.
     pub const CLIP_ROUNDED: u32 = 1 << 2;
+    /// The glyph carries independent red, green and blue LCD coverage.
+    ///
+    /// Such an instance must run through the dual-source text pipeline; the
+    /// ordinary premultiplied-alpha pipeline cannot preserve three independent
+    /// destination blend factors.
+    pub const SUBPIXEL: u32 = 1 << 3;
 }
 
 /// One instanced rectangle-family primitive.

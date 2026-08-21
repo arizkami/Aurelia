@@ -29,7 +29,8 @@ use crate::cache::{CacheStats, ShapeCache};
 use crate::font::FontDatabase;
 use crate::mtsdf::{GlyphRasterConfig, generate_mtsdf};
 use crate::raster::{
-    RasterStrategy, bitmap_size_px, choose_raster_strategy, rasterize_glyph_with_zones,
+    RasterStrategy, bitmap_size_px, choose_raster_strategy, rasterize_glyph_subpixel_with_zones,
+    rasterize_glyph_with_zones_at_phase,
 };
 use crate::types::{GlyphFormat, GlyphKey, TextLayout, TextStyle};
 use sphere_core::{FontId, GlyphId, Px, ScaleFactor};
@@ -48,6 +49,8 @@ pub struct TextSystemStats {
     pub mtsdf_glyphs: u64,
     /// Glyphs rasterised as small-size bitmaps.
     pub bitmap_glyphs: u64,
+    /// Bitmap glyphs rasterised as RGB-stripe subpixel coverage.
+    pub subpixel_glyphs: u64,
 }
 
 impl TextSystemStats {
@@ -228,6 +231,8 @@ impl TextSystem {
         glyph: GlyphId,
         strategy: RasterStrategy,
         size_px: f32,
+        subpixel: bool,
+        subpixel_phase: u8,
     ) -> Option<crate::types::AtlasPlacement> {
         let raster = self.raster;
         let image = match strategy {
@@ -236,9 +241,27 @@ impl TextSystem {
             }
             RasterStrategy::Bitmap => {
                 let zones = self.fonts.vertical_zones(font);
-                self.fonts.with_outline_face(font, |face| {
-                    rasterize_glyph_with_zones(face, glyph, size_px, zones)
-                })?
+                if subpixel {
+                    self.fonts.with_outline_face(font, |face| {
+                        rasterize_glyph_subpixel_with_zones(
+                            face,
+                            glyph,
+                            size_px,
+                            subpixel_phase,
+                            zones,
+                        )
+                    })?
+                } else {
+                    self.fonts.with_outline_face(font, |face| {
+                        rasterize_glyph_with_zones_at_phase(
+                            face,
+                            glyph,
+                            size_px,
+                            subpixel_phase,
+                            zones,
+                        )
+                    })?
+                }
             }
         }
         .ok()?;
@@ -267,7 +290,12 @@ impl TextSystem {
                 self.stats.glyph_misses += 1;
                 match strategy {
                     RasterStrategy::Mtsdf => self.stats.mtsdf_glyphs += 1,
-                    RasterStrategy::Bitmap => self.stats.bitmap_glyphs += 1,
+                    RasterStrategy::Bitmap => {
+                        self.stats.bitmap_glyphs += 1;
+                        if subpixel {
+                            self.stats.subpixel_glyphs += 1;
+                        }
+                    }
                 }
                 Some(p)
             }
@@ -287,18 +315,33 @@ impl GlyphProvider for TextSystem {
     fn place_glyph(&mut self, request: GlyphRequest) -> Option<GlyphPlacement> {
         let scale = ScaleFactor::new(request.device_scale);
         let strategy = self.strategy(request.mode, request.font_size, scale);
+        let subpixel_phase = request.subpixel_phase.min(3);
 
         let key = match strategy {
             // One distance field serves every size, which is the entire point
             // of MTSDF; keying it by size would defeat the cache and multiply
             // the atlas footprint by the number of sizes in the interface.
             RasterStrategy::Mtsdf => GlyphKey::mtsdf(request.font, request.glyph, 0),
-            RasterStrategy::Bitmap => GlyphKey::bitmap(
-                request.font,
-                request.glyph,
-                0,
-                bitmap_size_px(request.font_size, scale),
-            ),
+            RasterStrategy::Bitmap => {
+                let size_px = bitmap_size_px(request.font_size, scale);
+                if request.subpixel {
+                    GlyphKey::subpixel_bitmap(
+                        request.font,
+                        request.glyph,
+                        0,
+                        size_px,
+                        subpixel_phase,
+                    )
+                } else {
+                    GlyphKey::bitmap_with_phase(
+                        request.font,
+                        request.glyph,
+                        0,
+                        size_px,
+                        subpixel_phase,
+                    )
+                }
+            }
         };
 
         let placement = if let Some(p) = self.atlas.touch(&key) {
@@ -306,7 +349,15 @@ impl GlyphProvider for TextSystem {
             p
         } else {
             let size_px = crate::raster::device_font_size(request.font_size, scale);
-            self.rasterize(key, request.font, request.glyph, strategy, size_px)?
+            self.rasterize(
+                key,
+                request.font,
+                request.glyph,
+                strategy,
+                size_px,
+                request.subpixel,
+                subpixel_phase,
+            )?
         };
 
         let b = placement.bounds_em;
@@ -315,7 +366,8 @@ impl GlyphProvider for TextSystem {
             uv: placement.uv,
             bounds_em: [b.min_x(), b.min_y(), b.width(), b.height()],
             range_em: placement.range_em,
-            is_bitmap: placement.format == GlyphFormat::Grayscale,
+            is_bitmap: matches!(placement.format, GlyphFormat::Grayscale | GlyphFormat::Subpixel),
+            is_subpixel: placement.format == GlyphFormat::Subpixel,
             texel_size: [placement.texels.size.width, placement.texels.size.height],
         })
     }
@@ -343,6 +395,8 @@ mod tests {
             font_size: px(size),
             device_scale: scale,
             mode: TextRasterMode::Auto,
+            subpixel: false,
+            subpixel_phase: 0,
         }
     }
 
@@ -376,6 +430,35 @@ mod tests {
     }
 
     #[test]
+    fn bitmap_cache_separates_quarter_phases_and_rgb_coverage() {
+        let Some((mut system, font)) = with_font() else {
+            eprintln!("no system font; skipping");
+            return;
+        };
+        let Some(glyph) = system.fonts().glyph_index(font, 'A') else { return };
+        let base = GlyphRequest { mode: TextRasterMode::Bitmap, ..request(font, glyph, 16.0, 1.0) };
+
+        let gray0 = system.place_glyph(base).expect("gray phase zero");
+        let gray1 =
+            system.place_glyph(GlyphRequest { subpixel_phase: 1, ..base }).expect("gray phase one");
+        let gray1_again = system
+            .place_glyph(GlyphRequest { subpixel_phase: 1, ..base })
+            .expect("gray phase one cache hit");
+        let rgb1 = system
+            .place_glyph(GlyphRequest { subpixel: true, subpixel_phase: 1, ..base })
+            .expect("RGB phase one");
+
+        assert_ne!(gray0.uv, gray1.uv, "phases aliased in the atlas");
+        assert_eq!(gray1, gray1_again);
+        assert!(gray1.is_bitmap && !gray1.is_subpixel);
+        assert!(rgb1.is_bitmap && rgb1.is_subpixel);
+        assert_ne!(gray1.page, rgb1.page, "R8 and RGB8 coverage shared a page");
+        assert_eq!(system.stats().glyph_misses, 3);
+        assert_eq!(system.stats().glyph_hits, 1);
+        assert_eq!(system.stats().subpixel_glyphs, 1);
+    }
+
+    #[test]
     fn one_distance_field_serves_every_size() {
         // The headline property of MTSDF. If this ever fails, the atlas is
         // being keyed by size and its footprint scales with the type scale.
@@ -386,11 +469,16 @@ mod tests {
         let Some(glyph) = system.fonts().glyph_index(font, 'M') else { return };
 
         let big = GlyphRequest { mode: TextRasterMode::Mtsdf, ..request(font, glyph, 48.0, 1.0) };
-        let bigger =
-            GlyphRequest { mode: TextRasterMode::Mtsdf, ..request(font, glyph, 96.0, 1.0) };
+        let bigger = GlyphRequest {
+            mode: TextRasterMode::Mtsdf,
+            subpixel: true,
+            subpixel_phase: 3,
+            ..request(font, glyph, 96.0, 1.0)
+        };
         let a = system.place_glyph(big).expect("48 px");
         let b = system.place_glyph(bigger).expect("96 px");
         assert_eq!(a.uv, b.uv, "two sizes rasterised two separate fields");
+        assert!(!b.is_subpixel, "a distance field must ignore bitmap-only subpixel options");
         assert_eq!(system.stats().mtsdf_glyphs, 1);
     }
 

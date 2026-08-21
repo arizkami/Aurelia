@@ -44,6 +44,7 @@ shader_table! {
     "common/frame.wgsl",
     "quad.wgsl",
     "text.wgsl",
+    "text_subpixel.wgsl",
     "mesh.wgsl",
     "composite.wgsl",
     "blur.wgsl",
@@ -61,6 +62,13 @@ pub fn source(path: &str) -> Option<&'static str> {
 /// duplicated, which is what allows two shaders to include the same helper.
 pub fn compose(path: &str) -> Result<String, ShaderError> {
     let mut out = String::with_capacity(8 * 1024);
+    // WGSL enable directives have to precede every declaration. Includes are
+    // deliberately emitted before their parent source, so a directive inside
+    // `text_subpixel.wgsl` would otherwise land too late. Keep module preludes
+    // here, at the one point that can guarantee their position.
+    if path == "text_subpixel.wgsl" {
+        out.push_str("enable dual_source_blending;\n");
+    }
     let mut seen = FxHashSet::default();
     expand(path, &mut out, &mut seen, 0)?;
     Ok(out)
@@ -132,6 +140,21 @@ mod tests {
     }
 
     #[test]
+    fn every_pipeline_shader_parses_and_validates() {
+        for (path, _) in SOURCES.iter().filter(|(path, _)| !path.starts_with("common/")) {
+            let composed = compose(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let module = wgpu::naga::front::wgsl::parse_str(&composed)
+                .unwrap_or_else(|e| panic!("{path}: {}", e.emit_to_string(&composed)));
+            wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+        }
+    }
+
+    #[test]
     fn includes_are_pulled_in_before_the_including_body() {
         let composed = compose("quad.wgsl").unwrap();
         let math = composed.find("fn sd_rounded_box").expect("math helper missing");
@@ -163,6 +186,14 @@ mod tests {
         let a = compose("text.wgsl").unwrap();
         let b = compose("text.wgsl").unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn dual_source_extension_precedes_subpixel_shader_declarations() {
+        let composed = compose("text_subpixel.wgsl").unwrap();
+        assert!(composed.starts_with("enable dual_source_blending;\n"));
+        let output = composed.find("struct SubpixelFragmentOutput").expect("output missing");
+        assert!(output > "enable dual_source_blending;\n".len());
     }
 
     #[test]
@@ -207,6 +238,7 @@ mod tests {
             ("BITMAP", sphere_render::glyph_flags::BITMAP),
             ("OUTLINE", sphere_render::glyph_flags::OUTLINE),
             ("CLIP_ROUNDED", sphere_render::glyph_flags::CLIP_ROUNDED),
+            ("SUBPIXEL", sphere_render::glyph_flags::SUBPIXEL),
         ] {
             let needle = format!("const {name}: u32 = {value}u;");
             assert!(text.contains(&needle), "text.wgsl is missing `{needle}`");

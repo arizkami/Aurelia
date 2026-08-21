@@ -17,6 +17,7 @@ const ALL_KINDS: &[PipelineKind] = &[
     PipelineKind::Quad,
     PipelineKind::Image,
     PipelineKind::Text,
+    PipelineKind::TextSubpixel,
     PipelineKind::Mesh,
     PipelineKind::MeshTextured,
     PipelineKind::Composite,
@@ -44,9 +45,10 @@ fn headless() -> Option<(wgpu::Device, wgpu::Queue, String)> {
     required.max_storage_buffer_binding_size = adapter_limits.max_storage_buffer_binding_size;
     required.max_buffer_size = adapter_limits.max_buffer_size;
 
+    let optional_features = adapter.features() & wgpu::Features::DUAL_SOURCE_BLENDING;
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("sphere.test"),
-        required_features: wgpu::Features::empty(),
+        required_features: optional_features,
         required_limits: required,
         experimental_features: wgpu::ExperimentalFeatures::disabled(),
         memory_hints: wgpu::MemoryHints::default(),
@@ -69,6 +71,11 @@ fn every_shader_module_passes_naga_validation() {
         // modules, but composing them must still succeed.
         let composed = shader::compose(path).unwrap_or_else(|e| panic!("{path}: {e}"));
         if path.starts_with("common/") {
+            continue;
+        }
+        if *path == "text_subpixel.wgsl"
+            && !device.features().contains(wgpu::Features::DUAL_SOURCE_BLENDING)
+        {
             continue;
         }
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -99,6 +106,11 @@ fn every_pipeline_builds_for_the_surface_and_layer_formats() {
     for samples in [1u32, 4] {
         for format in [wgpu::TextureFormat::Bgra8UnormSrgb, wgpu::TextureFormat::Rgba8UnormSrgb] {
             for kind in ALL_KINDS {
+                if *kind == PipelineKind::TextSubpixel
+                    && !device.features().contains(wgpu::Features::DUAL_SOURCE_BLENDING)
+                {
+                    continue;
+                }
                 let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
                 cache
                     .get(&device, PipelineKey { kind: *kind, format, samples })

@@ -19,6 +19,8 @@ pub enum PipelineKind {
     Image,
     /// MTSDF and bitmap glyphs.
     Text,
+    /// RGB-coverage bitmap glyphs blended with a second fragment source.
+    TextSubpixel,
     /// Vertex-coloured triangles.
     Mesh,
     /// Textured triangles.
@@ -319,10 +321,14 @@ impl PipelineCache {
                 &QUAD_ATTRS,
                 wgpu::VertexStepMode::Instance,
             ),
-            PipelineKind::Text => (
-                "text.wgsl",
+            PipelineKind::Text | PipelineKind::TextSubpixel => (
+                if key.kind == PipelineKind::TextSubpixel {
+                    "text_subpixel.wgsl"
+                } else {
+                    "text.wgsl"
+                },
                 "vs_main",
-                "fs_main",
+                if key.kind == PipelineKind::TextSubpixel { "fs_subpixel" } else { "fs_main" },
                 core::mem::size_of::<GlyphInstance>() as u64,
                 &GLYPH_ATTRS,
                 wgpu::VertexStepMode::Instance,
@@ -373,6 +379,11 @@ impl PipelineCache {
             _ => wgpu::PrimitiveTopology::TriangleStrip,
         };
 
+        let blend = match key.kind {
+            PipelineKind::TextSubpixel => subpixel_blend_state(),
+            _ => wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+        };
+
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("sphere.pipeline"),
             layout: Some(layout),
@@ -388,9 +399,10 @@ impl PipelineCache {
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: key.format,
-                    // Every colour Sphere produces is premultiplied, so
-                    // source-over is `src + dst * (1 - src.a)`.
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    // Every ordinary Sphere colour is premultiplied. Subpixel
+                    // text instead supplies per-channel coverage through the
+                    // second fragment output; see `subpixel_blend_state`.
+                    blend: Some(blend),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -464,6 +476,27 @@ impl PipelineCache {
             self.blur_pipeline = Some(p);
         }
         Ok(self.blur_pipeline.as_ref().unwrap())
+    }
+}
+
+/// Blend equation for RGB subpixel coverage.
+///
+/// The subpixel fragment shader emits premultiplied foreground in source zero
+/// and colour-channel coverage in source one. The result is therefore
+/// `src0 + dst * (1 - src1)` independently for R, G and B. Alpha follows the
+/// same equation using source one's alpha component.
+fn subpixel_blend_state() -> wgpu::BlendState {
+    wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrc1,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrc1Alpha,
+            operation: wgpu::BlendOperation::Add,
+        },
     }
 }
 
@@ -542,5 +575,16 @@ mod tests {
                 assert_eq!(a.shader_location, i as u32);
             }
         }
+    }
+
+    #[test]
+    fn subpixel_blend_uses_the_second_source_as_coverage() {
+        let blend = subpixel_blend_state();
+        assert_eq!(blend.color.src_factor, wgpu::BlendFactor::One);
+        assert_eq!(blend.color.dst_factor, wgpu::BlendFactor::OneMinusSrc1);
+        assert_eq!(blend.color.operation, wgpu::BlendOperation::Add);
+        assert_eq!(blend.alpha.src_factor, wgpu::BlendFactor::One);
+        assert_eq!(blend.alpha.dst_factor, wgpu::BlendFactor::OneMinusSrc1Alpha);
+        assert_eq!(blend.alpha.operation, wgpu::BlendOperation::Add);
     }
 }
