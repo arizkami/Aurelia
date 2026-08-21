@@ -1,4 +1,4 @@
-// Per-frame bindings, shared by every Sphere pipeline.
+// Per-frame bindings, shared by every SphereKit pipeline.
 //
 // Group 0 is bound once per pass and never rebound per draw call, which is why
 // transforms, clips and gradients are indexed tables rather than per-instance
@@ -80,7 +80,7 @@ fn transform_scale(index: u32) -> f32 {
 
 /// Converts a device-pixel position into clip space.
 ///
-/// Sphere's y axis points down; WebGPU's clip space points up, so y is flipped
+/// SphereKit's y axis points down; WebGPU's clip space points up, so y is flipped
 /// exactly here and nowhere else.
 fn to_clip_space(device_px: vec2<f32>) -> vec4<f32> {
     let ndc = vec2<f32>(

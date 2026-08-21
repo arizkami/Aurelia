@@ -1,0 +1,25 @@
+[package]
+name = "spherekit"
+description = "SphereKit: a GPU-first graphics and UI engine in pure Rust."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+spherekit-core.workspace = true
+spherekit-render.workspace = true
+spherekit-wgpu.workspace = true
+spherekit-text.workspace = true
+spherekit-layout.workspace = true
+spherekit-svg.workspace = true
+spherekit-image.workspace = true
+spherekit-platform.workspace = true
+spherekit-ui.workspace = true
+spherekit-audio-ui.workspace = true
+rustc-hash.workspace = true
+raw-window-handle.workspace = true
+tracing.workspace = true
+pollster.workspace = true

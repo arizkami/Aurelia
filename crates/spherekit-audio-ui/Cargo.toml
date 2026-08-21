@@ -1,0 +1,21 @@
+[package]
+name = "spherekit-audio-ui"
+description = "Realtime audio visualisation primitives for SphereKit."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+spherekit-core.workspace = true
+spherekit-render.workspace = true
+spherekit-ui.workspace = true
+spherekit-layout.workspace = true
+spherekit-text.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+crossbeam-utils.workspace = true
+bytemuck.workspace = true

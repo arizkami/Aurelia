@@ -84,11 +84,11 @@ useful.
 
 Tests that assert on it:
 
-- `sphere-layout` — marking a node `PAINT`-dirty leaves it at zero.
-- `sphere-ui` — an identical rebuild leaves it at zero; hovering leaves it at zero; a theme change
+- `spherekit-layout` — marking a node `PAINT`-dirty leaves it at zero.
+- `spherekit-ui` — an identical rebuild leaves it at zero; hovering leaves it at zero; a theme change
   leaves it at zero.
-- `sphere-ui::widgets` — a 60-frame knob drag leaves it at zero on every frame.
-- `sphere-audio-ui` — 60 frames of meter repaint leave it at zero on every frame.
+- `spherekit-ui::widgets` — a 60-frame knob drag leaves it at zero on every frame.
+- `spherekit-audio-ui` — 60 frames of meter repaint leave it at zero on every frame.
 
 ## The engine seam
 
@@ -107,7 +107,7 @@ pub trait LayoutEngine {
 ```
 
 `TaffyLayoutEngine` is the shipped implementation. **No `taffy` type appears anywhere in this
-crate's public API.** Sphere has its own `Style`, its own `AvailableSpace`, its own `Overflow`,
+crate's public API.** SphereKit has its own `Style`, its own `AvailableSpace`, its own `Overflow`,
 `Align` and `Distribute`. The mapping happens inside `taffy_backend.rs`.
 
 That is not purity for its own sake. A measure callback lives in application code — it is where
@@ -191,7 +191,7 @@ be a per-frame allocation in the most frequent code path in the engine.
 Ordering honours `z_index` on top of the algorithm's own paint order. Clipping is respected: a
 child scrolled outside its container's clip is not hit, and there is a test for it.
 
-The chain is what makes capture-and-bubble dispatch possible; see `sphere-ui`'s event module.
+The chain is what makes capture-and-bubble dispatch possible; see `spherekit-ui`'s event module.
 
 ## Scrolling
 
@@ -204,9 +204,9 @@ without a separate measurement pass.
 
 ## Scale
 
-The tree is iterative everywhere its depth is user-controlled. `sphere-ui`'s build and paint walks
+The tree is iterative everywhere its depth is user-controlled. `spherekit-ui`'s build and paint walks
 use an explicit stack and are tested at 5,000 levels of nesting. Layout recursion depth is bounded
-by the backing engine rather than by Sphere; 200 levels is tested and is an order of magnitude past
+by the backing engine rather than by SphereKit; 200 levels is tested and is an order of magnitude past
 any real interface — a deeply nested mixer strip is nearer twenty.
 
 The other axis is width: 500 sibling nodes is tested, and is what a large session looks like.

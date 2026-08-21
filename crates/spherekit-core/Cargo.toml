@@ -1,0 +1,17 @@
+[package]
+name = "spherekit-core"
+description = "Core geometry, units, color and identity types for SphereKit."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+bitflags.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true
+smallvec.workspace = true
+slotmap.workspace = true
+rustc-hash.workspace = true

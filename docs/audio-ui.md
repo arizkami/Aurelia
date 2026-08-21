@@ -48,7 +48,7 @@ DSP callback ──▶ mutex ──▶ UI tree update ──▶ GPU call
 
 ## The three transfer primitives
 
-All three live in `sphere_audio_ui::transfer`. Which one to use is decided by the *shape* of the
+All three live in `spherekit_audio_ui::transfer`. Which one to use is decided by the *shape* of the
 data, not by preference.
 
 | Type | Data shape | Use for |
@@ -144,7 +144,7 @@ realtime_canvas(move |frame| {
 Two properties follow:
 
 **It invalidates PAINT only.** Its box never changes size, so relayout would be pure waste at 60 or
-120 Hz. `crates/sphere-audio-ui/src/realtime.rs` contains a test that builds a real tree, repaints
+120 Hz. `crates/spherekit-audio-ui/src/realtime.rs` contains a test that builds a real tree, repaints
 a meter sixty times, and asserts `nodes_laid_out == 0` on every one of them.
 
 **It builds meshes, not paths.** A spectrum is already a list of points; a waveform is already a
@@ -174,7 +174,7 @@ there is a test that lays out 40 strips in a 400 px viewport and asserts at most
 
 ## The measurement maths
 
-Kept in `sphere_audio_ui::dsp`, separate from the drawing, because it is the part that is easy to
+Kept in `spherekit_audio_ui::dsp`, separate from the drawing, because it is the part that is easy to
 get subtly and invisibly wrong.
 
 ### Meters are not linear
@@ -244,7 +244,7 @@ Each of those has a test that feeds it NaN and both infinities and asserts the o
 
 ## Frame scheduling
 
-`sphere_platform::RedrawPolicy` has four modes:
+`spherekit_platform::RedrawPolicy` has four modes:
 
 | Mode | Loop behaviour |
 |---|---|

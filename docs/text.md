@@ -14,12 +14,12 @@ text + style
    ↓  alignment and justification
    ↓  glyph rasterisation                MTSDF, or bitmap below ~12 px
    ↓  paged atlas placement
-   ↓  instanced draw                     sphere-wgpu
+   ↓  instanced draw                     spherekit-wgpu
 ```
 
-Nothing above the rasteriser is Sphere-specific: bidi, itemisation and shaping are solved problems
+Nothing above the rasteriser is SphereKit-specific: bidi, itemisation and shaping are solved problems
 with correct Rust implementations, and reimplementing them would be a large amount of work whose
-best possible outcome is parity. What Sphere owns is everything from rasterisation down, because
+best possible outcome is parity. What SphereKit owns is everything from rasterisation down, because
 that is where the design decision lives.
 
 ## Why MTSDF and not a bitmap cache
@@ -53,12 +53,12 @@ let alpha = clamp(sd * screen_range + 0.5, 0.0, 1.0);
 
 ## The generator
 
-`crates/sphere-text/src/mtsdf.rs` is a pure-Rust implementation of Chlumsky's method. The
+`crates/spherekit-text/src/mtsdf.rs` is a pure-Rust implementation of Chlumsky's method. The
 `msdfgen` crate is a C++ binding and is therefore not an option here.
 
 **Outline extraction.** `ttf-parser` yields contours as line, quadratic and cubic segments.
 Coordinates are normalised into em units by dividing by `units_per_em`, and TrueType's y-up
-convention is flipped to Sphere's y-down exactly once, in the outline collector.
+convention is flipped to SphereKit's y-down exactly once, in the outline collector.
 
 **Edge colouring.** Each contour is walked and a vertex is classified as a corner when the angle
 between the incoming and outgoing tangents exceeds ~3°. Edges are assigned a colour mask from
@@ -126,7 +126,7 @@ amount of gamma correction fixes it, because the coverage genuinely is grey. At 
 a 200 % display, there is nearly two pixels of solid core and it looks the way it should.
 
 ```bash
-SPHERE_PROBE_SIZE=13 SPHERE_PROBE_ZOOM=4 cargo run -p sphere-text --example glyph_quad_probe --release -- out.png
+SPHEREKIT_PROBE_SIZE=13 SPHEREKIT_PROBE_ZOOM=4 cargo run -p spherekit-text --example glyph_quad_probe --release -- out.png
 ```
 
 writes the comparison: forced MTSDF on the left, what `Auto` picks on the right, magnified with
@@ -184,7 +184,7 @@ points through a piecewise-linear map bends the curve between them by an amount 
 moving the flattened vertices is exact for the geometry actually rasterised.
 
 ```bash
-SPHERE_PROBE_COMPARE=fit SPHERE_PROBE_SIZE=13 SPHERE_PROBE_ZOOM=6 SPHERE_PROBE_TEXT=nxoeHm   cargo run -p sphere-text --example glyph_quad_probe --release -- out.png
+SPHEREKIT_PROBE_COMPARE=fit SPHEREKIT_PROBE_SIZE=13 SPHEREKIT_PROBE_ZOOM=6 SPHEREKIT_PROBE_TEXT=nxoeHm   cargo run -p spherekit-text --example glyph_quad_probe --release -- out.png
 ```
 
 writes unfitted against fitted, rasterised directly rather than through the atlas — the atlas has no
@@ -316,7 +316,7 @@ A [`TextStyle`] with no family named resolves through `fontdb`'s generic sans-se
 non-Latin system it has no coverage for the language the user actually reads in, so every unstyled
 string fell through to a fallback chosen by accident.
 
-`sphere-text::system_ui` fixes it by asking the platform. On Windows that means reading
+`spherekit-text::system_ui` fixes it by asking the platform. On Windows that means reading
 `NONCLIENTMETRICSW::lfMessageFont` through `SPI_GETNONCLIENTMETRICS`, because the interface font
 there is **not a constant** — the shell picks it per locale:
 
@@ -336,7 +336,7 @@ interface sizes — to Consolas on Windows, SF Mono on macOS and DejaVu Sans Mon
 *is* a constant, because no platform exposes a system-monospace setting to query, and the code says
 so rather than pretending otherwise.
 
-`cargo run -p sphere-text --example glyph_quad_probe` reports both the queried family and the family
+`cargo run -p spherekit-text --example glyph_quad_probe` reports both the queried family and the family
 that actually resolved, which is how to check this on a machine rather than assume it.
 
 ## Fallback
@@ -485,7 +485,7 @@ it, because the coverage the rasteriser produced was correct.
 
 Every traditional text renderer composites glyph coverage in *gamma* space instead. egui goes as far
 as asking its backend for a non-sRGB framebuffer specifically so that its whole pipeline blends that
-way, and warns when it is handed an sRGB one. Sphere cannot follow it there — the linear blend is
+way, and warns when it is handed an sRGB one. SphereKit cannot follow it there — the linear blend is
 load-bearing for every other primitive — so it reproduces the same result by bending the coverage
 ramp before the blend, per glyph, in the shader.
 
@@ -547,12 +547,12 @@ drawing and hid the calibration bug it was built to catch, while its own doc com
 pixels shown are exactly the pixels rendered".
 
 It now holds a linear-light float canvas, blends premultiplied into it, and encodes to sRGB once on
-the way out, which is the arrangement the hardware uses. `SPHERE_PROBE_COMPARE=blend` draws the same
+the way out, which is the arrangement the hardware uses. `SPHEREKIT_PROBE_COMPARE=blend` draws the same
 glyphs twice with only the correction differing:
 
 ```bash
-SPHERE_PROBE_COMPARE=blend SPHERE_PROBE_ZOOM=10 SPHERE_PROBE_TEXT=Hamburgefonstiv   cargo run -p sphere-text --example glyph_quad_probe --release -- out.png
-SPHERE_PROBE_THEME=dark SPHERE_PROBE_COMPARE=blend   cargo run -p sphere-text --example glyph_quad_probe --release
+SPHEREKIT_PROBE_COMPARE=blend SPHEREKIT_PROBE_ZOOM=10 SPHEREKIT_PROBE_TEXT=Hamburgefonstiv   cargo run -p spherekit-text --example glyph_quad_probe --release -- out.png
+SPHEREKIT_PROBE_THEME=dark SPHEREKIT_PROBE_COMPARE=blend   cargo run -p spherekit-text --example glyph_quad_probe --release
 ```
 
 A CPU transcription still cannot prove the GPU agreed. What it can do is stop disagreeing on purpose.

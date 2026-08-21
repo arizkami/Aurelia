@@ -1,6 +1,6 @@
 // Shared math helpers.
 //
-// Sphere composes WGSL by textual include (see `sphere_wgpu::shader`), so this
+// SphereKit composes WGSL by textual include (see `spherekit_wgpu::shader`), so this
 // file must be self-contained and must not declare bindings.
 
 const TAU: f32 = 6.283185307179586;
@@ -16,7 +16,7 @@ fn median3(a: f32, b: f32, c: f32) -> f32 {
 ///
 /// `p` is relative to the box centre, `b` is the half-extent, and `r` holds the
 /// four radii in `[top_left, top_right, bottom_right, bottom_left]` order —
-/// the same order Sphere's `Corners<T>` uses on the CPU, so the two cannot
+/// the same order SphereKit's `Corners<T>` uses on the CPU, so the two cannot
 /// drift apart.
 ///
 /// Negative inside, positive outside, and the gradient has unit length almost

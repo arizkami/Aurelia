@@ -1,6 +1,6 @@
-# SphereGraphicEngine
+# SphereKit
 
-> SphereGraphicEngine is a GPU-first graphics and UI engine written in Rust for realtime creative
+> SphereKit is a GPU-first graphics and UI engine written in Rust for realtime creative
 > applications. It combines a retained node/layout architecture, a WGPU rendering pipeline,
 > GPU-native MTSDF text, and specialised realtime visualisation primitives for audio software.
 
@@ -19,7 +19,7 @@ Qt, and no JUCE GUI anywhere in the dependency tree.
 
 ## What makes it different
 
-**The graphics engine stands alone.** `sphere-render` has no idea that nodes, layout or widgets
+**The graphics engine stands alone.** `spherekit-render` has no idea that nodes, layout or widgets
 exist. You can drive the canvas directly and never touch the UI layer:
 
 ```rust
@@ -64,30 +64,30 @@ black-to-white midpoint is the perceptually correct `0.735`, not a naive `0.5`.
 ```text
 Application
     ↓
-sphere-ui           element tree, events, focus, widgets
+spherekit-ui           element tree, events, focus, widgets
     ↓
-sphere-layout       retained nodes, styles, dirty propagation, hit testing
+spherekit-layout       retained nodes, styles, dirty propagation, hit testing
     ↓
-sphere-render       canvas → scene → cull → batch → CompiledFrame
+spherekit-render       canvas → scene → cull → batch → CompiledFrame
     ↓
-sphere-wgpu         the only crate that knows wgpu exists
+spherekit-wgpu         the only crate that knows wgpu exists
     ↓
 D3D12 / Vulkan / Metal / WebGPU
 ```
 
 | Crate | Responsibility |
 |---|---|
-| `sphere-core` | Units, geometry, transforms, colour, paths, paint, identity, errors |
-| `sphere-render` | Canvas, display list, culling, batching, tessellation, backend seam |
-| `sphere-wgpu` | wgpu backend, WGSL shaders, pipeline cache, GPU buffers |
-| `sphere-text` | Font discovery, shaping, line layout, MTSDF generation, paged atlas |
-| `sphere-layout` | Retained layout tree, style, dirty flags, hit testing, scrolling |
-| `sphere-image` | Image decoding, texture cache, fit resolution |
-| `sphere-svg` | SVG parsing and cached tessellation for interface assets |
-| `sphere-platform` | Windows, input, IME, monitors, frame scheduling |
-| `sphere-ui` | Element tree, event dispatch, focus, widgets |
-| `sphere-audio-ui` | Meters, waveforms, spectrums, EQ curves, lock-free transfer |
-| `sphere` | Facade that re-exports the whole engine |
+| `spherekit-core` | Units, geometry, transforms, colour, paths, paint, identity, errors |
+| `spherekit-render` | Canvas, display list, culling, batching, tessellation, backend seam |
+| `spherekit-wgpu` | wgpu backend, WGSL shaders, pipeline cache, GPU buffers |
+| `spherekit-text` | Font discovery, shaping, line layout, MTSDF generation, paged atlas |
+| `spherekit-layout` | Retained layout tree, style, dirty flags, hit testing, scrolling |
+| `spherekit-image` | Image decoding, texture cache, fit resolution |
+| `spherekit-svg` | SVG parsing and cached tessellation for interface assets |
+| `spherekit-platform` | Windows, input, IME, monitors, frame scheduling |
+| `spherekit-ui` | Element tree, event dispatch, focus, widgets |
+| `spherekit-audio-ui` | Meters, waveforms, spectrums, EQ curves, lock-free transfer |
+| `spherekit` | Facade that re-exports the whole engine |
 
 Backend mapping: Windows → Direct3D 12, Linux → Vulkan, macOS → Metal, Web → WebGPU.
 
@@ -113,7 +113,7 @@ cargo clippy --workspace --all-targets --all-features
 ## Status
 
 Measured on an NVIDIA GTX 1060 (Vulkan), running
-`cargo run -p sphere --example plugin_ui_demo --release` for 180 frames:
+`cargo run -p spherekit --example plugin_ui_demo --release` for 180 frames:
 
 | | |
 |---|---|
@@ -131,13 +131,13 @@ The zero is the point. See [`docs/architecture.md`](docs/architecture.md).
 ## Examples
 
 ```bash
-cargo run -p sphere --example desktop_app    --release  # borderless, custom title bar
-cargo run -p sphere --example system_window  --release  # the platform draws the title bar
-cargo run -p sphere --example plugin_ui_demo --release  # a compressor plug-in editor
+cargo run -p spherekit --example desktop_app    --release  # borderless, custom title bar
+cargo run -p spherekit --example system_window  --release  # the platform draws the title bar
+cargo run -p spherekit --example plugin_ui_demo --release  # a compressor plug-in editor
 
 # Diagnostic: writes a side-by-side PNG of one line of text, distance field
 # against whatever the automatic strategy picks, and reports why.
-SPHERE_PROBE_SIZE=13 SPHERE_PROBE_ZOOM=4 cargo run -p sphere-text --example glyph_quad_probe --release -- out.png
+SPHEREKIT_PROBE_SIZE=13 SPHEREKIT_PROBE_ZOOM=4 cargo run -p spherekit-text --example glyph_quad_probe --release -- out.png
 ```
 
 `desktop_app` is the shape most applications are: header, sidebar, scrolling settings pane, status
@@ -149,7 +149,7 @@ reach for first. `plugin_ui_demo` is the audio case:
 ten thousand instanced rectangles, multilingual text, and meters driven from a simulated audio
 thread through the lock-free boundary.
 
-Both accept `SPHERE_DEMO_FRAMES=<n>` to run for a bounded number of frames and print what they
+Both accept `SPHEREKIT_DEMO_FRAMES=<n>` to run for a bounded number of frames and print what they
 measured, which makes them usable as smoke tests.
 
 ## Documentation

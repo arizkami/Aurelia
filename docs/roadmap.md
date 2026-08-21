@@ -12,17 +12,17 @@ than against intent.
 
 | Crate | Tests | Status |
 |---|---|---|
-| `sphere-core` | 78 | Done |
-| `sphere-render` | 77 | Done |
-| `sphere-wgpu` | 31 (4 on a real GPU) | Done |
-| `sphere-text` | 232 | Done |
-| `sphere-layout` | 108 | Done |
-| `sphere-image` | 95 | Done |
-| `sphere-platform` | 116 | Done |
-| `sphere-ui` | 147 | Done |
-| `sphere-audio-ui` | 86 | Done |
-| `sphere-svg` | 32 | Done |
-| `sphere` (facade) | 3 | Done |
+| `spherekit-core` | 78 | Done |
+| `spherekit-render` | 77 | Done |
+| `spherekit-wgpu` | 31 (4 on a real GPU) | Done |
+| `spherekit-text` | 232 | Done |
+| `spherekit-layout` | 108 | Done |
+| `spherekit-image` | 95 | Done |
+| `spherekit-platform` | 116 | Done |
+| `spherekit-ui` | 147 | Done |
+| `spherekit-audio-ui` | 86 | Done |
+| `spherekit-svg` | 32 | Done |
+| `spherekit` (facade) | 3 | Done |
 
 ## Phases
 
@@ -150,7 +150,7 @@ parsing and `SvgError::Unsupported` is returned rather than handing back a silen
 | Blend modes beyond fixed-function | Layers open correctly; the shader does not implement them |
 | Glow, bloom, mask, reflection, glass | Not started |
 
-`blur.wgsl` compiles and its pipeline builds — the GPU test covers it — but `SphereSurface` does not
+`blur.wgsl` compiles and its pipeline builds — the GPU test covers it — but `SphereKitSurface` does not
 yet run the two-pass blur between a layer's render and its composite.
 
 ## Definition of done for v0.1
@@ -179,9 +179,9 @@ yet run the two-pass blur between a layer's render and its composite.
 1. **Clipboard, undo, and multi-line editing.** The text field handles selection, motion and
    composition; cut/copy/paste, an undo stack and vertical caret motion are not written. Vertical
    motion is the one that needs new machinery, because it has to walk the laid-out lines.
-2. **Animation core integration.** `sphere-core::animate` is built and tested — analytic springs,
+2. **Animation core integration.** `spherekit-core::animate` is built and tested — analytic springs,
    tweens as the degenerate case, `Animatable` for the scalar, geometry and colour types — and
-   `sphere-core::time` gives it one clock. What is *not* built is the retained layer that would let a
+   `spherekit-core::time` gives it one clock. What is *not* built is the retained layer that would let a
    stock widget animate without the application holding the `Motion`. The `desktop_app` caption shows
    the app-owned pattern working end to end; `Styled::transition` does not exist yet.
 3. **A native Win32 backend.** Deliberately deferred, with the reasoning written down in

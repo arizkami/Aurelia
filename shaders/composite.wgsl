@@ -12,7 +12,7 @@ struct CompositeParams {
     dest: vec4<f32>,
     /// Opacity applied while compositing.
     opacity: f32,
-    /// Blend mode; see `sphere_core::BlendMode`.
+    /// Blend mode; see `spherekit_core::BlendMode`.
     blend: u32,
     /// Saturation multiplier, 1.0 for no change.
     saturation: f32,

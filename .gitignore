@@ -1,5 +1,5 @@
 /target
 **/*.rs.bk
 *.pdb
-/.sphere-cache
+/.spherekit-cache
 /ref

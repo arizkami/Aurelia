@@ -9,7 +9,7 @@
 //!include common/math.wgsl
 //!include common/frame.wgsl
 
-// Keep in sync with `sphere_render::primitives::quad_flags`.
+// Keep in sync with `spherekit_render::primitives::quad_flags`.
 const FILL_SOLID: u32 = 1u;
 const FILL_GRADIENT: u32 = 2u;
 const FILL_TEXTURE: u32 = 4u;

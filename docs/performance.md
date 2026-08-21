@@ -21,7 +21,7 @@ this was developed against.
 Every layer reports what it did. These are the numbers to watch; a regression shows up here before
 it shows up as a dropped frame.
 
-### `LayoutStats` — `sphere-layout`
+### `LayoutStats` — `spherekit-layout`
 
 | Counter | Watch for |
 |---|---|
@@ -33,7 +33,7 @@ it shows up as a dropped frame.
 size a child twice under different constraints, and hiding that would make the number reassuring
 rather than useful.
 
-### `TreeStats` — `sphere-ui`
+### `TreeStats` — `spherekit-ui`
 
 | Counter | Watch for |
 |---|---|
@@ -42,7 +42,7 @@ rather than useful.
 | `nodes_removed` | Churn means elements are appearing and disappearing |
 | `elements_culled` | Should be large in a scrolled list; zero means culling is not working |
 
-### `SceneStats` — `sphere-render`
+### `SceneStats` — `spherekit-render`
 
 | Counter | Watch for |
 |---|---|
@@ -51,7 +51,7 @@ rather than useful.
 | `batches` | **Draw calls.** A jump at constant wall-clock is still a regression |
 | `quads` / `glyphs` / `triangles` | Instance counts by kind |
 
-### `FrameStats` — `sphere-wgpu`
+### `FrameStats` — `spherekit-wgpu`
 
 | Counter | Watch for |
 |---|---|
@@ -170,10 +170,10 @@ guarantee about yours.
 
 ```bash
 # Bounded run that prints the report above.
-SPHERE_DEMO_FRAMES=180 cargo run -p sphere --example plugin_ui_demo --release
+SPHEREKIT_DEMO_FRAMES=180 cargo run -p spherekit --example plugin_ui_demo --release
 
 # GPU-side validation: every shader through naga, every pipeline built.
-cargo test -p sphere-wgpu --test pipelines -- --nocapture
+cargo test -p spherekit-wgpu --test pipelines -- --nocapture
 ```
 
 On Windows, set `CARGO_INCREMENTAL=0` if a workspace-wide test run fails at the link step; see the
@@ -188,9 +188,9 @@ Honesty about the gaps:
 - GPU frame time is not measured. `FrameStats::gpu_ms` is `None`; timestamp queries are detected as
   a capability but not yet used.
 - No golden-image or screenshot tests exist, and there is no GPU readback path to build them on.
-  `sphere-text`'s `glyph_quad_probe` example renders text to a PNG, but it re-implements the glyph
+  `spherekit-text`'s `glyph_quad_probe` example renders text to a PNG, but it re-implements the glyph
   shader on the CPU rather than capturing a frame, so it can check geometry and not the GPU. The
-  two examples print a measured report under `SPHERE_DEMO_FRAMES`, which catches *structural*
+  two examples print a measured report under `SPHEREKIT_DEMO_FRAMES`, which catches *structural*
   regressions — a jump in draw calls, a nonzero `nodes_laid_out` — but not visual ones.
 - The figures above come from one discrete NVIDIA GPU. Integrated graphics, Metal and a software
   adapter are architecturally supported and untested for performance.

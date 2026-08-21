@@ -1,0 +1,16 @@
+[package]
+name = "spherekit-image"
+description = "Image decoding and texture cache for SphereKit."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+spherekit-core.workspace = true
+image.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rustc-hash.workspace = true

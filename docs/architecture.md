@@ -7,25 +7,25 @@ Why the seams are where they are.
 ```text
 Application
     ↓
-sphere-ui              element tree, event dispatch, focus, widgets
+spherekit-ui              element tree, event dispatch, focus, widgets
     ↓
-sphere-layout          retained nodes, style, dirty flags, hit testing
+spherekit-layout          retained nodes, style, dirty flags, hit testing
     ↓
-sphere-render          canvas → scene → cull → batch → CompiledFrame
+spherekit-render          canvas → scene → cull → batch → CompiledFrame
     ↓
-sphere-wgpu            the only crate that knows wgpu exists
+spherekit-wgpu            the only crate that knows wgpu exists
     ↓
 D3D12 / Vulkan / Metal / WebGPU
 ```
 
-Dependencies point downward and never upward. `sphere-render` does not know what a node is.
-`sphere-core` does not know what a GPU is.
+Dependencies point downward and never upward. `spherekit-render` does not know what a node is.
+`spherekit-core` does not know what a GPU is.
 
 ## The three rules that shaped everything else
 
 ### 1. The graphics engine must stand alone
 
-`sphere-render` has no dependency on `sphere-layout` or `sphere-ui`. Drawing does not require nodes:
+`spherekit-render` has no dependency on `spherekit-layout` or `spherekit-ui`. Drawing does not require nodes:
 
 ```rust
 let mut scene = Scene::new(viewport, scale);
@@ -60,7 +60,7 @@ bitflags! {
 ```
 
 `LAYOUT` propagates to ancestors, because a child's size can change a parent's. `PAINT` does not
-propagate at all. `sphere-layout` exposes a "nodes relaid out this pass" counter specifically so
+propagate at all. `spherekit-layout` exposes a "nodes relaid out this pass" counter specifically so
 this property is *measured* rather than asserted, and there is a test that marks a deep node
 `PAINT`-dirty and asserts the counter stays at zero.
 
@@ -72,8 +72,8 @@ crate:
 | Type | Hidden behind |
 |---|---|
 | `wgpu::*` | `RendererBackend`, `CompiledFrame` |
-| `taffy::*` | `LayoutEngine`, Sphere's own `Style` |
-| `winit::*` | Sphere's own `Window`, `WindowEvent`, `Key` |
+| `taffy::*` | `LayoutEngine`, SphereKit's own `Style` |
+| `winit::*` | SphereKit's own `Window`, `WindowEvent`, `Key` |
 | `lyon::*` | `Tessellator`, `Mesh` |
 
 The point is not purity. It is that `CompiledFrame` is pure data, so the batch compiler is testable
@@ -84,17 +84,17 @@ redesigning anything above it.
 
 | Crate | Owns | Depends on |
 |---|---|---|
-| `sphere-core` | Units, geometry, transforms, colour, paths, paint, ids, errors | — |
-| `sphere-render` | Canvas, scene, culling, batching, tessellation, backend trait | core |
-| `sphere-wgpu` | wgpu backend, WGSL, pipelines, GPU buffers, textures | core, render |
-| `sphere-text` | Font db, shaping, line layout, MTSDF, atlas, caches | core |
-| `sphere-layout` | Retained tree, style, dirty flags, hit testing, scrolling | core |
-| `sphere-image` | Decoding, texture cache, fit resolution | core |
-| `sphere-svg` | SVG parsing, cached tessellation | core, render |
-| `sphere-platform` | Windows, input, IME, monitors, scheduling | core |
-| `sphere-ui` | Elements, events, focus, widgets | core, render, layout, text, platform |
-| `sphere-audio-ui` | Meters, waveforms, spectrums, lock-free transfer | core, render, ui |
-| `sphere` | Facade | all |
+| `spherekit-core` | Units, geometry, transforms, colour, paths, paint, ids, errors | — |
+| `spherekit-render` | Canvas, scene, culling, batching, tessellation, backend trait | core |
+| `spherekit-wgpu` | wgpu backend, WGSL, pipelines, GPU buffers, textures | core, render |
+| `spherekit-text` | Font db, shaping, line layout, MTSDF, atlas, caches | core |
+| `spherekit-layout` | Retained tree, style, dirty flags, hit testing, scrolling | core |
+| `spherekit-image` | Decoding, texture cache, fit resolution | core |
+| `spherekit-svg` | SVG parsing, cached tessellation | core, render |
+| `spherekit-platform` | Windows, input, IME, monitors, scheduling | core |
+| `spherekit-ui` | Elements, events, focus, widgets | core, render, layout, text, platform |
+| `spherekit-audio-ui` | Meters, waveforms, spectrums, lock-free transfer | core, render, ui |
+| `spherekit` | Facade | all |
 
 Eleven crates, not thirty. Each boundary exists because something on one side must be replaceable or
 testable without the other. A crate that could not justify that was not created.
@@ -167,7 +167,7 @@ The audio boundary is the one that is not negotiable, and it has its own documen
 
 ## Error handling
 
-Sphere does not panic for conditions a running application can legitimately hit. A lost surface, a
+SphereKit does not panic for conditions a running application can legitimately hit. A lost surface, a
 minimised window, a missing font, a full atlas — all of them are values, and the caller decides the
 policy.
 
@@ -203,6 +203,6 @@ Roughly two thirds of the test suite runs with no GPU, because roughly two third
 no business needing one. Geometry, colour, paths, scenes, culling, batching, layout and dirty
 propagation are all pure functions of their input.
 
-What does need a device is isolated into `crates/sphere-wgpu/tests/pipelines.rs`, which creates a
+What does need a device is isolated into `crates/spherekit-wgpu/tests/pipelines.rs`, which creates a
 headless adapter, validates every WGSL module through naga, and builds every pipeline for both the
 swapchain and the layer format. On a machine with no adapter it skips rather than fails.

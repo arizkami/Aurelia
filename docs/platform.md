@@ -4,20 +4,20 @@ Windows, input, HiDPI, and the parts of "not owning the process" that matter.
 
 ## The seam
 
-`sphere-platform` has two jobs: describe the hardware faithfully, and keep `winit` from leaking.
+`spherekit-platform` has two jobs: describe the hardware faithfully, and keep `winit` from leaking.
 
-**No `winit` type appears in the public API.** Sphere has its own `WindowEvent`, `Key`, `NamedKey`,
+**No `winit` type appears in the public API.** SphereKit has its own `WindowEvent`, `Key`, `NamedKey`,
 `MouseButton`, `Modifiers`, `ScrollDelta`, `Cursor` and `MonitorInfo`. The winit backend lives in
 `backend/winit.rs` behind a feature, so a native Win32, AppKit or Wayland backend can replace it
 without touching anything above.
 
-`sphere-ui` then has its *own* input types again, and translates at `sphere_ui::InputTranslator`.
+`spherekit-ui` then has its *own* input types again, and translates at `spherekit_ui::InputTranslator`.
 That is a deliberate second boundary rather than duplication:
 
 | Layer | Answers |
 |---|---|
-| `sphere-platform` | What did the window system say? |
-| `sphere-ui` | What interaction is this? |
+| `spherekit-platform` | What did the window system say? |
+| `spherekit-ui` | What interaction is this? |
 
 A platform `MouseInput` carries no coordinates, because the window system does not send any. A UI
 `MouseDown` must carry them, because every handler needs them. Something has to remember the last
@@ -26,7 +26,7 @@ something, one per window.
 
 ## Logical and physical pixels
 
-Every position `sphere-platform` reports is in **logical** pixels (`Point<Px>`); every extent is in
+Every position `spherekit-platform` reports is in **logical** pixels (`Point<Px>`); every extent is in
 **physical** pixels (`Size<DevicePx>`). That asymmetry is not an accident:
 
 - A pointer position is compared against layout, which is logical.
@@ -47,7 +47,7 @@ platforms have been observed to report `0.0` transiently while a window moves be
 a zero scale makes every downstream conversion degenerate.
 
 A `ScaleFactorChanged` normally arrives with a `Resized` in the same breath; the surface must be
-reconfigured before the next frame, and `SphereSurface::resize` handles a zero extent by doing
+reconfigured before the next frame, and `SphereKitSurface::resize` handles a zero extent by doing
 nothing — a minimised window is not an error.
 
 ## The event loop
@@ -103,7 +103,7 @@ let attrs = WindowAttributes::new("...").with_visible(false);
 let window = cx.create_window(&attrs)?;
 
 // 2. Initialise. Nothing is on screen while this runs.
-let surface = SphereSurface::new(...).await?;
+let surface = SphereKitSurface::new(...).await?;
 
 // 3. Draw one frame into the hidden window.
 self.draw();
@@ -113,7 +113,7 @@ window.set_visible(true);
 window.request_redraw();
 ```
 
-[`SphereSurface::has_presented`] is the condition to test at step 4, and it is deliberately not the
+[`SphereKitSurface::has_presented`] is the condition to test at step 4, and it is deliberately not the
 same as "`render` returned". `render` reports `Ok(None)` for a zero-area viewport and for a surface
 that is transiently unavailable, and neither of those has drawn anything — revealing on either would
 show exactly the blank window the sequence exists to avoid.
@@ -221,7 +221,7 @@ surface". It is not built, and the reasons are worth stating rather than leaving
 2. **Measured scope.** winit's `platform_impl/windows` is 9,219 lines, of which keyboard and layout
    handling are 2,229 and the IME implementation is roughly 600. The hard parts are dead keys,
    layout switching and `ToUnicodeEx` kernel-state handling — none of which is chrome.
-3. **A backend without IME is not a fallback.** Sphere has a working input method path
+3. **A backend without IME is not a fallback.** SphereKit has a working input method path
    (see above). Shipping a second backend that reports `Unsupported` for it would make that backend
    unusable for exactly the languages an input method exists for.
 4. **The stated justification is not yet demonstrated.** "A plug-in host owns the pump" is the
@@ -248,7 +248,7 @@ pub enum WindowTarget {
 ```
 
 Both implement `HasWindowHandle` and `HasDisplayHandle`, so `WgpuRenderer::new` and
-`SphereSurface::new` accept either. `WindowAttributes::with_parent` covers the case where the
+`SphereKitSurface::new` accept either. `WindowAttributes::with_parent` covers the case where the
 engine creates a child window inside a host-supplied parent.
 
 `App::run` is documented as main-thread-only and **not for plug-ins** — a plug-in must not call it
@@ -261,14 +261,14 @@ Host lifecycle concerns worth stating plainly:
   synchronously.
 - Several instances of the same plug-in share a process. Nothing in the engine may be a process
   global, which is why there is no global renderer, no global font database and no global cache.
-- The host owns window focus. Sphere's focus registry is deliberately independent of it; see
-  `sphere_ui::FocusRegistry`.
+- The host owns window focus. SphereKit's focus registry is deliberately independent of it; see
+  `spherekit_ui::FocusRegistry`.
 
 ## Multiple windows
 
 `WindowRegistry` holds every open window with its own size, scale factor, focus state and redraw
 policy. A main window, a floating mixer, a plug-in editor and a modal each get their own
-`SphereSurface`; the GPU device is shared where the backend allows it.
+`SphereKitSurface`; the GPU device is shared where the backend allows it.
 
 ## Keyboard
 
@@ -299,8 +299,8 @@ Input-method composition works end to end, and the path is worth spelling out be
 has to cooperate and a break anywhere is silent.
 
 ```text
-winit Ime            sphere-platform ImeEvent
-   -> InputTranslator   sphere-ui UiEvent::Ime
+winit Ime            spherekit-platform ImeEvent
+   -> InputTranslator   spherekit-ui UiEvent::Ime
    -> UiTree::dispatch_with_text
    -> TextField         -> TextEdit::set_preedit / commit / cancel_composition
    -> paint             -> PaintContext::request_ime(caret)
@@ -312,14 +312,14 @@ winit Ime            sphere-platform ImeEvent
 
 An input method composes over several keystrokes before committing. The user has to *see* what they
 are composing, in place, with the text around it reflowing — so the provisional string is spliced
-into the buffer like any other text and [`sphere_ui::TextEdit::preedit`] records the byte range it
+into the buffer like any other text and [`spherekit_ui::TextEdit::preedit`] records the byte range it
 occupies.
 
 Two consequences fall out of that, and both are easy to get wrong:
 
-* [`sphere_ui::TextEdit::text`] is **not** the value while composing. Anything outside the editor —
+* [`spherekit_ui::TextEdit::text`] is **not** the value while composing. Anything outside the editor —
   validation, a search-as-you-type query, a bound model field — must read
-  [`sphere_ui::TextEdit::committed_text`], or it sees half-composed syllables.
+  [`spherekit_ui::TextEdit::committed_text`], or it sees half-composed syllables.
 * Ordinary edits have to be refused while a composition is open, or they splice into a range the
   input method believes it owns and the next pre-edit replaces the wrong bytes. `TextEdit` refuses
   them itself; `is_composing` is the check.
@@ -338,7 +338,7 @@ type Japanese:
    screen, which makes the feature useless for the languages that need it.
 
 Both come from one signal. A focused field calls `PaintContext::request_ime` with its caret, the
-tree collects it, and the application reads `SphereSurface::ime()` after rendering:
+tree collects it, and the application reads `SphereKitSurface::ime()` after rendering:
 
 ```rust
 let area = surface.ime();
@@ -369,10 +369,10 @@ reliable signal for that is that it did not ask again.
 
 Turning a click into a caret index means shaping the string, so `UiTree::dispatch_with_text` exists
 alongside `UiTree::dispatch` — the same pairing as `compute_layout_with_text`, for the same reason.
-`SphereSurface::dispatch` uses the text-aware form. Shaping there is a cache hit: paint shaped the
+`SphereKitSurface::dispatch` uses the text-aware form. Shaping there is a cache hit: paint shaped the
 same string with the same style moments earlier.
 
-A field lays out with [`sphere_ui::TextField`]'s own `text_style`, used by paint *and* by hit
+A field lays out with [`spherekit_ui::TextField`]'s own `text_style`, used by paint *and* by hit
 testing. Measuring at one size and painting at another puts the caret on the wrong character,
 visibly so at the end of a long string.
 

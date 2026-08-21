@@ -14,7 +14,7 @@ Scene                    flat command list + side tables
 CompiledFrame            instance buffers, transform/clip/gradient tables,
                          batches, passes, targets — pure data, no GPU
    ↓
-RendererBackend          sphere-wgpu
+RendererBackend          spherekit-wgpu
    ↓
 D3D12 / Vulkan / Metal / WebGPU
 ```
@@ -22,7 +22,7 @@ D3D12 / Vulkan / Metal / WebGPU
 The split between `Scene`, `CompiledFrame` and the backend is the load-bearing decision in this
 crate. `CompiledFrame` contains no GPU handles and is produced by code that never touches a device,
 which is what makes the batch compiler unit-testable and benchmarkable on a machine with no GPU at
-all. Roughly half of `sphere-render`'s tests exercise it.
+all. Roughly half of `spherekit-render`'s tests exercise it.
 
 ## Why the canvas does not draw
 
@@ -281,7 +281,7 @@ there is a regression test named after exactly that.
 
 ## Verification
 
-`crates/sphere-wgpu/tests/pipelines.rs` creates a headless adapter, runs every WGSL module through
+`crates/spherekit-wgpu/tests/pipelines.rs` creates a headless adapter, runs every WGSL module through
 naga validation, and builds every pipeline for both the swapchain and the layer format. A shader
 that fails validation is otherwise invisible until a window opens and shows nothing.
 

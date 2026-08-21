@@ -9,7 +9,7 @@
 //!include common/math.wgsl
 //!include common/frame.wgsl
 
-// Keep in sync with `sphere_render::primitives::glyph_flags`.
+// Keep in sync with `spherekit_render::primitives::glyph_flags`.
 const BITMAP: u32 = 1u;
 const OUTLINE: u32 = 2u;
 const CLIP_ROUNDED: u32 = 4u;
@@ -21,7 +21,7 @@ const SUBPIXEL: u32 = 8u;
 /// Bends the coverage ramp so the linear blend and the sRGB encode downstream
 /// reproduce a gamma-space blend.
 ///
-/// Coverage is a geometric fraction of a pixel. Sphere blends in linear light,
+/// Coverage is a geometric fraction of a pixel. SphereKit blends in linear light,
 /// which is right for every other primitive and wrong for this one: half
 /// coverage of white on black lands in the buffer as linear 0.5, which the sRGB
 /// surface shows as 0.735. The grey pixel beside a stem comes out nearly as
@@ -32,7 +32,7 @@ const SUBPIXEL: u32 = 8u;
 /// directions need mirrored curves rather than reciprocal exponents — the blend
 /// is linear in the *destination*, so it is always the end of the ramp nearest
 /// the background that has to bend. See `GlyphRun::coverage_contrast`, and
-/// `sphere_render::scene::alpha_from_coverage`, which is this function on the
+/// `spherekit_render::scene::alpha_from_coverage`, which is this function on the
 /// CPU and must not drift from it.
 fn apply_coverage_contrast(coverage: f32, contrast: f32) -> f32 {
     let c = clamp(coverage, 0.0, 1.0);
