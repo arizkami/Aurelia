@@ -568,6 +568,11 @@ impl GalleryApp {
         let current = self.state.page.get();
         let mut nav = div()
             .flex_col()
+            // Clipped, and scrollable once it no longer fits. Without this the
+            // rows overflow a short sidebar and are drawn straight over the
+            // account footer — the container shrinks, its fixed-height
+            // children do not, and nothing was cutting the difference off.
+            .overflow_y_scroll()
             // Grows instead of filling: the footer below claims its own height
             // first, and whatever is left over is the navigation's.
             .grow(1.0)
@@ -808,17 +813,27 @@ impl GalleryApp {
                     .flex_row()
                     .items_center()
                     .h(px(36.0))
+                    .shrink(0.0)
                     .px_(px(12.0))
+                    // A `no_wrap` label's minimum width is its whole string, so
+                    // two of them in one row simply refuse to yield and get
+                    // drawn over each other. The title takes the leftover space
+                    // and clips inside it; the hint keeps its size and wins,
+                    // which is the right way round — a truncated page title is
+                    // still readable, a truncated sentence is not.
                     .child(
-                        label(self.state.page.get().title())
-                            .text_size(theme.typography.sm)
-                            .weight(theme.typography.strong)
-                            .text_color(c.text)
-                            .no_wrap(),
+                        div().flex_1().min_w(px(0.0)).overflow_hidden().child(
+                            label(self.state.page.get().title())
+                                .text_size(theme.typography.sm)
+                                .weight(theme.typography.strong)
+                                .text_color(c.text)
+                                .no_wrap(),
+                        ),
                     )
-                    .child(div().flex_1())
+                    .child(div().w(theme.spacing.md).shrink(0.0))
                     .child(
                         label("Every control here is live")
+                            .shrink(0.0)
                             .text_size(theme.typography.xs)
                             .text_color(c.text_muted)
                             .no_wrap(),
@@ -1692,6 +1707,36 @@ mod tests {
                 "the {} page built only {} elements — it is probably empty",
                 page.title(),
                 tree.stats().elements
+            );
+        }
+    }
+
+    #[test]
+    fn the_chrome_keeps_its_height_in_a_short_window() {
+        // Height, not page length, is the other way the column runs short. A
+        // window dragged down to a sliver still has to keep its caption and its
+        // status bar intact — they are the two things the user grabs to undo it.
+        let mut text = TextSystem::with_system_fonts();
+        for height in [720.0, 400.0, 300.0, 220.0, 160.0] {
+            let mut app = GalleryApp::new();
+            app.state.page.set(Page::Palette);
+            let viewport = size(px(560.0), px(height));
+            let mut tree = UiTree::new();
+            tree.set_theme(app.state.theme());
+            tree.build(app.build());
+            tree.compute_layout_with_text(viewport, &mut text).unwrap();
+
+            let header = tree.bounds_of("chrome.header").unwrap();
+            let status = tree.bounds_of("chrome.status").unwrap();
+            assert_eq!(
+                header.height(),
+                px(CAPTION_HEIGHT),
+                "the caption was squashed in a {height} px window"
+            );
+            assert_eq!(
+                status.height(),
+                px(26.0),
+                "the status bar was squashed in a {height} px window"
             );
         }
     }

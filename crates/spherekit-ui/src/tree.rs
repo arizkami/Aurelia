@@ -64,11 +64,53 @@ struct BuiltNode {
     paints_over: bool,
 }
 
+/// How many lines one wheel notch scrolls.
+///
+/// The platform default, and the number that matters more than any easing here:
+/// Windows reports a notch as `120` raw units, every toolkit turns that into
+/// *three* lines, and a window that moves one line per notch feels stuck even
+/// though it is scrolling perfectly well.
+///
+/// This is the fallback. The user's actual setting is read once through
+/// [`spherekit_platform::wheel_scroll_lines`] and used in preference — a reader
+/// who has turned their wheel up to ten lines has said what they want, and an
+/// application that ignores it is the reason they had to say it twice.
+pub const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
+
+/// The fraction of the visible height "one screen at a time" scrolls.
+///
+/// Not the whole height: every shell keeps a couple of lines of context across
+/// a page jump so the reader can see where they were. Windows' own list views
+/// use one line of overlap; a fixed fraction is the same idea and does not need
+/// a line height to express.
+const WHEEL_PAGE_FRACTION: f32 = 0.9;
+
+/// How far one wheel notch travels, given a line height and a viewport.
+///
+/// Split out from the dispatch so the policy — including the page-scroll case,
+/// which is easy to write as a four-million-pixel jump — can be tested without
+/// a window.
+fn wheel_notch_distance(setting: Option<u32>, line: Px, viewport_extent: Px) -> Px {
+    match setting {
+        // "One screen at a time" is a real Windows setting and is not a number
+        // of lines. Taking it literally scrolls `u32::MAX` lines.
+        Some(spherekit_platform::WHEEL_SCROLL_PAGE) => {
+            Px((viewport_extent.get() * WHEEL_PAGE_FRACTION).max(line.get()))
+        }
+        // Zero is the documented "no wheel scrolling" value.
+        Some(0) => Px::ZERO,
+        Some(lines) => line * lines as f32,
+        None => line * WHEEL_LINES_PER_NOTCH,
+    }
+}
+
 /// How long a wheel notch takes to land.
 ///
-/// Short enough that the content feels attached to the wheel, long enough that
-/// consecutive notches blend into one movement instead of three jumps.
-const SCROLL_GLIDE: f32 = 0.22;
+/// Short enough that the content stays attached to the wheel — past roughly a
+/// sixth of a second the eye reads the delay as the application thinking rather
+/// than as motion — and long enough that consecutive notches blend into one
+/// movement instead of a stack of jumps.
+const SCROLL_GLIDE: f32 = 0.13;
 
 /// A scroll offset on its way somewhere.
 ///
@@ -202,6 +244,11 @@ pub struct UiTree {
     stats: TreeStats,
     /// Scratch for hit testing, reused so a mouse move never allocates.
     hit_scratch: Vec<NodeId>,
+    /// The user's wheel setting, read once at construction.
+    ///
+    /// Cached rather than queried per event: it is a registry-backed system
+    /// call, and the wheel is one of the highest-frequency events there is.
+    wheel_lines: Option<u32>,
     /// Scroll offsets still travelling toward a wheel target.
     ///
     /// Empty almost always; one entry while a list is gliding. A thumb drag
@@ -238,6 +285,7 @@ impl UiTree {
             stats: TreeStats::default(),
             hit_scratch: Vec::new(),
             scroll_glide: FxHashMap::default(),
+            wheel_lines: spherekit_platform::wheel_scroll_lines(),
         }
     }
 
@@ -906,8 +954,24 @@ impl UiTree {
         // for nothing: a list that has hit its end passes the wheel to the pane
         // behind it, exactly as every other toolkit does.
         if let UiEvent::Scroll(wheel) = event {
+            // A line of body text is the unit a "line" of scrolling means, and
+            // a notch is three of them. `to_pixels` only converts, so the
+            // notch multiple is folded into the line height handed to it —
+            // which leaves a trackpad's pixel deltas untouched, as they must
+            // be: those are already the distance the fingers moved.
+            // A line of body text is the unit a "line" of scrolling means; how
+            // many of them a notch is worth is the user's setting. The whole
+            // notch distance is folded into the line height handed to
+            // `to_pixels`, which leaves a trackpad's pixel deltas untouched —
+            // those are already the distance the fingers moved.
             let line = self.theme.typography.md * self.theme.typography.line_height;
-            let delta = wheel.delta.to_pixels(line);
+            let viewport = self
+                .root
+                .and_then(|r| self.layout.layout(r))
+                .map(|l| l.client_size().height)
+                .unwrap_or(line);
+            let notch = wheel_notch_distance(self.wheel_lines, line, viewport);
+            let delta = wheel.delta.to_pixels(notch);
             if let Some(position) = self.scroll_chain(&indices, delta) {
                 result.repaint = true;
                 result.consumed = true;
@@ -1690,6 +1754,42 @@ mod tests {
         assert_eq!(tree.focus().focused(), Some(ElementId::from_key("a")));
         assert!(tree.navigate_focus(FocusDirection::Next));
         assert_eq!(tree.focus().focused(), Some(ElementId::from_key("b")));
+    }
+
+    #[test]
+    fn the_wheel_setting_decides_the_notch_distance() {
+        let line = px(18.0);
+        let viewport = px(600.0);
+
+        // No setting readable: the platform default.
+        assert_eq!(wheel_notch_distance(None, line, viewport), line * WHEEL_LINES_PER_NOTCH);
+        // The usual Windows value.
+        assert_eq!(wheel_notch_distance(Some(3), line, viewport), px(54.0));
+        // A reader who turned it up gets what they asked for.
+        assert_eq!(wheel_notch_distance(Some(10), line, viewport), px(180.0));
+        // Zero is the documented "wheel does not scroll" value.
+        assert_eq!(wheel_notch_distance(Some(0), line, viewport), Px::ZERO);
+    }
+
+    #[test]
+    fn one_screen_at_a_time_scrolls_a_screen_not_four_million_lines() {
+        // `WHEEL_PAGESCROLL` is `u32::MAX`. Multiplying it by a line height is
+        // the obvious reading and would jump roughly 77 million pixels, which
+        // lands every scroll at the end of the content.
+        let line = px(18.0);
+        let viewport = px(600.0);
+        let page =
+            wheel_notch_distance(Some(spherekit_platform::WHEEL_SCROLL_PAGE), line, viewport);
+        assert!(page > line, "a page should move more than a line");
+        assert!(page < viewport, "a page should keep some context on screen");
+        assert_eq!(page, px(540.0));
+
+        // And it must stay sane when the viewport is tiny: never less than a
+        // line, or the wheel would appear dead in a short pane.
+        assert_eq!(
+            wheel_notch_distance(Some(spherekit_platform::WHEEL_SCROLL_PAGE), line, px(4.0)),
+            line
+        );
     }
 
     #[test]

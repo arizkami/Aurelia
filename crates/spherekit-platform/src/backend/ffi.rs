@@ -53,10 +53,11 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnableMenuItem, GetSystemMenu, HMENU, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, NCCALCSIZE_PARAMS,
     PostMessageW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE,
-    SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYCAPTION, SM_CYSIZEFRAME, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_INITMENUPOPUP, WM_NCCALCSIZE,
-    WM_NCDESTROY, WM_NCHITTEST, WM_NCRBUTTONUP, WM_SYSCOMMAND,
+    SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYCAPTION, SM_CYSIZEFRAME, SPI_GETWHEELSCROLLLINES,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+    SetWindowPos, SystemParametersInfoW, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, WM_INITMENUPOPUP, WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCRBUTTONUP,
+    WM_SYSCOMMAND,
 };
 
 /// `windows-sys` does not expose this message on every SDK feature set.
@@ -224,6 +225,25 @@ const DWMWA_MICA_EFFECT: u32 = 1029;
 const DWMSBT_NONE: u32 = 1;
 const DWMSBT_MAINWINDOW: u32 = 2;
 const DWMSBT_TRANSIENTWINDOW: u32 = 3;
+
+/// How many lines one wheel notch scrolls, as the user has it set.
+///
+/// `None` when the setting cannot be read, which is the caller's cue to use its
+/// own default rather than invent one here.
+///
+/// Windows reports the "roll the mouse wheel to scroll" value from Settings.
+/// `WHEEL_PAGESCROLL` (`u32::MAX`) is the "one screen at a time" option and is
+/// passed through as-is — a page is not a number of lines, and flattening it to
+/// one here would silently drop a setting the user chose deliberately.
+pub(crate) fn wheel_scroll_lines() -> Option<u32> {
+    let mut lines: u32 = 0;
+    // SAFETY: `SPI_GETWHEELSCROLLLINES` writes one `u32` through `pvParam`, and
+    // that is exactly what is passed. The call reads no user buffer.
+    let ok = unsafe {
+        SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, (&mut lines as *mut u32).cast(), 0)
+    };
+    if ok != 0 { Some(lines) } else { None }
+}
 
 /// Makes DWM draw the native frame and system backdrop in the requested theme.
 pub(crate) fn set_immersive_dark_mode(hwnd: *mut core::ffi::c_void, dark: bool) -> bool {

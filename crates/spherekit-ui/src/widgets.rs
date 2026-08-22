@@ -3035,6 +3035,35 @@ mod tests {
     }
 
     #[test]
+    fn one_wheel_notch_travels_a_platform_notch() {
+        // A notch has to move about what every other application on the desktop
+        // moves, or the window feels stuck even though it is scrolling. Windows
+        // and the major toolkits step three lines per notch; one line is a third
+        // of that and reads as the wheel barely working.
+        let mut tree = UiTree::new();
+        tree.build(
+            div().w(relative(1.0)).h(relative(1.0)).child(overflowing_scroll_view()).into_element(),
+        );
+        tree.compute_layout(viewport()).unwrap();
+
+        // One notch is one line of `ScrollDelta::Lines`; the platform reports
+        // 120 raw units as 1.0.
+        tree.dispatch(&wheel_at(50.0, 50.0, 1.0));
+        settle(&mut tree);
+        let moved = tree.scroll_offset_of("inner").unwrap().height.get();
+
+        let theme = crate::theme::Theme::dark();
+        let line = theme.typography.md.get() * theme.typography.line_height;
+        let notch = line * crate::tree::WHEEL_LINES_PER_NOTCH;
+        assert!(
+            (moved - notch).abs() < 1.0,
+            "one notch moved {moved:.1} px; a platform notch is {notch:.1} px \
+             ({line:.1} px per line x {})",
+            crate::tree::WHEEL_LINES_PER_NOTCH
+        );
+    }
+
+    #[test]
     fn the_wheel_glides_rather_than_jumping() {
         // The offset must be *between* where it was and where it is going for
         // at least one frame. A jump would satisfy every other scroll test in

@@ -64,6 +64,33 @@ pub mod window;
 #[cfg(feature = "winit-backend")]
 pub mod app;
 
+/// How many lines one wheel notch should scroll, as the user has it configured.
+///
+/// `None` on a platform with no such setting, or when it cannot be read — the
+/// caller keeps its own default rather than being handed a guess dressed up as
+/// an answer.
+///
+/// A return of [`WHEEL_SCROLL_PAGE`] means "one screen at a time", which is a
+/// setting Windows genuinely offers and which no number of lines expresses.
+/// Callers must handle it; treating it as a line count would scroll roughly
+/// four million pixels.
+pub fn wheel_scroll_lines() -> Option<u32> {
+    #[cfg(windows)]
+    {
+        backend::ffi::wheel_scroll_lines()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// The value [`wheel_scroll_lines`] returns for "one screen at a time".
+///
+/// Windows' own `WHEEL_PAGESCROLL`. Passed through rather than flattened,
+/// because a page is not a number of lines and the user chose it deliberately.
+pub const WHEEL_SCROLL_PAGE: u32 = u32::MAX;
+
 pub use clipboard::{Clipboard, ClipboardProvider};
 pub use cursor::Cursor;
 pub use event::{ElementState, ImeEvent, MouseButton, ScrollDelta, Theme, TouchPhase, WindowEvent};

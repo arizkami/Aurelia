@@ -18,9 +18,6 @@ A graphics and UI foundation for software that has to stay responsive while some
 already using the machine hard — digital audio workstations, audio plug-ins, creative tools,
 realtime visualisation.
 
-It is pure Rust. There is no Skia, no C++ rendering core, no browser DOM, no Electron, no CEF, no
-Qt, and no JUCE GUI anywhere in the dependency tree.
-
 ## What makes it different
 
 **The graphics engine stands alone.** `spherekit-render` has no idea that nodes, layout or widgets
@@ -45,9 +42,11 @@ This is enforced by the dirty-flag propagation rules, and it is tested rather th
 **Text is a distance field, not a bitmap cache.** Glyphs are rasterised once into a multi-channel
 signed distance field with a fourth true-distance channel (MTSDF), then sampled at any size.
 Zooming a panel does not re-rasterise anything, and outlines, glows and shadows come from the same
-field with no second pass. Below roughly twelve device pixels — where a distance field runs out of
-resolution before a glyph runs out of detail — an isolated grayscale fallback keeps small labels
-crisp.
+field with no second pass. Below twenty-four device pixels — where a distance field runs out of
+resolution before a glyph runs out of detail — an isolated bitmap fallback takes over, vertically
+grid-fitted and positioned to a quarter pixel, which is what keeps interface labels crisp at 100 %
+scaling. The threshold is on _device_ pixels, so a 13 px label is a bitmap at 100 % and a distance
+field at 200 %.
 
 **Realtime audio data never renders from the audio thread.** The boundary is a lock-free snapshot
 or ring buffer. Everything on the far side of it — allocation, GPU upload, text shaping, file I/O —
@@ -62,6 +61,40 @@ outlines from looking jagged.
 **Colour is linear, and that is not optional.** `Color` is sRGB with straight alpha; `LinearColor`
 is linear-light and premultiplied and is what reaches the GPU. Mixing happens in linear space, so a
 black-to-white midpoint is the perceptually correct `0.735`, not a naive `0.5`.
+
+**A widget owns no state.** Every control takes its value and reports changes; nothing is hidden in
+the tree. That is what lets a parameter live in a DSP struct, an undo stack or a host automation
+lane with no adapter in between.
+
+```rust
+knob(self.threshold.get())
+    .range(-60.0, 0.0)
+    .on_change({ let t = self.threshold.clone(); move |v| t.set(v) })
+```
+
+## Widgets
+
+|            |                                                                                         |
+| ---------- | --------------------------------------------------------------------------------------- |
+| Buttons    | `button` — primary, secondary, ghost, danger; any width or height; icon-font glyphs     |
+| Selection  | `toggle`, `checkbox`                                                                    |
+| Values     | `slider`, `fader`, `knob` — stepped, bipolar, formatted, keyboard-adjustable            |
+| Text       | `label`, `text_field` — selection, masking, input-method composition, clipboard         |
+| Identity   | `avatar` — initials, a tint derived from the name, presence dot                         |
+| Menus      | `dropdown` anchored to a control, `context_menu` at a point, `menu_item` with shortcuts |
+| Containers | `scroll_view`, `scroll_area`, `panel`, `separator`, `progress` (determinate or not)     |
+
+Cut, copy, paste and select-all live on `TextEdit`, so a keyboard shortcut and a menu item cannot
+disagree about what Copy means — including the rule that a masked field never hands its contents to
+a global clipboard. A field _reports_ a right-click through `on_context_menu` rather than opening a
+menu itself: an element cannot place a popup outside its own box, so the application owns the menu
+and therefore owns where it goes.
+
+Scrolling is real scrolling: the wheel moves the innermost container that still has room and chains
+outward when it does not, the offset glides to its destination on an eased curve, and overlay
+scrollbars draw _over_ the content so showing them never changes what the content is laid out into.
+One notch travels as far as the reader's own Windows setting says it should —
+`SPI_GETWHEELSCROLLLINES`, including the "one screen at a time" option.
 
 ## Architecture
 
@@ -79,21 +112,32 @@ spherekit-wgpu         the only crate that knows wgpu exists
 D3D12 / Vulkan / Metal / WebGPU
 ```
 
-| Crate | Responsibility |
-|---|---|
-| `spherekit-core` | Units, geometry, transforms, colour, paths, paint, identity, errors |
-| `spherekit-render` | Canvas, display list, culling, batching, tessellation, backend seam |
-| `spherekit-wgpu` | wgpu backend, WGSL shaders, pipeline cache, GPU buffers |
-| `spherekit-text` | Font discovery, shaping, line layout, MTSDF generation, paged atlas |
-| `spherekit-layout` | Retained layout tree, style, dirty flags, hit testing, scrolling |
-| `spherekit-image` | Image decoding, texture cache, fit resolution |
-| `spherekit-svg` | SVG parsing and cached tessellation for interface assets |
-| `spherekit-platform` | Windows, input, IME, monitors, frame scheduling |
-| `spherekit-ui` | Element tree, event dispatch, focus, widgets |
-| `spherekit-audio-ui` | Meters, waveforms, spectrums, EQ curves, lock-free transfer |
-| `spherekit` | Facade that re-exports the whole engine |
+| Crate                | Responsibility                                                      |
+| -------------------- | ------------------------------------------------------------------- |
+| `spherekit-core`     | Units, geometry, transforms, colour, paths, paint, identity, errors |
+| `spherekit-render`   | Canvas, display list, culling, batching, tessellation, backend seam |
+| `spherekit-wgpu`     | wgpu backend, WGSL shaders, pipeline cache, GPU buffers             |
+| `spherekit-text`     | Font discovery, shaping, line layout, MTSDF generation, paged atlas |
+| `spherekit-layout`   | Retained layout tree, style, dirty flags, hit testing, scrolling    |
+| `spherekit-image`    | Image decoding, texture cache, fit resolution                       |
+| `spherekit-svg`      | SVG parsing and cached tessellation for interface assets            |
+| `spherekit-platform` | Windows, input, IME, monitors, frame scheduling                     |
+| `spherekit-ui`       | Element tree, event dispatch, focus, widgets                        |
+| `spherekit-audio-ui` | Meters, waveforms, spectrums, EQ curves, lock-free transfer         |
+| `spherekit-css`      | Stylesheet runtime shared by native and React apps                  |
+| `spherekit-jsengine` | JavaScript runtime host                                             |
+| `spherekit-bridge`   | JSON Lines protocol between a React front end and the native host   |
+| `spherekit-react`    | React renderer that drives the native tree through the bridge       |
+| `spherekit-cli`      | `spherekit` command: scaffolds and builds React + Rust apps         |
+| `spherekit`          | Facade that re-exports the whole engine                             |
 
 Backend mapping: Windows → Direct3D 12, Linux → Vulkan, macOS → Metal, Web → WebGPU.
+
+> **Transparent windows are Direct3D 12 only.** A transparent surface is composited through a
+> DirectComposition visual, which is the DX12 presentation path; NVIDIA's Windows Vulkan WSI
+> exposes `Opaque` alpha and nothing else, so a Mica window on Vulkan renders as a black
+> rectangle. `spherekit-wgpu` forces DX12 for transparent surfaces and says so in the log.
+> `WGPU_BACKEND` still overrides it for diagnostics.
 
 ## Building
 
@@ -112,7 +156,7 @@ cargo clippy --workspace --all-targets --all-features
 > If a workspace-wide `cargo test` fails at the link step with `LNK1120` while the same crates
 > pass individually, the incremental-compilation cache is being interfered with — usually by
 > on-access antivirus scanning, and visible as `did not finalize incremental compilation session
-> directory ... Access is denied (os error 5)`. Set `CARGO_INCREMENTAL=0` for the run.
+directory ... Access is denied (os error 5)`. Set `CARGO_INCREMENTAL=0` for the run.
 
 ### SphereKit CLI and React apps
 
@@ -147,22 +191,23 @@ tradeoffs and supported v1 property boundary.
 Measured on an NVIDIA GTX 1060 (Vulkan), running
 `cargo run -p spherekit --example plugin_ui_demo --release` for 180 frames:
 
-| | |
-|---|---|
-| Tests | 1,020 total, zero warnings, clippy clean, `cargo fmt` clean |
-| Quad instances per frame | 10,018 |
-| Glyph instances per frame | 178 (Latin, Thai, Japanese, Chinese, Korean, Arabic) |
-| Mesh triangles per frame | 1,980 |
-| **Layout nodes relaid out** | **0** — across 180 frames of continuous meter animation |
-| Layout nodes created / reused | 0 / 39 |
-| Glyph texels uploaded | 0 once the atlas is warm |
-| CPU per frame | 1.1 ms typical, 2.2 ms worst |
+|                               |                                                             |
+| ----------------------------- | ----------------------------------------------------------- |
+| Tests                         | 1,297 total, zero warnings, clippy clean, `cargo fmt` clean |
+| Quad instances per frame      | 10,018                                                      |
+| Glyph instances per frame     | 178 (Latin, Thai, Japanese, Chinese, Korean, Arabic)        |
+| Mesh triangles per frame      | 1,980                                                       |
+| **Layout nodes relaid out**   | **0** — across 180 frames of continuous meter animation     |
+| Layout nodes created / reused | 0 / 39                                                      |
+| Glyph texels uploaded         | 0 once the atlas is warm                                    |
+| CPU per frame                 | 1.1 ms typical, 2.2 ms worst                                |
 
 The zero is the point. See [`docs/architecture.md`](docs/architecture.md).
 
 ## Examples
 
 ```bash
+cargo run -p uigallery                          --release  # every widget, live
 cargo run -p spherekit --example desktop_app    --release  # borderless, custom title bar
 cargo run -p spherekit --example system_window  --release  # the platform draws the title bar
 cargo run -p spherekit --example plugin_ui_demo --release  # a compressor plug-in editor
@@ -170,7 +215,16 @@ cargo run -p spherekit --example plugin_ui_demo --release  # a compressor plug-i
 # Diagnostic: writes a side-by-side PNG of one line of text, distance field
 # against whatever the automatic strategy picks, and reports why.
 SPHEREKIT_PROBE_SIZE=13 SPHEREKIT_PROBE_ZOOM=4 cargo run -p spherekit-text --example glyph_quad_probe --release -- out.png
+
+# The same probe with RGB coverage off, which is what a transparent window gets.
+SPHEREKIT_PROBE_SUBPIXEL=0 SPHEREKIT_PROBE_SIZE=10 cargo run -p spherekit-text --example glyph_quad_probe --release
 ```
+
+**`app/uigallery`** is the reference application: seven pages under a custom Windows frame over DWM
+Mica, one per widget family, with a note on each specimen saying what that variant is _for_ — the
+part an API listing cannot tell you. Nothing in it is a mock-up; the toggles toggle and the sliders
+drag, because a gallery that showed pictures would be a worse document than the source it
+documents.
 
 `desktop_app` is the shape most applications are: header, sidebar, scrolling settings pane, status
 bar, runtime theme switching, SVG icons, text fields with input-method support, and keyboard
@@ -186,17 +240,18 @@ measured, which makes them usable as smoke tests.
 
 ## Documentation
 
-| Document | Contents |
-|---|---|
-| [`docs/architecture.md`](docs/architecture.md) | Crate boundaries, the frame lifecycle, why the seams are where they are |
-| [`docs/rendering.md`](docs/rendering.md) | Scene, culling, batching, the instance layouts, shaders, colour |
-| [`docs/text.md`](docs/text.md) | Shaping, MTSDF, the atlas, and the small-text policy |
-| [`docs/layout.md`](docs/layout.md) | The retained tree, dirty propagation, hit testing |
-| [`docs/audio-ui.md`](docs/audio-ui.md) | The audio-thread boundary and realtime primitives |
-| [`docs/platform.md`](docs/platform.md) | Windowing, HiDPI, plug-in embedding, frame scheduling |
-| [`docs/performance.md`](docs/performance.md) | Targets, what is measured, and how |
-| [`docs/api-bridge.md`](docs/api-bridge.md) | React/native JSON Lines API and event bridge |
-| [`docs/roadmap.md`](docs/roadmap.md) | Phase status and what is not built yet |
+| Document                                         | Contents                                                                |
+| ------------------------------------------------ | ----------------------------------------------------------------------- |
+| [`docs/architecture.md`](docs/architecture.md)   | Crate boundaries, the frame lifecycle, why the seams are where they are |
+| [`docs/rendering.md`](docs/rendering.md)         | Scene, culling, batching, the instance layouts, shaders, colour         |
+| [`docs/text.md`](docs/text.md)                   | Shaping, MTSDF, the atlas, and the small-text policy                    |
+| [`docs/layout.md`](docs/layout.md)               | The retained tree, dirty propagation, hit testing                       |
+| [`docs/audio-ui.md`](docs/audio-ui.md)           | The audio-thread boundary and realtime primitives                       |
+| [`docs/platform.md`](docs/platform.md)           | Windowing, HiDPI, plug-in embedding, frame scheduling                   |
+| [`docs/performance.md`](docs/performance.md)     | Targets, what is measured, and how                                      |
+| [`docs/api-bridge.md`](docs/api-bridge.md)       | React/native JSON Lines API and event bridge                            |
+| [`docs/spherekit-css.md`](docs/spherekit-css.md) | The stylesheet runtime and its v1 property boundary                     |
+| [`docs/roadmap.md`](docs/roadmap.md)             | Phase status and what is not built yet                                  |
 
 ## Licence
 
