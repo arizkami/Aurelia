@@ -705,6 +705,30 @@ impl WgpuRenderer {
     }
 }
 
+/// Whether any pass after `from` writes to `target`.
+///
+/// "Writes" covers two shapes, and missing the second is a bug that stays
+/// hidden until something composites at the very end of a frame:
+///
+/// * a later pass whose own `target` is this one — the surface resuming after
+///   a nested layer, and
+/// * a later pass that **composites into** it. A composite is recorded on the
+///   *layer's* pass as a destination, so it never appears as a pass whose
+///   `target` is the surface.
+///
+/// The answer decides whether a multisampled attachment may be discarded once
+/// it resolves. Discarding one that is written again later brings back garbage
+/// on the next `LoadOp::Load` — in practice the whole pass vanishes.
+fn target_written_later(
+    passes: &[impl core::borrow::Borrow<spherekit_render::Pass>],
+    from: usize,
+    target: u32,
+) -> bool {
+    passes[from + 1..].iter().map(|p| p.borrow()).any(|later| {
+        later.target == target || later.composite.as_ref().is_some_and(|c| c.destination == target)
+    })
+}
+
 fn pick_surface_format(caps: &wgpu::SurfaceCapabilities) -> wgpu::TextureFormat {
     // An sRGB target means the hardware does the encode and blending happens in
     // linear space, which is the whole premise of the colour pipeline.
@@ -1126,8 +1150,21 @@ impl RendererBackend for WgpuRenderer {
                 // This is what a translucent panel, a group opacity or a
                 // backdrop blur does *after* other content has drawn: it opens
                 // an offscreen layer and the surface resumes behind it.
-                let resumed_later =
-                    passes[pass_index + 1..].iter().any(|later| later.target == pass.target);
+                // "Written again later" covers two shapes, and missing the
+                // second one is a bug that hides until something composites at
+                // the very end of a frame:
+                //
+                //   * a later pass whose *target* is this one — the surface
+                //     resuming after a nested layer, and
+                //   * a later pass that *composites into* this one. A composite
+                //     is recorded on the layer's own pass as a destination, so
+                //     it never appears as a pass with `target == 0`.
+                //
+                // A context menu at the top of the z-order is exactly the
+                // second shape: nothing draws to the surface after it, so the
+                // surface pass looked finished and threw its samples away —
+                // taking the entire window with it.
+                let resumed_later = target_written_later(&passes, pass_index, pass.target);
                 let store =
                     if samples > 1 && pass.composite.is_none() && pass.clear && !resumed_later {
                         wgpu::StoreOp::Discard
@@ -1622,6 +1659,58 @@ mod tests {
     use super::*;
     use spherekit_core::{Point, Rect, px, rect};
     use spherekit_render::RenderTarget;
+
+    /// A pass with no batches, for reasoning about pass structure alone.
+    fn pass(target: u32, clear: bool, composite_into: Option<u32>) -> spherekit_render::Pass {
+        spherekit_render::Pass {
+            target,
+            batches: 0..0,
+            clear,
+            composite: composite_into.map(|destination| spherekit_render::Composite {
+                source: target,
+                destination,
+                bounds: rect(px(0.0), px(0.0), px(10.0), px(10.0)),
+                opacity: 0.5,
+                blend: spherekit_core::BlendMode::Normal,
+                filter: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_surface_composited_into_at_the_end_of_a_frame_is_still_written_later() {
+        // The exact shape a context menu at the top of the z-order produces:
+        // the surface pass is followed only by a *layer* pass, whose composite
+        // lands back on the surface. Reading only `later.target` says nothing
+        // follows, the surface's multisampled attachment is discarded, and the
+        // composite then loads garbage — the whole window disappears for as
+        // long as the menu is part-transparent.
+        let passes = [
+            pass(1, true, Some(0)), // the sidebar's backdrop-blur layer
+            pass(0, true, None),    // the surface: everything the user sees
+            pass(2, true, Some(0)), // the menu's opacity layer
+        ];
+        assert!(
+            target_written_later(&passes, 1, 0),
+            "the surface pass was treated as finished while a composite still targeted it"
+        );
+    }
+
+    #[test]
+    fn a_surface_resumed_by_a_later_pass_is_written_later() {
+        let passes = [pass(0, true, None), pass(1, true, Some(0)), pass(0, false, None)];
+        assert!(target_written_later(&passes, 0, 0));
+    }
+
+    #[test]
+    fn a_target_nothing_touches_again_is_finished() {
+        // The case the discard exists for: one pass, nothing after it.
+        let passes = [pass(0, true, None)];
+        assert!(!target_written_later(&passes, 0, 0));
+        // And a later layer that composites somewhere *else* does not count.
+        let passes = [pass(0, true, None), pass(1, true, Some(2))];
+        assert!(!target_written_later(&passes, 0, 0));
+    }
 
     fn frame_with_target(origin: (f32, f32), scale: f32) -> CompiledFrame {
         let mut f = CompiledFrame::default();

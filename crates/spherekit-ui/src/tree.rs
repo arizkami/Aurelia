@@ -60,6 +60,41 @@ struct BuiltNode {
     /// rect is only reliably rejected when the element also has no group of its
     /// own to open.
     hidden: bool,
+    /// Whether this element wants a second visit after its children.
+    paints_over: bool,
+}
+
+/// How long a wheel notch takes to land.
+///
+/// Short enough that the content feels attached to the wheel, long enough that
+/// consecutive notches blend into one movement instead of three jumps.
+const SCROLL_GLIDE: f32 = 0.22;
+
+/// A scroll offset on its way somewhere.
+///
+/// A tween rather than a spring: a wheel notch has a definite destination and
+/// must not overshoot it, because overshooting a list means showing rows past
+/// the end and pulling them back. Retargeting mid-flight restarts the curve
+/// from wherever it had got to, so spinning the wheel reads as one accelerating
+/// movement rather than a stack of interrupted ones.
+#[derive(Copy, Clone, Debug)]
+struct ScrollGlide {
+    from: Size<Px>,
+    to: Size<Px>,
+    elapsed: f32,
+}
+
+impl ScrollGlide {
+    /// Where the glide is at, and whether it has arrived.
+    fn sample(&self) -> (Size<Px>, bool) {
+        let t = (self.elapsed / SCROLL_GLIDE).clamp(0.0, 1.0);
+        let eased = spherekit_core::animate::Curve::EaseOutCubic.eval(t);
+        let at = spherekit_core::size(
+            self.from.width + (self.to.width - self.from.width) * eased,
+            self.from.height + (self.to.height - self.from.height) * eased,
+        );
+        (at, t >= 1.0)
+    }
 }
 
 /// Per-node state that must outlive a rebuild.
@@ -114,6 +149,7 @@ struct EventOutputs {
     capture_pointer: bool,
     release_pointer: bool,
     cursor: Option<Cursor>,
+    scroll_to: Option<Size<Px>>,
 }
 
 /// Counters for the diagnostics overlay.
@@ -166,6 +202,12 @@ pub struct UiTree {
     stats: TreeStats,
     /// Scratch for hit testing, reused so a mouse move never allocates.
     hit_scratch: Vec<NodeId>,
+    /// Scroll offsets still travelling toward a wheel target.
+    ///
+    /// Empty almost always; one entry while a list is gliding. A thumb drag
+    /// deliberately does not appear here — a dragged thumb must track the
+    /// pointer exactly, and easing it would feel like lag.
+    scroll_glide: FxHashMap<NodeId, ScrollGlide>,
 }
 
 impl Default for UiTree {
@@ -195,6 +237,7 @@ impl UiTree {
             caption_exclusions: Vec::new(),
             stats: TreeStats::default(),
             hit_scratch: Vec::new(),
+            scroll_glide: FxHashMap::default(),
         }
     }
 
@@ -347,6 +390,7 @@ impl UiTree {
                 });
             }
 
+            let paints_over = pending.element.paints_over();
             let opacity = pending.element.paint_opacity().clamp(0.0, 1.0);
             let filter = pending.element.paint_filter();
             self.built.push(BuiltNode {
@@ -357,6 +401,7 @@ impl UiTree {
                 opacity,
                 filter,
                 hidden,
+                paints_over,
             });
             self.index_for_node.insert(node, index);
             self.node_for_element.insert(pending.identity, node);
@@ -483,13 +528,49 @@ impl UiTree {
         // popped in the right order without recursion.
         enum Step {
             Enter(usize, Rect<Px>),
-            Exit { restore: bool, layer: bool },
+            Exit { restore: bool, layer: bool, over: Option<usize> },
         }
         let mut stack: Vec<Step> = vec![Step::Enter(0, viewport_rect)];
 
         while let Some(step) = stack.pop() {
             match step {
-                Step::Exit { restore, layer } => {
+                Step::Exit { restore, layer, over } => {
+                    // Before the clip and the group are torn down, so an
+                    // overlay is still confined to the box that owns it.
+                    if let Some(index) = over
+                        && let Some(built) = self.built.get(index)
+                    {
+                        let node = built.node;
+                        let bounds = self
+                            .layout
+                            .layout(node)
+                            .map(|l| l.absolute_bounds)
+                            .unwrap_or(Rect::ZERO);
+                        let state = self.node_state.get(&node).copied().unwrap_or_default();
+                        let interaction = InteractionState {
+                            hovered: state.hovered,
+                            active: state.active,
+                            focused: focused_node == Some(node),
+                            focus_within: focused_node
+                                .is_some_and(|f| f == node || self.layout.is_ancestor_of(node, f)),
+                            disabled: false,
+                        };
+                        let metrics = self.scroll_metrics(node);
+                        let mut cx = PaintContext {
+                            canvas,
+                            text,
+                            bounds,
+                            visible: viewport_rect,
+                            scratch: state.scratch,
+                            state: interaction,
+                            theme: &self.theme,
+                            time,
+                            ime: &mut self.ime,
+                            caption_exclusions: &mut self.caption_exclusions,
+                            scroll: metrics,
+                        };
+                        self.built[index].element.paint_over(&mut cx);
+                    }
                     if layer {
                         canvas.end_layer();
                     }
@@ -550,6 +631,7 @@ impl UiTree {
                     // hit-test order: z-index is a visual stacking contract,
                     // not just an input-routing hint.
                     let children = self.built[index].children.clone();
+                    let metrics = self.scroll_metrics(node);
                     {
                         let built = &mut self.built[index];
                         let mut cx = PaintContext {
@@ -563,6 +645,7 @@ impl UiTree {
                             time,
                             ime: &mut self.ime,
                             caption_exclusions: &mut self.caption_exclusions,
+                            scroll: metrics,
                         };
                         built.element.paint(&mut cx);
                     }
@@ -570,8 +653,13 @@ impl UiTree {
 
                     let child_visible = if clips { visible.intersection(bounds) } else { visible };
 
-                    if clips || needs_group {
-                        stack.push(Step::Exit { restore: true, layer: opened_layer });
+                    let over = self.built[index].paints_over.then_some(index);
+                    if clips || needs_group || over.is_some() {
+                        stack.push(Step::Exit {
+                            restore: clips || needs_group,
+                            layer: opened_layer,
+                            over,
+                        });
                     }
                     let mut children = children;
                     let needs_sort = children
@@ -591,6 +679,156 @@ impl UiTree {
     }
 
     // ------------------------------------------------------------ events
+
+    /// Scrolls the innermost container in `indices` that can still move.
+    ///
+    /// `indices` is the hit chain, outermost first, so this walks it backwards.
+    /// A container that is already at the end of its range in the requested
+    /// direction is skipped rather than consuming the gesture — that is what
+    /// makes a wheel inside a fully-scrolled list keep moving the page.
+    ///
+    /// Returns whether anything actually moved.
+    fn scroll_chain(&mut self, indices: &[usize], delta: Size<Px>) -> Option<usize> {
+        for (position, index) in indices.iter().enumerate().rev() {
+            let Some(built) = self.built.get(*index) else { continue };
+            let node = built.node;
+            let Some(style) = self.layout.style(node).cloned() else { continue };
+
+            let scrolls_x = matches!(style.overflow_x, spherekit_layout::Overflow::Scroll);
+            let scrolls_y = matches!(style.overflow_y, spherekit_layout::Overflow::Scroll);
+            if !scrolls_x && !scrolls_y {
+                continue;
+            }
+
+            let max = self.layout.max_scroll_offset(node);
+            // Accumulate onto the glide's *destination*, not onto where the
+            // content currently is. Otherwise a second notch during the first
+            // one's flight would be measured from a moving point and the two
+            // would partly cancel.
+            let at = match self.scroll_glide.get(&node) {
+                Some(glide) => glide.to,
+                None => self.layout.scroll_offset(node),
+            };
+            // A wheel that reports only vertical movement still scrolls a
+            // horizontal-only container: it is the axis the container has, not
+            // the axis the mouse has, that decides.
+            let (dx, dy) = if scrolls_y && !scrolls_x && delta.height == Px::ZERO {
+                (Px::ZERO, delta.width)
+            } else if scrolls_x && !scrolls_y && delta.width == Px::ZERO {
+                (delta.height, Px::ZERO)
+            } else {
+                (delta.width, delta.height)
+            };
+
+            let wants = spherekit_core::size(
+                if scrolls_x { at.width - dx } else { at.width },
+                if scrolls_y { at.height - dy } else { at.height },
+            );
+            let clamped = spherekit_core::size(
+                wants.width.clamp(Px::ZERO, max.width),
+                wants.height.clamp(Px::ZERO, max.height),
+            );
+            if clamped == at {
+                // Already at the end in this direction; let an ancestor try.
+                continue;
+            }
+            // Glide rather than jump. The offset itself is not touched here —
+            // `advance` walks it there over the next few frames.
+            let from = self.layout.scroll_offset(node);
+            self.scroll_glide.insert(node, ScrollGlide { from, to: clamped, elapsed: 0.0 });
+            self.layout.mark_dirty(node, DirtyFlags::PAINT);
+            return Some(position);
+        }
+        None
+    }
+
+    /// Steps time-based animation the tree owns. Returns whether more is owed.
+    ///
+    /// Only smooth scrolling for now. Call it once per frame with the elapsed
+    /// time and keep drawing while it returns `true`; a window that stops
+    /// drawing mid-glide leaves the content parked halfway.
+    ///
+    /// [`SphereKitSurface::render`](https://docs.rs/spherekit) does this for
+    /// you — an application driving a `UiTree` directly does not.
+    pub fn advance(&mut self, dt: std::time::Duration) -> bool {
+        if self.scroll_glide.is_empty() {
+            return false;
+        }
+        let dt = dt.as_secs_f32();
+        let mut finished: SmallVec<[NodeId; 4]> = SmallVec::new();
+        let mut running = false;
+
+        for (node, glide) in self.scroll_glide.iter_mut() {
+            glide.elapsed += dt;
+            let (at, done) = glide.sample();
+            let _ = self.layout.set_scroll_offset(*node, at);
+            self.layout.mark_dirty(*node, DirtyFlags::PAINT);
+            if done {
+                finished.push(*node);
+            } else {
+                running = true;
+            }
+        }
+        for node in finished {
+            self.scroll_glide.remove(&node);
+        }
+        running
+    }
+
+    /// What a node is scrolling, as the layout tree currently has it.
+    ///
+    /// Zero for anything that is not a scroll container, which is almost
+    /// everything — the three lookups are cheap and the alternative is every
+    /// widget knowing how to ask layout questions.
+    fn scroll_metrics(&self, node: NodeId) -> crate::element::ScrollMetrics {
+        let Some(layout) = self.layout.layout(node) else {
+            return crate::element::ScrollMetrics::default();
+        };
+        crate::element::ScrollMetrics {
+            offset: self.layout.scroll_offset(node),
+            content: layout.content_size,
+            client: layout.client_size(),
+        }
+    }
+
+    /// Where the element with this id ended up, after the last layout pass.
+    ///
+    /// For anchoring something to a box flexbox placed — a tooltip, a popover,
+    /// a test that wants to know whether a fixed-height strip actually got its
+    /// height. `None` if no element with that id was built.
+    pub fn bounds_of(&self, id: impl core::hash::Hash) -> Option<Rect<Px>> {
+        let node = self.node_for_element.get(&ElementId::from_key(id))?;
+        self.layout.layout(*node).map(|l| l.absolute_bounds)
+    }
+
+    /// How far the element with this id is scrolled, if it exists and scrolls.
+    ///
+    /// Keyed by the element's id rather than by node, because an application
+    /// knows the id it wrote and has no reason to know about layout nodes.
+    pub fn scroll_offset_of(&self, id: impl core::hash::Hash) -> Option<Size<Px>> {
+        let node = self.node_for_element.get(&ElementId::from_key(id))?;
+        Some(self.layout.scroll_offset(*node))
+    }
+
+    /// Scrolls the element with this id, clamped to its range.
+    ///
+    /// Returns whether anything moved. The obvious use is putting a pane back
+    /// at the top when its content is replaced — without it a reader lands
+    /// halfway down a page they have never seen.
+    pub fn scroll_element_to(&mut self, id: impl core::hash::Hash, offset: Size<Px>) -> bool {
+        let Some(node) = self.node_for_element.get(&ElementId::from_key(id)).copied() else {
+            return false;
+        };
+        self.scroll_glide.remove(&node);
+        if self.layout.scroll_offset(node) == offset {
+            return false;
+        }
+        if self.layout.set_scroll_offset(node, offset).is_ok() {
+            self.layout.mark_dirty(node, DirtyFlags::PAINT);
+            return true;
+        }
+        false
+    }
 
     /// The hit chain under a point, outermost first.
     pub fn hit_chain(&mut self, point: Point<Px>) -> HitChain {
@@ -648,7 +886,7 @@ impl UiTree {
         // A captured pointer wins over hit testing entirely. That is the whole
         // point of capture: a fader must keep tracking after the cursor leaves
         // its narrow column.
-        let indices: SmallVec<[usize; 12]> = if let Some(captured) = self.captured {
+        let mut indices: SmallVec<[usize; 12]> = if let Some(captured) = self.captured {
             SmallVec::from_slice(&[captured])
         } else {
             self.hit_scratch.clear();
@@ -660,6 +898,26 @@ impl UiTree {
             result.merge(self.update_hover(&indices, position, &clipboard));
         }
         self.update_active(event, &indices);
+
+        // The wheel moves the innermost scroll container under the pointer that
+        // still has room to move, before any handler sees the event. Doing it
+        // here rather than in `ScrollView` means a plain
+        // `div().overflow_y_scroll()` scrolls too, and it gives scroll chaining
+        // for nothing: a list that has hit its end passes the wheel to the pane
+        // behind it, exactly as every other toolkit does.
+        if let UiEvent::Scroll(wheel) = event {
+            let line = self.theme.typography.md * self.theme.typography.line_height;
+            let delta = wheel.delta.to_pixels(line);
+            if let Some(position) = self.scroll_chain(&indices, delta) {
+                result.repaint = true;
+                result.consumed = true;
+                // The container that moved has consumed the gesture, so the
+                // wheel stops there: an outer pane's own scroll handler must
+                // not also fire. `indices` is outermost first, so everything
+                // before the mover is an ancestor and is dropped.
+                indices = indices[position..].iter().copied().collect();
+            }
+        }
 
         let chain: HitChain = indices
             .iter()
@@ -774,6 +1032,8 @@ impl UiTree {
         let node = built.node;
         let bounds = self.layout.layout(node).map(|l| l.absolute_bounds).unwrap_or(Rect::ZERO);
 
+        let metrics = self.scroll_metrics(node);
+
         let scratch_before = self.node_state.entry(node).or_default().scratch;
         let mut scratch = scratch_before;
 
@@ -792,6 +1052,8 @@ impl UiTree {
                 capture_pointer: false,
                 release_pointer: false,
                 cursor: None,
+                scroll: metrics,
+                scroll_to: None,
                 text,
                 clipboard,
                 theme: &self.theme,
@@ -804,6 +1066,7 @@ impl UiTree {
                 capture_pointer: cx.capture_pointer,
                 release_pointer: cx.release_pointer,
                 cursor: cx.cursor,
+                scroll_to: cx.scroll_to,
             };
             (flow, outputs)
         };
@@ -811,6 +1074,18 @@ impl UiTree {
             self.node_state.entry(node).or_default().scratch = scratch;
         }
 
+        if let Some(target) = cx.scroll_to {
+            // A dragged thumb must track the pointer exactly, so it wins over
+            // any glide still in flight rather than fighting it.
+            self.scroll_glide.remove(&node);
+            // Scrolling changes where children are drawn, not how big they are,
+            // so this is a repaint and never a relayout. That is the whole
+            // reason a long list stays cheap to scroll.
+            if self.layout.set_scroll_offset(node, target).is_ok() {
+                self.layout.mark_dirty(node, DirtyFlags::PAINT);
+                result.repaint = true;
+            }
+        }
         if cx.repaint {
             self.layout.mark_dirty(node, DirtyFlags::PAINT);
             result.repaint = true;

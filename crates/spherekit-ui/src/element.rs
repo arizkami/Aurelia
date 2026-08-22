@@ -85,6 +85,11 @@ pub struct PaintContext<'a, 'canvas> {
     /// Written through [`PaintContext::keep_interactive`]. Appended to rather
     /// than replaced, because every interactive element in the pass contributes.
     pub caption_exclusions: &'a mut Vec<Rect<Px>>,
+    /// What this element is scrolling, if anything.
+    ///
+    /// Zero for the overwhelming majority of elements. A scroll container reads
+    /// it to size and place its scrollbars.
+    pub scroll: ScrollMetrics,
 }
 
 /// An editable element's request for input-method composition.
@@ -148,6 +153,72 @@ impl PaintContext<'_, '_> {
     }
 }
 
+/// What a scroll container is showing, and how much of it.
+///
+/// Handed to both paint and event handling because a scrollbar needs the same
+/// three numbers in both: to size a thumb, and to turn a drag on that thumb
+/// back into an offset. The layout tree is the owner — this is a copy of what
+/// it holds for the node being visited, so a widget never reaches into layout.
+///
+/// Every field is zero for a node that does not scroll, which makes
+/// [`ScrollMetrics::scrollable`] the one question worth asking first.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct ScrollMetrics {
+    /// How far the content is scrolled, in logical pixels.
+    pub offset: Size<Px>,
+    /// The size of the content, which exceeds `client` when it overflows.
+    pub content: Size<Px>,
+    /// The size of the window onto that content: the padding box.
+    pub client: Size<Px>,
+}
+
+impl ScrollMetrics {
+    /// The largest offset that still shows content, never negative.
+    #[inline]
+    pub fn max_offset(&self) -> Size<Px> {
+        spherekit_core::size(
+            (self.content.width - self.client.width).max(Px::ZERO),
+            (self.content.height - self.client.height).max(Px::ZERO),
+        )
+    }
+
+    /// Whether the content overflows on the given axis.
+    #[inline]
+    pub fn scrollable(&self, vertical: bool) -> bool {
+        let max = self.max_offset();
+        if vertical { max.height > Px::ZERO } else { max.width > Px::ZERO }
+    }
+
+    /// How much of the content is visible on one axis, `0..=1`.
+    ///
+    /// This is the fraction of the track a thumb should occupy, and it is why
+    /// a thumb shrinks as a list grows rather than staying a fixed size.
+    #[inline]
+    pub fn visible_fraction(&self, vertical: bool) -> f32 {
+        let (content, client) = if vertical {
+            (self.content.height.get(), self.client.height.get())
+        } else {
+            (self.content.width.get(), self.client.width.get())
+        };
+        if content <= 0.0 {
+            return 1.0;
+        }
+        (client / content).clamp(0.0, 1.0)
+    }
+
+    /// How far through the scrollable range the offset is, `0..=1`.
+    #[inline]
+    pub fn progress(&self, vertical: bool) -> f32 {
+        let max = self.max_offset();
+        let (offset, max) = if vertical {
+            (self.offset.height.get(), max.height.get())
+        } else {
+            (self.offset.width.get(), max.width.get())
+        };
+        if max <= 0.0 { 0.0 } else { (offset / max).clamp(0.0, 1.0) }
+    }
+}
+
 /// What an element needs in order to respond to an event.
 pub struct EventContext<'a> {
     /// The event.
@@ -175,6 +246,13 @@ pub struct EventContext<'a> {
     pub release_pointer: bool,
     /// A cursor to show while over this element.
     pub cursor: Option<crate::style::Cursor>,
+    /// What this element is scrolling, if anything.
+    pub scroll: ScrollMetrics,
+    /// Set to move this element's scroll offset. Clamped by the layout tree.
+    ///
+    /// An output rather than a direct call because the element tree has no
+    /// handle on layout — the same reason a repaint is a flag and not a method.
+    pub scroll_to: Option<Size<Px>>,
     /// The window's text system, when the caller supplied one.
     ///
     /// Present for events dispatched through [`crate::tree::UiTree::dispatch_with_text`]
@@ -307,6 +385,24 @@ pub trait Element: 'static {
     /// Records this element's own painting. Children are painted by the
     /// framework, after this returns.
     fn paint(&mut self, cx: &mut PaintContext<'_, '_>);
+
+    /// Whether this element also wants to paint *after* its children.
+    ///
+    /// Answered at build time so the paint walk only schedules the second visit
+    /// for elements that asked, which is almost none of them.
+    fn paints_over(&self) -> bool {
+        false
+    }
+
+    /// Paints on top of this element's children, if [`Element::paints_over`].
+    ///
+    /// For an overlay that belongs to the container rather than to its content:
+    /// a scrollbar, an inward shadow, a drop indicator. Painting those in
+    /// [`Element::paint`] would put them *under* every child.
+    ///
+    /// Still inside this element's clip and group, so an overlay cannot escape
+    /// the box that owns it.
+    fn paint_over(&mut self, _cx: &mut PaintContext<'_, '_>) {}
 
     /// Returns the post-process applied to this element and its subtree.
     ///
@@ -1007,6 +1103,8 @@ mod tests {
             capture_pointer: false,
             release_pointer: false,
             cursor: None,
+            scroll: ScrollMetrics::default(),
+            scroll_to: None,
             text: None,
             clipboard: Box::leak(Box::new(spherekit_platform::Clipboard::unsupported())),
             theme: TEST_THEME.get_or_init(crate::theme::Theme::dark),
@@ -1186,6 +1284,7 @@ mod tests {
             time: 0.0,
             ime: &mut None,
             caption_exclusions: &mut Vec::new(),
+            scroll: ScrollMetrics::default(),
         };
         assert!(cx.is_culled());
     }

@@ -224,6 +224,34 @@ impl TextEdit {
         self.focus = self.clamp_boundary(focus);
     }
 
+    /// Copies the selection to `clipboard`. Returns whether anything was put
+    /// there.
+    ///
+    /// `masked` is the field's own secrecy: a password field must never hand
+    /// its contents to a global clipboard, and the check belongs here so every
+    /// route to a copy — shortcut, menu, host command — is covered by one rule
+    /// rather than three.
+    pub fn copy_to(&self, clipboard: &spherekit_platform::Clipboard, masked: bool) -> bool {
+        if masked || !self.has_selection() {
+            return false;
+        }
+        clipboard.set_text(self.selected_text()).is_ok()
+    }
+
+    /// Copies the selection and removes it. Returns whether the text changed.
+    pub fn cut_to(&mut self, clipboard: &spherekit_platform::Clipboard, masked: bool) -> bool {
+        if !self.copy_to(clipboard, masked) {
+            return false;
+        }
+        self.delete_forward()
+    }
+
+    /// Inserts the clipboard's text. Returns whether the text changed.
+    pub fn paste_from(&mut self, clipboard: &spherekit_platform::Clipboard) -> bool {
+        let Ok(text) = clipboard.get_text() else { return false };
+        self.insert(&text)
+    }
+
     /// Selects everything.
     pub fn select_all(&mut self) {
         self.anchor = 0;

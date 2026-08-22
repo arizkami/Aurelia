@@ -441,6 +441,17 @@ pub enum Curve {
     /// Slow at both ends. The default, and what most UI motion wants.
     #[default]
     EaseInOut,
+    /// Starts slower than [`Curve::EaseIn`]. `t³`.
+    EaseInCubic,
+    /// Ends slower than [`Curve::EaseOut`]. `1 − (1 − t)³`.
+    ///
+    /// The one to reach for when something is *arriving* — a menu, a scroll,
+    /// a panel. The steep start reads as a response to the input and the long
+    /// tail as the thing settling, which is why every shell uses it for
+    /// exactly those.
+    EaseOutCubic,
+    /// Slow at both ends, more pronounced than [`Curve::EaseInOut`].
+    EaseInOutCubic,
 }
 
 impl Curve {
@@ -460,6 +471,19 @@ impl Curve {
                 } else {
                     let u = 1.0 - t;
                     1.0 - 2.0 * u * u
+                }
+            }
+            Curve::EaseInCubic => t * t * t,
+            Curve::EaseOutCubic => {
+                let u = 1.0 - t;
+                1.0 - u * u * u
+            }
+            Curve::EaseInOutCubic => {
+                if t < 0.5 {
+                    4.0 * t * t * t
+                } else {
+                    let u = 1.0 - t;
+                    1.0 - 4.0 * u * u * u
                 }
             }
         }
@@ -507,6 +531,36 @@ impl Drive {
     pub const SMOOTH: Self = Self::Spring(Spring::SMOOTH);
     /// A faster spring.
     pub const STIFF: Self = Self::Spring(Spring::STIFF);
+
+    /// A tween of `duration` with an explicit curve.
+    ///
+    /// Prefer a [`Spring`] for anything a user can interrupt — a hover, a
+    /// drag, a toggle. A tween is right when the *duration* is the point: a
+    /// page transition that has to match a sibling animation, or a shuttle
+    /// that has to loop on a known beat.
+    pub const fn tween(duration: Duration, curve: Curve) -> Self {
+        Self::Tween(Tween::new(duration).with_curve(curve))
+    }
+
+    /// A tween that starts fast and settles. What arriving things want.
+    pub const fn ease_out(duration: Duration) -> Self {
+        Self::tween(duration, Curve::EaseOutCubic)
+    }
+
+    /// A tween that starts slow and accelerates. What leaving things want.
+    pub const fn ease_in(duration: Duration) -> Self {
+        Self::tween(duration, Curve::EaseInCubic)
+    }
+
+    /// A tween that is slow at both ends.
+    pub const fn ease_in_out(duration: Duration) -> Self {
+        Self::tween(duration, Curve::EaseInOutCubic)
+    }
+
+    /// A tween with no easing at all, for something mechanical.
+    pub const fn linear(duration: Duration) -> Self {
+        Self::tween(duration, Curve::Linear)
+    }
 }
 
 impl Default for Drive {

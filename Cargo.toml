@@ -17,6 +17,7 @@ members = [
     "crates/spherekit-css",
     "crates/spherekit-bridge",
     "crates/spherekit-cli",
+    "app/uigallery",
 ]
 
 [workspace.package]
@@ -42,6 +43,7 @@ spherekit-audio-ui = { path = "crates/spherekit-audio-ui", version = "0.1.0" }
 spherekit-react    = { path = "crates/spherekit-react",    version = "0.1.0" }
 spherekit-css      = { path = "crates/spherekit-css",      version = "0.1.0" }
 spherekit-bridge   = { path = "crates/spherekit-bridge",   version = "0.1.0" }
+spherekit          = { path = "crates/spherekit",          version = "0.1.0" }
 
 # --- foundation ---
 bitflags   = "2.13"

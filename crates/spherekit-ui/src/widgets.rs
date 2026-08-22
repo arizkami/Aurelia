@@ -324,6 +324,7 @@ impl Element for Button {
             visible: cx.visible,
             scratch: cx.scratch,
             state,
+            scroll: cx.scroll,
             theme: cx.theme,
             time: cx.time,
             // Forwarded rather than dropped: a nested paint context must be able
@@ -1138,16 +1139,344 @@ pub fn separator(vertical: bool) -> crate::element::Div {
     if vertical { d.w(px(1.0)).h(relative(1.0)) } else { d.h(px(1.0)).w(relative(1.0)) }
 }
 
+/// How long one sweep of an indeterminate bar takes.
+const INDETERMINATE_PERIOD: f32 = 1.6;
+/// How much of the track the indeterminate shuttle covers.
+const INDETERMINATE_SPAN: f32 = 0.35;
+/// Default thickness of a progress bar.
+const PROGRESS_THICKNESS: f32 = 4.0;
+
+/// A progress bar, determinate or not.
+///
+/// The distinction is `Option<f32>` rather than a flag, because "how far along"
+/// genuinely has no answer while a task has not reported one. A bar that
+/// pretends to be at zero is a worse lie than one that says it does not know.
+pub struct Progress {
+    id: Option<ElementId>,
+    /// `None` means indeterminate.
+    value: Option<f32>,
+    style: Style,
+    paint: PaintStyle,
+    thickness: Px,
+    track: Option<Color>,
+    fill: Option<Color>,
+}
+
 /// A determinate progress bar, `0..=1`.
-pub fn progress(fraction: f32) -> crate::element::Div {
-    let t = fraction.clamp(0.0, 1.0);
-    div()
-        .h(px(4.0))
-        .w(relative(1.0))
-        .rounded(px(2.0))
-        .bg(Color::hex(0x24282F))
-        .clip()
-        .child(div().h(relative(1.0)).w(relative(t)).rounded(px(2.0)).bg(Color::hex(0x3D8BFD)))
+///
+/// A NaN fraction reads as zero rather than propagating: `done / total` with a
+/// total of zero is a real thing to write, and it should show an empty bar
+/// rather than a rectangle of NaN width.
+pub fn progress(fraction: f32) -> Progress {
+    Progress {
+        id: None,
+        value: Some(if fraction.is_nan() { 0.0 } else { fraction.clamp(0.0, 1.0) }),
+        style: Style::DEFAULT,
+        paint: PaintStyle::default(),
+        thickness: px(PROGRESS_THICKNESS),
+        track: None,
+        fill: None,
+    }
+}
+
+/// A progress bar for work whose extent is not known.
+///
+/// A shuttle sweeps the track on a fixed loop. It is driven by paint time, so
+/// the window has to be redrawing for it to move — ask the scheduler for
+/// [`RedrawPolicy::Animating`](spherekit_platform::RedrawPolicy::Animating)
+/// while one is on screen, or it will sit still and look broken.
+pub fn progress_indeterminate() -> Progress {
+    Progress { value: None, ..progress(0.0) }
+}
+
+impl Progress {
+    /// Gives the bar a stable identity.
+    pub fn id(mut self, id: impl core::hash::Hash) -> Self {
+        self.id = Some(ElementId::from_key(id));
+        self
+    }
+
+    /// How thick the bar is. Defaults to 4 px.
+    pub fn thickness(mut self, thickness: Px) -> Self {
+        self.thickness = thickness;
+        self
+    }
+
+    /// Overrides the track colour. Defaults to the theme's elevated surface.
+    pub fn track_color(mut self, color: Color) -> Self {
+        self.track = Some(color);
+        self
+    }
+
+    /// Overrides the fill colour. Defaults to the theme's accent.
+    pub fn fill_color(mut self, color: Color) -> Self {
+        self.fill = Some(color);
+        self
+    }
+
+    /// Whether this bar animates and therefore needs frames.
+    #[inline]
+    pub fn is_indeterminate(&self) -> bool {
+        self.value.is_none()
+    }
+
+    /// The shuttle's span on the track at `time`, as `(start, end)` in `0..=1`.
+    ///
+    /// Public so a caller can test the motion without a canvas, and separate
+    /// from painting for the same reason a scrollbar's geometry is: the shape
+    /// is the part worth being sure about.
+    pub fn shuttle(time: f32) -> (f32, f32) {
+        let phase = (time / INDETERMINATE_PERIOD).rem_euclid(1.0);
+        // Eased rather than linear so the shuttle slows at both ends instead of
+        // hitting the edges at full speed and snapping back.
+        let eased = spherekit_core::animate::Curve::EaseInOutCubic.eval(phase);
+        // Travels from fully off the left to fully off the right, so the bar is
+        // never briefly empty at the turn.
+        let head = eased * (1.0 + INDETERMINATE_SPAN);
+        ((head - INDETERMINATE_SPAN).max(0.0), head.min(1.0))
+    }
+}
+
+impl Styled for Progress {
+    fn style_mut(&mut self) -> &mut Style {
+        &mut self.style
+    }
+    fn paint_style_mut(&mut self) -> &mut PaintStyle {
+        // A progress bar draws itself from the theme; `track_color` and
+        // `fill_color` are the knobs, not the generic paint style. Kept as a
+        // real field so a stray `.bg()` writes somewhere harmless rather than
+        // leaking an allocation per call.
+        &mut self.paint
+    }
+}
+
+impl Element for Progress {
+    fn id(&self) -> Option<ElementId> {
+        self.id
+    }
+
+    fn layout_style(&self) -> Style {
+        let mut style = self.style.clone();
+        if matches!(style.size.height, spherekit_core::Length::Auto) {
+            style.size.height = spherekit_core::Length::Px(self.thickness);
+        }
+        if matches!(style.size.width, spherekit_core::Length::Auto) {
+            style.size.width = spherekit_core::Length::Fraction(1.0);
+        }
+        style
+    }
+
+    fn paint(&mut self, cx: &mut PaintContext<'_, '_>) {
+        let bounds = cx.bounds;
+        if bounds.is_empty() {
+            return;
+        }
+        let c = cx.theme.colors;
+        let radius = Px(bounds.height().get() * 0.5);
+        let track = self.track.unwrap_or(c.elevated);
+        let fill = self.fill.unwrap_or(c.accent);
+
+        cx.canvas.fill_rounded_rect(RoundedRect::new(bounds, Corners::all(radius)), track);
+
+        let (start, end) = match self.value {
+            Some(v) => (0.0, v),
+            None => Self::shuttle(cx.time),
+        };
+        let span = end - start;
+        if span <= 0.0 {
+            return;
+        }
+        let x0 = bounds.min_x() + bounds.width() * start;
+        let filled = spherekit_core::Rect::new(
+            Point::new(x0, bounds.min_y()),
+            Size::new(bounds.width() * span, bounds.height()),
+        );
+        cx.canvas.fill_rounded_rect(RoundedRect::new(filled, Corners::all(radius)), fill);
+    }
+
+    fn semantics(&self) -> Option<Semantics> {
+        let s = Semantics::role(Role::Progress);
+        match self.value {
+            // An indeterminate bar deliberately reports no value: a screen
+            // reader saying "0 percent" would be stating something false.
+            None => Some(s),
+            Some(v) => Some(s.value(ValueRange { value: v, min: 0.0, max: 1.0, step: None })),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scrolling
+// ---------------------------------------------------------------------------
+
+/// When a scroll container shows its scrollbars.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum ScrollbarPolicy {
+    /// Shown only while the axis actually overflows. The default, and the only
+    /// one that is right for content whose length is not known in advance.
+    #[default]
+    Auto,
+    /// Always shown, even with nothing to scroll. For a pane whose width must
+    /// not change when its content grows past the fold.
+    Always,
+    /// Never shown. The wheel still works — this hides the indicator, it does
+    /// not disable scrolling.
+    Never,
+}
+
+/// Width of a scrollbar's track, in logical pixels.
+const SCROLLBAR_TRACK: f32 = 10.0;
+/// Width of the thumb inside that track while idle.
+const SCROLLBAR_THUMB: f32 = 4.0;
+/// Width of the thumb while the pointer is over the container or dragging.
+const SCROLLBAR_THUMB_ACTIVE: f32 = 8.0;
+/// How far the track is held off the container's edge.
+const SCROLLBAR_EDGE: f32 = 3.0;
+/// The shortest a thumb may get, however long the content is.
+///
+/// Without a floor, a thumb over a hundred thousand rows becomes a single
+/// pixel that cannot be grabbed. Every shell clamps this.
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+
+/// Scratch slot holding the offset a scrollbar drag started from.
+const SCRATCH_SCROLL_ORIGIN: usize = 0;
+/// Scratch slot holding the pointer coordinate a scrollbar drag started from.
+const SCRATCH_SCROLL_POINTER: usize = 1;
+/// Scratch slot holding which axis is being dragged. 0 none, 1 vertical, 2 horizontal.
+const SCRATCH_SCROLL_AXIS: usize = 2;
+
+/// The geometry of one scrollbar, derived from what the container is showing.
+///
+/// Split out from painting so the same arithmetic answers both "where do I draw
+/// the thumb" and "what offset does a pointer at this position mean". Those two
+/// disagreeing is the classic scrollbar bug — the thumb that jumps when you
+/// grab it — and one function is how it stays impossible.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Scrollbar {
+    /// The full track, along the container's inside edge.
+    pub track: Rect<Px>,
+    /// The thumb within that track.
+    pub thumb: Rect<Px>,
+    /// Whether this bar runs top-to-bottom.
+    pub vertical: bool,
+}
+
+impl Scrollbar {
+    /// Computes the bar for one axis, or `None` when there is nothing to show.
+    ///
+    /// `bounds` is the container's border box; the bar is laid inside it, which
+    /// is what makes it an overlay that costs the content no width.
+    pub fn for_axis(
+        bounds: Rect<Px>,
+        metrics: crate::element::ScrollMetrics,
+        vertical: bool,
+        policy: ScrollbarPolicy,
+    ) -> Option<Self> {
+        if policy == ScrollbarPolicy::Never {
+            return None;
+        }
+        if policy == ScrollbarPolicy::Auto && !metrics.scrollable(vertical) {
+            return None;
+        }
+        if bounds.is_empty() {
+            return None;
+        }
+
+        // Held off the edge so the thumb clears a rounded corner and a border
+        // rather than being drawn across them.
+        let edge = Px(SCROLLBAR_EDGE);
+        let track_w = Px(SCROLLBAR_TRACK);
+        let track = if vertical {
+            Rect::new(
+                Point::new(bounds.max_x() - track_w - edge, bounds.min_y() + edge),
+                Size::new(track_w, bounds.height() - edge * 2.0),
+            )
+        } else {
+            Rect::new(
+                Point::new(bounds.min_x() + edge, bounds.max_y() - track_w - edge),
+                Size::new(bounds.width() - edge * 2.0, track_w),
+            )
+        };
+        if track.is_empty() {
+            return None;
+        }
+
+        let extent = if vertical { track.height().get() } else { track.width().get() };
+        if extent <= 0.0 {
+            return None;
+        }
+        let thumb_extent =
+            (extent * metrics.visible_fraction(vertical)).max(SCROLLBAR_MIN_THUMB).min(extent);
+        // The travel is what is left of the track once the thumb has taken its
+        // share — not the whole track. Using the whole track is why a naive
+        // scrollbar runs past its end.
+        let travel = (extent - thumb_extent).max(0.0);
+        let start = travel * metrics.progress(vertical);
+
+        let thumb = if vertical {
+            Rect::new(
+                Point::new(track.min_x(), track.min_y() + Px(start)),
+                Size::new(track_w, Px(thumb_extent)),
+            )
+        } else {
+            Rect::new(
+                Point::new(track.min_x() + Px(start), track.min_y()),
+                Size::new(Px(thumb_extent), track_w),
+            )
+        };
+        Some(Self { track, thumb, vertical })
+    }
+
+    /// The offset a thumb dragged by `delta` pixels along the track means.
+    ///
+    /// `from` is the offset the drag started at. Returns the new offset on this
+    /// axis, unclamped — the layout tree clamps, and doing it twice would make
+    /// a drag that overshoots stick instead of resuming.
+    pub fn offset_for_drag(
+        &self,
+        metrics: crate::element::ScrollMetrics,
+        from: Px,
+        delta: Px,
+    ) -> Px {
+        let extent =
+            if self.vertical { self.track.height().get() } else { self.track.width().get() };
+        let thumb =
+            if self.vertical { self.thumb.height().get() } else { self.thumb.width().get() };
+        let travel = (extent - thumb).max(0.0);
+        if travel <= 0.0 {
+            return from;
+        }
+        let max = if self.vertical {
+            metrics.max_offset().height.get()
+        } else {
+            metrics.max_offset().width.get()
+        };
+        // One pixel of thumb travel is `max / travel` pixels of content.
+        from + Px(delta.get() * (max / travel))
+    }
+
+    /// Draws the bar. The track stays subtle; the thumb carries the state.
+    pub fn paint(&self, cx: &mut PaintContext<'_, '_>, active: bool) {
+        let c = cx.theme.colors;
+        let width = if active { SCROLLBAR_THUMB_ACTIVE } else { SCROLLBAR_THUMB };
+        let inset = (SCROLLBAR_TRACK - width) * 0.5;
+        let thumb = if self.vertical {
+            Rect::new(
+                Point::new(self.thumb.min_x() + Px(inset), self.thumb.min_y()),
+                Size::new(Px(width), self.thumb.height()),
+            )
+        } else {
+            Rect::new(
+                Point::new(self.thumb.min_x(), self.thumb.min_y() + Px(inset)),
+                Size::new(self.thumb.width(), Px(width)),
+            )
+        };
+        let radius = Px(width * 0.5);
+        cx.canvas.fill_rounded_rect(
+            RoundedRect::new(thumb, Corners::all(radius)),
+            if active { c.border_strong } else { c.border },
+        );
+    }
 }
 
 /// A scrollable container.
@@ -1155,21 +1484,68 @@ pub fn progress(fraction: f32) -> crate::element::Div {
 /// Scrolling adjusts the node's offset, which shifts its children's absolute
 /// bounds without marking anything layout-dirty. A scroll that relaid out its
 /// contents would make a long list unusable.
+///
+/// The wheel is handled by the tree for *any* node with `Overflow::Scroll`, so
+/// this widget's own job is narrower than it looks: it declares the overflow,
+/// draws the overlay scrollbars, and turns a drag on a thumb into an offset.
+///
+/// Scrollbars are drawn **over** the content rather than beside it, so turning
+/// them on never changes what the content is laid out into. That is why
+/// [`ScrollbarPolicy::Always`] costs nothing but ink.
+///
+/// # The one thing that will catch you
+///
+/// A scroll view inside a flex parent needs `min_h(px(0.0))` — `min_w` for a
+/// horizontal one — on **itself and every flex ancestor between it and the
+/// fixed-size box**:
+///
+/// ```ignore
+/// div().flex_col().h(relative(1.0))
+///     .child(header)
+///     .child(scroll_view().flex_1().min_h(px(0.0)).child(page))
+/// ```
+///
+/// A flex item's automatic minimum size is its content, and an item cannot be
+/// shrunk below that. So without the floor the *ancestor* silently grows to fit
+/// the whole page instead of staying window-height; the scroll view then has
+/// room for all of its content, reports no overflow, and neither the wheel nor
+/// a scrollbar does anything. The content is simply cut off by the window edge,
+/// which looks exactly like a clipping bug and is not one.
+///
+/// This is the same rule as CSS's `min-height: 0` on a scrolling flex child,
+/// and it catches everyone once.
 pub struct ScrollView {
     id: Option<ElementId>,
     children: Vec<AnyElement>,
     style: Style,
+    paint: PaintStyle,
     horizontal: bool,
+    both: bool,
+    framed: bool,
+    policy: ScrollbarPolicy,
 }
 
 /// Creates a [`ScrollView`].
 pub fn scroll_view() -> ScrollView {
-    ScrollView { id: None, children: Vec::new(), style: Style::DEFAULT, horizontal: false }
+    ScrollView {
+        id: None,
+        children: Vec::new(),
+        style: Style::DEFAULT,
+        paint: PaintStyle::default(),
+        horizontal: false,
+        both: false,
+        framed: false,
+        policy: ScrollbarPolicy::default(),
+    }
 }
 
 impl ScrollView {
     /// Gives the view a stable identity, which it needs to keep its scroll
     /// offset across rebuilds.
+    ///
+    /// Worth spelling out: without an id the view gets a positional identity,
+    /// and inserting a sibling above it silently hands its scroll position to
+    /// something else.
     pub fn id(mut self, id: impl core::hash::Hash) -> Self {
         self.id = Some(ElementId::from_key(id));
         self
@@ -1179,6 +1555,33 @@ impl ScrollView {
     pub fn horizontal(mut self, horizontal: bool) -> Self {
         self.horizontal = horizontal;
         self
+    }
+
+    /// Scrolls on both axes.
+    pub fn both_axes(mut self, both: bool) -> Self {
+        self.both = both;
+        self
+    }
+
+    /// When the scrollbars are shown.
+    pub fn scrollbars(mut self, policy: ScrollbarPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// The bars this view would draw, given what it is currently showing.
+    fn bars(
+        &self,
+        bounds: Rect<Px>,
+        metrics: crate::element::ScrollMetrics,
+    ) -> (Option<Scrollbar>, Option<Scrollbar>) {
+        let vertical = (!self.horizontal || self.both)
+            .then(|| Scrollbar::for_axis(bounds, metrics, true, self.policy))
+            .flatten();
+        let horizontal = (self.horizontal || self.both)
+            .then(|| Scrollbar::for_axis(bounds, metrics, false, self.policy))
+            .flatten();
+        (vertical, horizontal)
     }
 }
 
@@ -1193,21 +1596,8 @@ impl Styled for ScrollView {
         &mut self.style
     }
     fn paint_style_mut(&mut self) -> &mut PaintStyle {
-        // A scroll view has no appearance of its own; wrap it in a `div` for a
-        // background or a border.
-        static_paint_style()
+        &mut self.paint
     }
-}
-
-/// A shared, never-read paint style for elements with no appearance.
-fn static_paint_style() -> &'static mut PaintStyle {
-    // A scroll view never paints, so nothing observes this. Using a leaked
-    // allocation rather than a field keeps `ScrollView` free of a member that
-    // would only ever hold defaults.
-    use std::sync::OnceLock;
-    static CELL: OnceLock<()> = OnceLock::new();
-    CELL.get_or_init(|| ());
-    Box::leak(Box::new(PaintStyle::default()))
 }
 
 impl Element for ScrollView {
@@ -1223,9 +1613,10 @@ impl Element for ScrollView {
         } else {
             spherekit_layout::FlexDirection::Column
         };
-        if self.horizontal {
+        if self.horizontal || self.both {
             style.overflow_x = Overflow::Scroll;
-        } else {
+        }
+        if !self.horizontal || self.both {
             style.overflow_y = Overflow::Scroll;
         }
         style
@@ -1239,20 +1630,457 @@ impl Element for ScrollView {
         core::mem::take(&mut self.children)
     }
 
-    fn paint(&mut self, _cx: &mut PaintContext<'_, '_>) {}
+    fn paint(&mut self, cx: &mut PaintContext<'_, '_>) {
+        let mut style = self.paint.clone();
+        if self.framed && style.background.is_none() {
+            style.background = Some(cx.theme.colors.surface.into());
+            style.border_width = px(1.0);
+            style.border_color = cx.theme.colors.border;
+            style.corner_radii = Corners::all(cx.theme.radii.md);
+        }
+        style.paint_box(cx.canvas, cx.bounds, cx.state);
+    }
+
+    fn paints_over(&self) -> bool {
+        self.policy != ScrollbarPolicy::Never
+    }
+
+    /// Painted after the children so the bars overlay the content.
+    ///
+    /// A separate pass because `paint` runs *before* the tree walks into the
+    /// subtree — a bar drawn there would sit under every row it is meant to
+    /// float above.
+    fn paint_over(&mut self, cx: &mut PaintContext<'_, '_>) {
+        let dragging = cx.scratch[SCRATCH_SCROLL_AXIS] != 0.0;
+        let active = cx.state.hovered || dragging;
+        let (vertical, horizontal) = self.bars(cx.bounds, cx.scroll);
+        if let Some(bar) = vertical {
+            bar.paint(cx, active);
+        }
+        if let Some(bar) = horizontal {
+            bar.paint(cx, active);
+        }
+    }
 
     fn handle_event(&mut self, cx: &mut EventContext<'_>) -> EventFlow {
-        // The tree owns the scroll offset; this only reports that the wheel was
-        // consumed here so an ancestor scroll view does not also move.
-        if let UiEvent::Scroll(_) = cx.event {
+        let (vertical, horizontal) = self.bars(cx.bounds, cx.scroll);
+
+        match cx.event {
+            UiEvent::MouseDown(e) if e.button == MouseButton::Primary => {
+                // Vertical first: where the two tracks meet in the corner, the
+                // vertical bar is the one a shell gives the press to.
+                for (bar, axis) in [(vertical, 1.0f32), (horizontal, 2.0f32)] {
+                    let Some(bar) = bar else { continue };
+                    if !bar.track.contains(e.position) {
+                        continue;
+                    }
+                    let along = if bar.vertical { e.position.y } else { e.position.x };
+                    let from =
+                        if bar.vertical { cx.scroll.offset.height } else { cx.scroll.offset.width };
+
+                    if bar.thumb.contains(e.position) {
+                        // Grab: remember where, so the thumb does not jump.
+                        cx.scratch[SCRATCH_SCROLL_ORIGIN] = from.get();
+                        cx.scratch[SCRATCH_SCROLL_POINTER] = along.get();
+                    } else {
+                        // A press on the track jumps the thumb to the pointer
+                        // and then tracks it, which is what makes a long list
+                        // navigable without a drag at all.
+                        let extent = if bar.vertical {
+                            bar.track.height().get()
+                        } else {
+                            bar.track.width().get()
+                        };
+                        let thumb = if bar.vertical {
+                            bar.thumb.height().get()
+                        } else {
+                            bar.thumb.width().get()
+                        };
+                        let origin =
+                            if bar.vertical { bar.track.min_y() } else { bar.track.min_x() };
+                        let travel = (extent - thumb).max(0.0);
+                        let want = ((along.get() - origin.get() - thumb * 0.5) / travel.max(1.0))
+                            .clamp(0.0, 1.0);
+                        let max = if bar.vertical {
+                            cx.scroll.max_offset().height
+                        } else {
+                            cx.scroll.max_offset().width
+                        };
+                        let jumped = Px(max.get() * want);
+                        cx.scratch[SCRATCH_SCROLL_ORIGIN] = jumped.get();
+                        cx.scratch[SCRATCH_SCROLL_POINTER] = along.get();
+                        cx.scroll_to = Some(axis_offset(cx.scroll.offset, bar.vertical, jumped));
+                    }
+                    cx.scratch[SCRATCH_SCROLL_AXIS] = axis;
+                    cx.capture();
+                    cx.notify();
+                    return EventFlow::Stop;
+                }
+                EventFlow::Continue
+            }
+
+            UiEvent::MouseMove(e) if cx.scratch[SCRATCH_SCROLL_AXIS] != 0.0 => {
+                let is_vertical = cx.scratch[SCRATCH_SCROLL_AXIS] == 1.0;
+                let bar = if is_vertical { vertical } else { horizontal };
+                let Some(bar) = bar else { return EventFlow::Continue };
+                let along = if is_vertical { e.position.y } else { e.position.x };
+                let delta = along - Px(cx.scratch[SCRATCH_SCROLL_POINTER]);
+                let from = Px(cx.scratch[SCRATCH_SCROLL_ORIGIN]);
+                let next = bar.offset_for_drag(cx.scroll, from, delta);
+                cx.scroll_to = Some(axis_offset(cx.scroll.offset, is_vertical, next));
+                cx.notify();
+                EventFlow::Stop
+            }
+
+            UiEvent::MouseUp(_) if cx.scratch[SCRATCH_SCROLL_AXIS] != 0.0 => {
+                cx.scratch[SCRATCH_SCROLL_AXIS] = 0.0;
+                cx.release();
+                cx.notify();
+                EventFlow::Stop
+            }
+
+            // The wheel is the tree's job — it owns scroll chaining, and it has
+            // to work for a plain `div().overflow_y_scroll()` too. Reporting it
+            // as handled here would only stop an ancestor from ever seeing it.
+            _ => EventFlow::Continue,
+        }
+    }
+
+    fn semantics(&self) -> Option<Semantics> {
+        Some(Semantics::role(Role::ScrollArea))
+    }
+}
+
+/// Replaces one axis of an offset, leaving the other alone.
+fn axis_offset(offset: Size<Px>, vertical: bool, value: Px) -> Size<Px> {
+    if vertical { Size::new(offset.width, value) } else { Size::new(value, offset.height) }
+}
+
+/// A framed scrolling pane: [`scroll_view`] with the theme's surface, border
+/// and radius already on it.
+///
+/// The shape most callers actually want, and the one that is easy to get
+/// subtly wrong by hand — the frame must not scroll with the content, and the
+/// bars must sit inside it rather than over the border.
+pub fn scroll_area() -> ScrollView {
+    ScrollView { framed: true, ..scroll_view() }
+}
+
+// ---------------------------------------------------------------------------
+// Menus
+// ---------------------------------------------------------------------------
+
+/// One row in a menu: a label, an optional shortcut, and an action.
+///
+/// Themed at paint time rather than at build time, so a menu row does not need
+/// the caller to thread colours through it — the same reason [`Button`] does
+/// not.
+pub struct MenuItem {
+    id: Option<ElementId>,
+    text: String,
+    shortcut: Option<String>,
+    danger: bool,
+    disabled: bool,
+    on_select: Option<OnAction>,
+}
+
+/// Creates a [`MenuItem`].
+pub fn menu_item(text: impl Into<String>) -> MenuItem {
+    MenuItem {
+        id: None,
+        text: text.into(),
+        shortcut: None,
+        danger: false,
+        disabled: false,
+        on_select: None,
+    }
+}
+
+impl MenuItem {
+    /// Gives the row a stable identity.
+    pub fn id(mut self, id: impl core::hash::Hash) -> Self {
+        self.id = Some(ElementId::from_key(id));
+        self
+    }
+
+    /// The accelerator shown right-aligned, such as `Ctrl+C`.
+    ///
+    /// Display only. The row does not bind the key — the field or the window
+    /// that owns the shortcut does, and duplicating it here would let the two
+    /// drift apart.
+    pub fn shortcut(mut self, shortcut: impl Into<String>) -> Self {
+        self.shortcut = Some(shortcut.into());
+        self
+    }
+
+    /// Draws the row as destructive.
+    pub fn danger(mut self, danger: bool) -> Self {
+        self.danger = danger;
+        self
+    }
+
+    /// Greys the row out and takes it out of the tab order.
+    ///
+    /// Worth using rather than hiding the row: a Paste that is *there but
+    /// unavailable* tells the reader the clipboard is empty, and a Paste that
+    /// vanishes just makes the menu move.
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    /// Runs when the row is chosen, by click or by Space or Enter.
+    pub fn on_select(mut self, f: impl FnMut() + 'static) -> Self {
+        self.on_select = Some(Box::new(f));
+        self
+    }
+}
+
+impl Element for MenuItem {
+    fn id(&self) -> Option<ElementId> {
+        self.id
+    }
+
+    fn layout_style(&self) -> Style {
+        Style {
+            size: spherekit_core::Size {
+                width: spherekit_core::Length::Fraction(1.0),
+                height: spherekit_core::Length::Px(px(28.0)),
+            },
+            flex_shrink: 0.0,
+            ..Style::DEFAULT
+        }
+    }
+
+    fn paint(&mut self, cx: &mut PaintContext<'_, '_>) {
+        cx.keep_interactive();
+        let c = cx.theme.colors;
+        let mut state = cx.state;
+        state.disabled = self.disabled;
+
+        let ink = match (self.disabled, self.danger) {
+            (true, _) => c.text_muted,
+            (false, true) => c.danger,
+            (false, false) => c.text,
+        };
+        let hover = if self.danger { c.danger.with_alpha(0.16) } else { c.hover };
+        let style = PaintStyle {
+            hover_background: (!self.disabled).then(|| hover.into()),
+            active_background: (!self.disabled).then(|| c.pressed.into()),
+            corner_radii: Corners::all(cx.theme.radii.sm),
+            focus_ring: Some(FocusRing { color: c.focus, ..FocusRing::default() }),
+            opacity: if self.disabled { 0.55 } else { 1.0 },
+            ..Default::default()
+        };
+        style.paint_box(cx.canvas, cx.bounds, state);
+
+        let pad = cx.theme.spacing.sm;
+        let inner = cx.bounds.inset(spherekit_core::Edges {
+            top: Px::ZERO,
+            right: pad,
+            bottom: Px::ZERO,
+            left: pad,
+        });
+        let text_style = spherekit_text::TextStyle {
+            font_size: cx.theme.typography.sm,
+            font: spherekit_text::FontRequest {
+                weight: cx.theme.typography.weight,
+                ..Default::default()
+            },
+            wrap: spherekit_text::WrapMode::None,
+            ..Default::default()
+        };
+
+        let layout = cx.text.layout(&self.text, &text_style, None);
+        let baseline = inner.min_y() + Px((inner.height().get() - layout.size.height.get()) * 0.5);
+        crate::text::draw_layout(
+            cx.canvas,
+            &layout,
+            Point::new(inner.min_x(), baseline),
+            ink,
+            spherekit_render::TextRasterMode::Auto,
+            (Px::ZERO, Color::TRANSPARENT),
+            spherekit_render::coverage_contrast_for(ink, c.surface),
+        );
+
+        if let Some(shortcut) = self.shortcut.as_deref() {
+            let s = cx.text.layout(shortcut, &text_style, None);
+            let x = inner.max_x() - s.size.width;
+            let y = inner.min_y() + Px((inner.height().get() - s.size.height.get()) * 0.5);
+            crate::text::draw_layout(
+                cx.canvas,
+                &s,
+                Point::new(x, y),
+                c.text_muted,
+                spherekit_render::TextRasterMode::Auto,
+                (Px::ZERO, Color::TRANSPARENT),
+                spherekit_render::coverage_contrast_for(c.text_muted, c.surface),
+            );
+        }
+    }
+
+    fn handle_event(&mut self, cx: &mut EventContext<'_>) -> EventFlow {
+        if self.disabled {
+            return EventFlow::Continue;
+        }
+        cx.set_cursor(Cursor::Pointer);
+        let chose = match cx.event {
+            UiEvent::MouseUp(e) => {
+                e.button == MouseButton::Primary && cx.bounds.contains(e.position)
+            }
+            UiEvent::Key(k) if k.state.is_pressed() => {
+                matches!(k.key, Key::Space | Key::Enter)
+            }
+            _ => false,
+        };
+        if chose {
+            if let Some(f) = self.on_select.as_mut() {
+                f();
+            }
             cx.notify();
             return EventFlow::Stop;
         }
         EventFlow::Continue
     }
 
+    fn focusable(&self) -> bool {
+        !self.disabled
+    }
+
     fn semantics(&self) -> Option<Semantics> {
-        Some(Semantics::role(Role::ScrollArea))
+        Some(
+            Semantics::new(Role::MenuItem, self.text.clone())
+                .disabled(self.disabled)
+                .with_implied_actions(),
+        )
+    }
+}
+
+/// A menu that opens at a point rather than against an anchor.
+///
+/// The difference from [`Dropdown`] is where it goes: a dropdown belongs to the
+/// control it hangs off, a context menu belongs to wherever the pointer was.
+/// Give it a position in the coordinates of **its parent**, which for a menu
+/// added to the root of a window is the window itself.
+///
+/// Like [`Dropdown`] it takes an open amount in `0..=1` and leaves layout
+/// entirely at zero, so a closed menu cannot swallow a click.
+///
+/// ```ignore
+/// // In the root element, so `at` is in window coordinates:
+/// .child(context_menu(open, at)
+///     .child(menu_item("Cut").shortcut("Ctrl+X").on_select(..))
+///     .child(menu_item("Copy").shortcut("Ctrl+C").on_select(..)))
+/// ```
+pub struct ContextMenu {
+    id: Option<ElementId>,
+    children: Vec<AnyElement>,
+    style: Style,
+    paint: PaintStyle,
+    open: f32,
+    at: Point<Px>,
+    rise: Px,
+}
+
+/// Creates a [`ContextMenu`] at a point in its parent's coordinates.
+pub fn context_menu(open: f32, at: Point<Px>) -> ContextMenu {
+    let mut style = Style::DEFAULT;
+    style.flex_direction = spherekit_layout::FlexDirection::Column;
+    // On top by default, and by a wide margin. Siblings are painted in
+    // z-index order, so a menu left at the default zero paints *under* any
+    // pane that raised itself — and a translucent pane over it does not hide
+    // it outright, it just washes it out, which reads as a rendering fault
+    // rather than as a stacking one. There is no case where a context menu
+    // wants to be behind the thing it was opened over.
+    style.z_index = CONTEXT_MENU_Z;
+    ContextMenu {
+        id: None,
+        children: Vec::new(),
+        style,
+        paint: PaintStyle::default(),
+        open,
+        at,
+        rise: px(6.0),
+    }
+}
+
+impl ContextMenu {
+    /// Gives the menu a stable identity.
+    pub fn id(mut self, id: impl core::hash::Hash) -> Self {
+        self.id = Some(ElementId::from_key(id));
+        self
+    }
+
+    /// How far the menu travels as it opens. Defaults to 6 px.
+    pub fn rise(mut self, rise: Px) -> Self {
+        self.rise = rise;
+        self
+    }
+
+    fn eased(&self) -> f32 {
+        ease_out_cubic(self.open.clamp(0.0, 1.0))
+    }
+}
+
+impl ParentElement for ContextMenu {
+    fn extend_children(&mut self, children: impl IntoIterator<Item = AnyElement>) {
+        self.children.extend(children);
+    }
+}
+
+impl Styled for ContextMenu {
+    fn style_mut(&mut self) -> &mut Style {
+        &mut self.style
+    }
+    fn paint_style_mut(&mut self) -> &mut PaintStyle {
+        &mut self.paint
+    }
+}
+
+impl Element for ContextMenu {
+    fn id(&self) -> Option<ElementId> {
+        self.id
+    }
+
+    fn layout_style(&self) -> Style {
+        let mut style = self.style.clone();
+        if self.open.clamp(0.0, 1.0) <= DROPDOWN_CLOSED {
+            style.display = spherekit_layout::Display::None;
+            return style;
+        }
+        style.position = spherekit_layout::Position::Absolute;
+        let drop = self.rise * (1.0 - self.eased());
+        style.inset.left = spherekit_core::Length::Px(self.at.x);
+        style.inset.top = spherekit_core::Length::Px(self.at.y + drop);
+        style
+    }
+
+    fn children(&mut self) -> &mut [AnyElement] {
+        &mut self.children
+    }
+
+    fn take_children(&mut self) -> Vec<AnyElement> {
+        core::mem::take(&mut self.children)
+    }
+
+    fn paint(&mut self, cx: &mut PaintContext<'_, '_>) {
+        let mut style = self.paint.clone();
+        if style.background.is_none() {
+            style.background = Some(cx.theme.colors.surface.into());
+            style.border_width = px(1.0);
+            style.border_color = cx.theme.colors.border;
+            style.corner_radii = Corners::all(cx.theme.radii.lg);
+            style.shadows.push(cx.theme.shadows.md);
+        }
+        style.paint_box(cx.canvas, cx.bounds, cx.state);
+    }
+
+    fn paint_opacity(&self) -> f32 {
+        (self.eased() * self.paint.opacity).clamp(0.0, 1.0)
+    }
+
+    fn semantics(&self) -> Option<Semantics> {
+        Some(Semantics::new(Role::Menu, String::new()))
     }
 }
 
@@ -1492,6 +2320,12 @@ pub enum DropdownSide {
     Above,
 }
 
+/// The stacking order a context menu takes unless the caller overrides it.
+///
+/// Deliberately far above anything an application is likely to use for its
+/// own panes, so a menu does not need the app to know about it.
+pub const CONTEXT_MENU_Z: i32 = 10_000;
+
 /// Below this the panel is treated as shut and leaves layout entirely.
 const DROPDOWN_CLOSED: f32 = 0.002;
 
@@ -1689,9 +2523,10 @@ impl Element for Dropdown {
 /// Everything in this module, for a glob import.
 pub mod prelude {
     pub use super::{
-        Avatar, Button, ButtonVariant, Dropdown, DropdownSide, Presence, ScrollView, Toggle,
-        ValueControl, ValueShape, avatar, button, checkbox, dropdown, fader, knob, panel, progress,
-        scroll_view, separator, slider, toggle,
+        Avatar, Button, ButtonVariant, ContextMenu, Dropdown, DropdownSide, MenuItem, Presence,
+        Progress, ScrollView, Scrollbar, ScrollbarPolicy, Toggle, ValueControl, ValueShape, avatar,
+        button, checkbox, context_menu, dropdown, fader, knob, menu_item, panel, progress,
+        progress_indeterminate, scroll_area, scroll_view, separator, slider, toggle,
     };
 }
 
@@ -2185,6 +3020,221 @@ mod tests {
         }
     }
 
+    /// Runs the scroll glide to completion.
+    ///
+    /// The wheel now sets a *destination*; `advance` walks the offset there.
+    /// A test that asserts on the offset has to let that finish, exactly as a
+    /// window does by continuing to draw.
+    fn settle(tree: &mut UiTree) {
+        for _ in 0..120 {
+            if !tree.advance(std::time::Duration::from_millis(16)) {
+                return;
+            }
+        }
+        panic!("a scroll glide never finished");
+    }
+
+    #[test]
+    fn the_wheel_glides_rather_than_jumping() {
+        // The offset must be *between* where it was and where it is going for
+        // at least one frame. A jump would satisfy every other scroll test in
+        // this file, which is why this one looks at the middle and not the end.
+        let mut tree = UiTree::new();
+        tree.build(
+            div().w(relative(1.0)).h(relative(1.0)).child(overflowing_scroll_view()).into_element(),
+        );
+        tree.compute_layout(viewport()).unwrap();
+
+        tree.dispatch(&wheel_at(50.0, 50.0, 3.0));
+        assert_eq!(
+            tree.scroll_offset_of("inner").unwrap().height,
+            Px::ZERO,
+            "the wheel moved the content before a single frame had passed"
+        );
+
+        assert!(tree.advance(std::time::Duration::from_millis(16)));
+        let mid = tree.scroll_offset_of("inner").unwrap().height;
+        assert!(mid > Px::ZERO, "the glide never started");
+
+        settle(&mut tree);
+        let end = tree.scroll_offset_of("inner").unwrap().height;
+        assert!(end > mid, "the glide stopped short: {mid:?} then {end:?}");
+    }
+
+    #[test]
+    fn a_glide_is_abandoned_when_the_offset_is_set_outright() {
+        // A dragged thumb and a `scroll_element_to` are both exact: a glide
+        // still running would drag the content back off the mark a frame later.
+        let mut tree = UiTree::new();
+        tree.build(
+            div().w(relative(1.0)).h(relative(1.0)).child(overflowing_scroll_view()).into_element(),
+        );
+        tree.compute_layout(viewport()).unwrap();
+
+        tree.dispatch(&wheel_at(50.0, 50.0, 3.0));
+        tree.scroll_element_to("inner", Size::new(Px::ZERO, px(500.0)));
+        assert!(!tree.advance(std::time::Duration::from_millis(16)), "a glide outlived the jump");
+        assert_eq!(tree.scroll_offset_of("inner").unwrap().height, px(500.0));
+    }
+
+    #[test]
+    fn an_indeterminate_shuttle_stays_on_the_track_and_repeats() {
+        let mut widest: f32 = 0.0;
+        for step in 0..200 {
+            let t = step as f32 * 0.02;
+            let (start, end) = Progress::shuttle(t);
+            assert!(start >= 0.0 && end <= 1.0, "shuttle left the track at t={t}: {start}..{end}");
+            assert!(end >= start, "shuttle inverted at t={t}");
+            widest = widest.max(end - start);
+        }
+        // It has to actually be visible for most of the loop, not a hairline.
+        assert!(widest > 0.3, "the shuttle never covered much of the track: {widest}");
+        // And it loops: the same phase gives the same answer one period later.
+        let a = Progress::shuttle(0.4);
+        let b = Progress::shuttle(0.4 + INDETERMINATE_PERIOD);
+        assert!((a.0 - b.0).abs() < 1e-4 && (a.1 - b.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn an_indeterminate_bar_reports_no_value_to_a_screen_reader() {
+        // Saying "0 percent" would be stating something false.
+        let s = progress_indeterminate().semantics().unwrap();
+        assert!(s.value.is_none());
+        let s = progress(0.25).semantics().unwrap();
+        assert_eq!(s.value.map(|v| v.value), Some(0.25));
+    }
+
+    /// A wheel gesture at a point, `down` lines' worth.
+    fn wheel_at(x: f32, y: f32, down: f32) -> UiEvent {
+        UiEvent::Scroll(crate::event::ScrollEvent {
+            position: Point::new(px(x), px(y)),
+            delta: crate::event::ScrollDelta::Lines(Size::new(0.0, -down)),
+            modifiers: Modifiers::NONE,
+            momentum: false,
+        })
+    }
+
+    /// A scroll view over content that genuinely overflows it.
+    ///
+    /// `shrink(0.0)` is load-bearing: a flex item whose own content is empty
+    /// has an automatic minimum size of zero, so a 1000 px spacer inside a
+    /// 100 px column would otherwise be *shrunk to 100* and there would be
+    /// nothing to scroll.
+    fn overflowing_scroll_view() -> AnyElement {
+        scroll_view()
+            .id("inner")
+            .w(relative(1.0))
+            .h(px(100.0))
+            .child(div().h(px(1000.0)).shrink(0.0))
+            .into_element()
+    }
+
+    #[test]
+    fn the_wheel_actually_moves_a_scroll_view() {
+        let mut tree = UiTree::new();
+        tree.build(
+            div().w(relative(1.0)).h(relative(1.0)).child(overflowing_scroll_view()).into_element(),
+        );
+        tree.compute_layout(viewport()).unwrap();
+
+        let before = tree.scroll_offset_of("inner").expect("the view has a node");
+        assert_eq!(before.height, Px::ZERO);
+
+        let result = tree.dispatch(&wheel_at(50.0, 50.0, 3.0));
+        assert!(result.repaint, "a scroll that moved something must repaint");
+        assert!(result.consumed);
+        settle(&mut tree);
+
+        let after = tree.scroll_offset_of("inner").expect("the view has a node");
+        assert!(after.height > Px::ZERO, "the wheel did not move the offset: {after:?}");
+    }
+
+    #[test]
+    fn scrolling_stops_at_the_end_of_the_content() {
+        let mut tree = UiTree::new();
+        tree.build(
+            div().w(relative(1.0)).h(relative(1.0)).child(overflowing_scroll_view()).into_element(),
+        );
+        tree.compute_layout(viewport()).unwrap();
+
+        for _ in 0..200 {
+            tree.dispatch(&wheel_at(50.0, 50.0, 3.0));
+            settle(&mut tree);
+        }
+        let end = tree.scroll_offset_of("inner").unwrap();
+        // 1000 of content in a 100 window leaves 900 of travel, and not a pixel
+        // more however long the wheel is spun.
+        assert_eq!(end.height, px(900.0), "ran past the end of the content");
+    }
+
+    #[test]
+    fn a_grown_scroll_view_still_reports_its_overflow() {
+        // The shape a real page has: a scroll view that takes the leftover
+        // height with `flex_1`, wrapping a centring row, wrapping a padded
+        // column. Every one of those is a flex item that could be shrunk to
+        // fit instead of overflowing, and if any of them is, the container
+        // reports no overflow and neither the wheel nor a bar does anything.
+        let mut tree = UiTree::new();
+        tree.build(
+            div()
+                .flex_col()
+                .w(relative(1.0))
+                .h(px(300.0))
+                .child(
+                    scroll_view().id("pane").flex_1().w(relative(1.0)).child(
+                        div().flex_row().justify_center().w(relative(1.0)).child(
+                            div()
+                                .flex_col()
+                                .w(relative(1.0))
+                                .max_w(px(760.0))
+                                .p(px(32.0))
+                                .child(div().h(px(1000.0)).shrink(0.0)),
+                        ),
+                    ),
+                )
+                .into_element(),
+        );
+        tree.compute_layout(viewport()).unwrap();
+
+        tree.dispatch(&wheel_at(50.0, 50.0, 3.0));
+        settle(&mut tree);
+        let moved = tree.scroll_offset_of("pane").unwrap();
+        assert!(moved.height > Px::ZERO, "a grown scroll view did not scroll: {moved:?}");
+    }
+
+    #[test]
+    fn a_page_of_text_taller_than_its_pane_scrolls() {
+        // Text, not spacers: a real page's height comes from shaping, and a
+        // label's contribution to its parent's minimum size is what decides
+        // whether the pane overflows or merely clips.
+        let Some(mut text) = text_system() else { return };
+        let mut tree = UiTree::new();
+        let mut column = div().flex_col().w(relative(1.0)).max_w(px(760.0)).p(px(32.0));
+        for i in 0..40 {
+            column = column.child(crate::text::label(format!("Paragraph {i}")).text_size(px(14.0)));
+        }
+        tree.build(
+            div()
+                .flex_col()
+                .w(relative(1.0))
+                .h(px(300.0))
+                .child(
+                    scroll_view()
+                        .id("pane")
+                        .flex_1()
+                        .w(relative(1.0))
+                        .child(div().flex_row().justify_center().w(relative(1.0)).child(column)),
+                )
+                .into_element(),
+        );
+        tree.compute_layout_with_text(viewport(), &mut text).unwrap();
+
+        tree.dispatch(&wheel_at(50.0, 50.0, 3.0));
+        settle(&mut tree);
+        let moved = tree.scroll_offset_of("pane").unwrap();
+        assert!(moved.height > Px::ZERO, "a page of text did not scroll: {moved:?}");
+    }
+
     #[test]
     fn a_scroll_view_consumes_the_wheel_so_ancestors_do_not_also_move() {
         let outer_scrolls = Rc::new(Cell::new(0));
@@ -2195,23 +3245,100 @@ mod tests {
                 .w(relative(1.0))
                 .h(relative(1.0))
                 .on_scroll(move |_| o.set(o.get() + 1))
-                .child(
-                    scroll_view()
-                        .id("inner")
-                        .w(relative(1.0))
-                        .h(px(100.0))
-                        .child(div().h(px(1000.0))),
-                )
+                .child(overflowing_scroll_view())
                 .into_element(),
         );
         tree.compute_layout(viewport()).unwrap();
-        tree.dispatch(&UiEvent::Scroll(crate::event::ScrollEvent {
-            position: Point::new(px(50.0), px(50.0)),
-            delta: crate::event::ScrollDelta::Lines(Size::new(0.0, -3.0)),
-            modifiers: Modifiers::NONE,
-            momentum: false,
-        }));
+        tree.dispatch(&wheel_at(50.0, 50.0, 3.0));
         assert_eq!(outer_scrolls.get(), 0, "the wheel reached an ancestor scroll view");
+    }
+
+    #[test]
+    fn a_scroll_view_at_its_end_hands_the_wheel_to_its_ancestor() {
+        // Scroll chaining. Without it a list that has bottomed out swallows
+        // every further notch and the page behind it feels stuck.
+        let outer_scrolls = Rc::new(Cell::new(0));
+        let o = outer_scrolls.clone();
+        let mut tree = UiTree::new();
+        tree.build(
+            div()
+                .w(relative(1.0))
+                .h(relative(1.0))
+                .on_scroll(move |_| o.set(o.get() + 1))
+                .child(overflowing_scroll_view())
+                .into_element(),
+        );
+        tree.compute_layout(viewport()).unwrap();
+
+        // A few notches, nowhere near the 900 px of travel available.
+        for _ in 0..3 {
+            tree.dispatch(&wheel_at(50.0, 50.0, 3.0));
+            settle(&mut tree);
+        }
+        assert_eq!(outer_scrolls.get(), 0, "an ancestor moved while the list still had room");
+
+        // Spin it to the bottom, then one more notch: that one is the
+        // ancestor's, because the list has nothing left to give.
+        for _ in 0..200 {
+            tree.dispatch(&wheel_at(50.0, 50.0, 3.0));
+            settle(&mut tree);
+        }
+        assert_eq!(tree.scroll_offset_of("inner").unwrap().height, px(900.0));
+        let chained = outer_scrolls.get();
+        assert!(chained > 0, "the wheel never chained out of a finished list");
+    }
+
+    #[test]
+    fn a_thumb_shrinks_as_the_content_grows_but_never_past_grabbing() {
+        let bounds = Rect::new(Point::new(Px::ZERO, Px::ZERO), Size::new(px(200.0), px(100.0)));
+        let short = crate::element::ScrollMetrics {
+            offset: Size::new(Px::ZERO, Px::ZERO),
+            content: Size::new(px(200.0), px(200.0)),
+            client: Size::new(px(200.0), px(100.0)),
+        };
+        let long =
+            crate::element::ScrollMetrics { content: Size::new(px(200.0), px(100_000.0)), ..short };
+
+        let a = Scrollbar::for_axis(bounds, short, true, ScrollbarPolicy::Auto).unwrap();
+        let b = Scrollbar::for_axis(bounds, long, true, ScrollbarPolicy::Auto).unwrap();
+        assert!(a.thumb.height() > b.thumb.height(), "the thumb did not shrink with the content");
+        assert!(
+            b.thumb.height() >= px(SCROLLBAR_MIN_THUMB),
+            "a hundred thousand rows produced an ungrabbable {:?} thumb",
+            b.thumb.height()
+        );
+    }
+
+    #[test]
+    fn a_thumb_at_the_end_of_its_travel_sits_flush_with_the_track() {
+        let bounds = Rect::new(Point::new(Px::ZERO, Px::ZERO), Size::new(px(200.0), px(100.0)));
+        let metrics = crate::element::ScrollMetrics {
+            offset: Size::new(Px::ZERO, px(400.0)),
+            content: Size::new(px(200.0), px(500.0)),
+            client: Size::new(px(200.0), px(100.0)),
+        };
+        let bar = Scrollbar::for_axis(bounds, metrics, true, ScrollbarPolicy::Auto).unwrap();
+        // Fully scrolled means the thumb's bottom is the track's bottom — the
+        // classic off-by-a-thumb bug is computing travel over the whole track.
+        assert!(
+            (bar.thumb.max_y().get() - bar.track.max_y().get()).abs() < 0.01,
+            "thumb ended at {:?}, track ends at {:?}",
+            bar.thumb.max_y(),
+            bar.track.max_y()
+        );
+    }
+
+    #[test]
+    fn no_bar_is_drawn_for_content_that_fits_unless_asked() {
+        let bounds = Rect::new(Point::new(Px::ZERO, Px::ZERO), Size::new(px(200.0), px(100.0)));
+        let fits = crate::element::ScrollMetrics {
+            offset: Size::ZERO,
+            content: Size::new(px(200.0), px(80.0)),
+            client: Size::new(px(200.0), px(100.0)),
+        };
+        assert!(Scrollbar::for_axis(bounds, fits, true, ScrollbarPolicy::Auto).is_none());
+        assert!(Scrollbar::for_axis(bounds, fits, true, ScrollbarPolicy::Always).is_some());
+        assert!(Scrollbar::for_axis(bounds, fits, true, ScrollbarPolicy::Never).is_none());
     }
 
     #[test]

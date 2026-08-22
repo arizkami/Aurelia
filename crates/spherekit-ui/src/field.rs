@@ -70,6 +70,7 @@ pub struct TextField {
     mask: bool,
     on_change: Option<Box<dyn FnMut(&TextEdit)>>,
     on_submit: Option<Box<dyn FnMut(&str)>>,
+    on_context_menu: Option<Box<dyn FnMut(Point<Px>)>>,
 }
 
 /// Creates a [`TextField`] over an existing buffer.
@@ -84,6 +85,7 @@ pub fn text_field(edit: TextEdit) -> TextField {
         mask: false,
         on_change: None,
         on_submit: None,
+        on_context_menu: None,
     }
 }
 
@@ -132,6 +134,20 @@ impl TextField {
     /// Called when Enter is pressed, with the committed text.
     pub fn on_submit(mut self, f: impl FnMut(&str) + 'static) -> Self {
         self.on_submit = Some(Box::new(f));
+        self
+    }
+
+    /// Runs on a secondary press, with the pointer position.
+    ///
+    /// The field reports the request rather than opening a menu itself: an
+    /// element cannot place a popup outside its own box, and a context menu is
+    /// exactly a popup that has to escape it. The application owns the menu and
+    /// therefore owns where it goes.
+    ///
+    /// Taking focus first is deliberate — a right-click should leave the caret
+    /// and selection where a menu action can act on them.
+    pub fn on_context_menu(mut self, f: impl FnMut(Point<Px>) + 'static) -> Self {
+        self.on_context_menu = Some(Box::new(f));
         self
     }
 
@@ -326,28 +342,18 @@ impl TextField {
             Key::Character(c) if accel && c.eq_ignore_ascii_case("a") => {
                 self.edit.select_all();
             }
+            // The three clipboard actions go through `TextEdit`, so a shortcut
+            // and a context-menu item cannot disagree about what Copy means —
+            // including the rule that a masked field never yields its secret.
             Key::Character(c) if accel && c.eq_ignore_ascii_case("c") => {
-                // A password field must never make its secret available to a
-                // global clipboard. Paste remains enabled below.
-                if !self.mask && self.edit.has_selection() {
-                    let _ = cx.clipboard.set_text(self.edit.selected_text());
-                }
+                self.edit.copy_to(cx.clipboard, self.mask);
                 return Some(false);
             }
             Key::Character(c) if accel && c.eq_ignore_ascii_case("x") => {
-                if self.mask || !self.edit.has_selection() {
-                    return Some(false);
-                }
-                let selected = self.edit.selected_text().to_owned();
-                if cx.clipboard.set_text(&selected).is_ok() {
-                    self.edit.delete_forward();
-                    return Some(true);
-                }
-                return Some(false);
+                return Some(self.edit.cut_to(cx.clipboard, self.mask));
             }
             Key::Character(c) if accel && c.eq_ignore_ascii_case("v") => {
-                let Ok(pasted) = cx.clipboard.get_text() else { return Some(false) };
-                return Some(self.edit.insert(&pasted));
+                return Some(self.edit.paste_from(cx.clipboard));
             }
             _ => return None,
         }
@@ -522,6 +528,24 @@ impl Element for TextField {
         cx.set_cursor(Cursor::Text);
 
         match cx.event {
+            UiEvent::MouseDown(e) if e.button == MouseButton::Secondary => {
+                // Focus first, then report. A menu that acts on the selection
+                // needs the field to be the focused one when it runs, and a
+                // right-click that left focus elsewhere would cut from the
+                // wrong field.
+                cx.focus();
+                if !self.edit.has_selection()
+                    && let Some(byte) = self.byte_at(e.position, cx)
+                {
+                    self.edit.set_caret(byte);
+                }
+                if let Some(f) = self.on_context_menu.as_mut() {
+                    f(e.position);
+                }
+                cx.notify();
+                EventFlow::Stop
+            }
+
             UiEvent::MouseDown(e) if e.button == MouseButton::Primary => {
                 cx.focus();
                 cx.capture();

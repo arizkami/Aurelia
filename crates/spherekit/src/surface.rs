@@ -95,6 +95,11 @@ pub struct SurfaceStats {
     pub cpu_ms: f32,
     /// Atlas texels uploaded this frame.
     pub glyph_texels_uploaded: u64,
+    /// Whether the tree still owes animation frames.
+    ///
+    /// True while a scroll is gliding to its destination. Keep drawing until
+    /// it goes false, or the content parks halfway.
+    pub animating: bool,
 }
 
 /// Where start-up time went.
@@ -161,6 +166,8 @@ pub struct SphereKitSurface {
     pending_uploads: Vec<ImageId>,
     stats: SurfaceStats,
     start: std::time::Instant,
+    /// When the last frame was drawn, for the delta the tree animates against.
+    last_frame: std::time::Instant,
     /// Where start-up time went.
     init_timing: InitTiming,
     /// Whether a frame has actually reached the screen.
@@ -243,6 +250,7 @@ impl SphereKitSurface {
             pending_uploads: Vec::new(),
             stats: SurfaceStats::default(),
             start: std::time::Instant::now(),
+            last_frame: std::time::Instant::now(),
             init_timing: InitTiming { gpu_ms, fonts_ms },
             presented: false,
         })
@@ -409,6 +417,11 @@ impl SphereKitSurface {
             return Ok(None);
         }
         let time = self.start.elapsed().as_secs_f32();
+        // Stepped before the build so this frame draws where the animation has
+        // got to, rather than one frame behind it.
+        let now = std::time::Instant::now();
+        let animating = self.tree.advance(now.duration_since(self.last_frame));
+        self.last_frame = now;
 
         self.text.begin_frame();
         self.images.begin_frame();
@@ -461,6 +474,7 @@ impl SphereKitSurface {
             nodes_laid_out: self.tree.stats().nodes_laid_out,
             cpu_ms,
             glyph_texels_uploaded: texels,
+            animating,
         };
         Ok(Some(self.stats))
     }

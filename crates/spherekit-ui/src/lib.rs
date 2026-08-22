@@ -76,7 +76,8 @@ pub mod widgets;
 pub use edit::{Motion, Preedit, TextEdit};
 pub use element::{
     AnyElement, Div, Element, Empty, EventContext, HandlerKind, Handlers, ImeArea,
-    InteractionState, Interactive, IntoElement, PaintContext, ParentElement, Styled, div,
+    InteractionState, Interactive, IntoElement, PaintContext, ParentElement, ScrollMetrics, Styled,
+    div,
 };
 pub use event::{
     ClickTracker, ElementState, EventFlow, HitChain, HitTarget, ImeEvent, Key, KeyEvent, Modifiers,
@@ -92,9 +93,10 @@ pub use text::{Label, draw_layout, label};
 pub use theme::{Palette, Radii, Shadows, Spacing, Theme, Typography};
 pub use tree::{DispatchResult, TreeStats, UiTree};
 pub use widgets::{
-    Avatar, Button, ButtonVariant, Dropdown, DropdownSide, Presence, ScrollView, Toggle,
-    ValueControl, ValueShape, avatar, button, checkbox, dropdown, fader, knob, panel, progress,
-    scroll_view, separator, slider, toggle,
+    Avatar, Button, ButtonVariant, ContextMenu, Dropdown, DropdownSide, MenuItem, Presence,
+    Progress, ScrollView, Scrollbar, ScrollbarPolicy, Toggle, ValueControl, ValueShape, avatar,
+    button, checkbox, context_menu, dropdown, fader, knob, menu_item, panel, progress,
+    progress_indeterminate, scroll_area, scroll_view, separator, slider, toggle,
 };
 
 /// Everything a typical consumer needs, in one import.

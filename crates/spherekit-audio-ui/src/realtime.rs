@@ -1528,6 +1528,7 @@ mod tests {
                     time: 0.0,
                     ime: &mut None,
                     caption_exclusions: &mut Vec::new(),
+                    scroll: Default::default(),
                 };
                 node.paint(&mut cx);
             }

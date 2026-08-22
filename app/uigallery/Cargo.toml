@@ -1,0 +1,18 @@
+[package]
+name = "uigallery"
+description = "SphereKit UI Gallery: every built-in widget, live and interactive."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "uigallery"
+path = "src/main.rs"
+
+[dependencies]
+spherekit.workspace = true
+pollster.workspace = true

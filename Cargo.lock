@@ -2459,6 +2459,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "uigallery"
+version = "0.1.0"
+dependencies = [
+ "pollster",
+ "spherekit",
+]
+
+[[package]]
 name = "unicode-bidi"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

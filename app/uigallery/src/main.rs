@@ -1,22 +1,29 @@
-//! A conventional desktop application, built with nothing audio-specific.
+//! # SphereKit UI Gallery
 //!
-//! The other example is a plug-in editor and leans on `spherekit-audio-ui`. This
-//! one is the shape most applications actually are: a compact title bar, a
-//! settings sidebar, a scrolling pane, and a status bar. Its custom dark theme
-//! uses lifted charcoal surfaces instead of near-black panels.
+//! Every built-in widget, live and interactive, in one window.
 //!
-//! It is also where the two rendering paths that are *not* analytically
+//! This is a real application rather than a catalogue: the shell is a custom
+//! Windows frame over DWM Mica, the pages are a scrolling pane, and every
+//! control on every page owns nothing — it takes a value and reports changes,
+//! exactly as an application's own controls would. Read [`pages`] to see what
+//! each widget is for; read this file to see the shell it all hangs in.
+//!
+//! It is also where the rendering paths that are *not* analytically
 //! antialiased get exercised — the sidebar icons are SVG, tessellated into
 //! triangles, and they are smooth because the surface is multisampled.
 //!
 //! ```text
-//! cargo run -p spherekit --example desktop_app --release
+//! cargo run -p uigallery --release
 //! ```
 //!
 //! Keyboard: Tab and Shift-Tab move focus, Space and Enter activate, arrow keys
-//! adjust a focused slider, Escape quits.
+//! adjust a focused slider or knob, Escape closes a menu and then quits.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod pages;
+
+use pages::Page;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -36,7 +43,7 @@ use spherekit::text::FontWeight;
 use spherekit::ui::{
     AnyElement, Cursor, Element, EventContext, InputTranslator, Interactive, IntoElement,
     ParentElement, Presence, Role, Semantics, Styled, StyledInteraction, TextEdit, Theme, avatar,
-    button, checkbox, div, dropdown, label, scroll_view, separator, slider, text_field, toggle,
+    context_menu, div, dropdown, label, menu_item, scroll_view, separator,
 };
 use spherekit::{SphereKitSurface, SurfaceOptions};
 
@@ -155,67 +162,13 @@ fn product_theme(system_theme: PlatformTheme) -> Theme {
     }
 }
 
-/// The sections the sidebar navigates between.
+/// What a context-menu row does to the field it was opened over.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Section {
-    General,
-    Appearance,
-    Network,
-    About,
-}
-
-impl Section {
-    const ALL: [Section; 4] =
-        [Section::General, Section::Appearance, Section::Network, Section::About];
-
-    fn title(self) -> &'static str {
-        match self {
-            Section::General => "General",
-            Section::Appearance => "Appearance",
-            Section::Network => "Network",
-            Section::About => "About",
-        }
-    }
-
-    /// A monochrome icon, tinted by the theme at draw time.
-    ///
-    /// Deliberately stroked rather than filled: a stroked path is the shape
-    /// most likely to look jagged without multisampling, so it is the honest
-    /// thing to put in a demo that claims to have fixed that.
-    fn icon(self) -> &'static str {
-        match self {
-            Section::General => {
-                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
-                     stroke="black" stroke-width="1.8" stroke-linecap="round">
-                     <circle cx="12" cy="12" r="3.2"/>
-                     <path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3
-                              M5.2 5.2l2.1 2.1M16.7 16.7l2.1 2.1
-                              M18.8 5.2l-2.1 2.1M7.3 16.7l-2.1 2.1"/></svg>"##
-            }
-            Section::Appearance => {
-                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
-                     stroke="black" stroke-width="1.8" stroke-linejoin="round">
-                     <path d="M12 3a9 9 0 1 0 0 18c1.4 0 2.2-.9 2.2-2 0-1.4-1.2-1.7-1.2-2.7
-                              0-.8.7-1.5 1.6-1.5H16a5 5 0 0 0 5-5c0-3.9-4-6.8-9-6.8z"/>
-                     <circle cx="7.6" cy="11.5" r="1.3"/>
-                     <circle cx="12" cy="7.6" r="1.3"/>
-                     <circle cx="16.4" cy="10.4" r="1.3"/></svg>"##
-            }
-            Section::Network => {
-                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
-                     stroke="black" stroke-width="1.8" stroke-linecap="round">
-                     <circle cx="12" cy="12" r="9"/>
-                     <path d="M3 12h18M12 3c2.6 2.6 2.6 15.4 0 18M12 3c-2.6 2.6-2.6 15.4 0 18"/>
-                     </svg>"##
-            }
-            Section::About => {
-                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
-                     stroke="black" stroke-width="1.8" stroke-linecap="round">
-                     <circle cx="12" cy="12" r="9"/>
-                     <path d="M12 11v5.5"/><circle cx="12" cy="7.8" r="1"/></svg>"##
-            }
-        }
-    }
+pub(crate) enum EditAction {
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
 }
 
 /// Everything the UI reads, and everything a handler may write.
@@ -224,15 +177,51 @@ impl Section {
 /// is rebuilt every frame, so a handler installed during one build has to be
 /// able to change what the *next* build reads. This is the pattern the engine
 /// intends — explicit, and impossible to panic on.
-struct State {
+pub(crate) struct State {
     system_theme: Cell<PlatformTheme>,
-    section: Cell<Section>,
-    notifications: Cell<bool>,
-    auto_update: Cell<bool>,
-    telemetry: Cell<bool>,
-    ui_scale: Cell<f32>,
-    volume: Cell<f32>,
-    download: Cell<f32>,
+    /// Which gallery page the sidebar has selected.
+    pub(crate) page: Cell<Page>,
+
+    // --- Buttons -----------------------------------------------------------
+    /// How many times any button on the Buttons page has been pressed.
+    pub(crate) presses: Cell<u32>,
+
+    // --- Selection ---------------------------------------------------------
+    pub(crate) wifi: Cell<bool>,
+    pub(crate) opt_a: Cell<bool>,
+    pub(crate) opt_b: Cell<bool>,
+    pub(crate) opt_c: Cell<bool>,
+
+    // --- Values ------------------------------------------------------------
+    pub(crate) gain: Cell<f32>,
+    pub(crate) scale: Cell<f32>,
+    pub(crate) pan: Cell<f32>,
+    pub(crate) level: Cell<f32>,
+    pub(crate) tone: Cell<f32>,
+    pub(crate) width: Cell<f32>,
+
+    // --- Text --------------------------------------------------------------
+    pub(crate) name_field: RefCell<TextEdit>,
+    pub(crate) secret_field: RefCell<TextEdit>,
+
+    // --- Identity ----------------------------------------------------------
+    /// The Identity page's own dropdown, separate from the sidebar footer's so
+    /// the two can be open at once and prove they do not share state.
+    pub(crate) demo_menu_open: Cell<bool>,
+    pub(crate) demo_menu: Cell<Motion<f32>>,
+
+    // --- Containers --------------------------------------------------------
+    pub(crate) download: Cell<f32>,
+    /// Whether the Containers page is running its indeterminate bar.
+    pub(crate) busy: Cell<bool>,
+
+    // --- Context menu ------------------------------------------------------
+    /// Where the last right-click landed, in window coordinates.
+    pub(crate) menu_at: Cell<spherekit::core::Point<Px>>,
+    /// Which field the menu is acting on: 0 none, 1 name, 2 secret.
+    pub(crate) menu_field: Cell<u8>,
+    pub(crate) ctx_menu_open: Cell<bool>,
+    pub(crate) ctx_menu: Cell<Motion<f32>>,
     /// Editable buffers. `RefCell` rather than `Cell` because a `TextEdit` is
     /// not `Copy`; the field takes a clone each frame and hands back the edited
     /// one, which is the same shape as a slider reporting an `f32`.
@@ -271,8 +260,6 @@ struct State {
     /// window: the element tree is deliberately free of platform types, so the
     /// request travels as data and the runner performs it.
     pending: Cell<Option<WindowCommand>>,
-    server: RefCell<TextEdit>,
-    passphrase: RefCell<TextEdit>,
     log: RefCell<Vec<String>>,
 }
 
@@ -280,13 +267,28 @@ impl State {
     fn new() -> Rc<Self> {
         Rc::new(Self {
             system_theme: Cell::new(PlatformTheme::Dark),
-            section: Cell::new(Section::General),
-            notifications: Cell::new(true),
-            auto_update: Cell::new(false),
-            telemetry: Cell::new(false),
-            ui_scale: Cell::new(100.0),
-            volume: Cell::new(65.0),
+            page: Cell::new(Page::Buttons),
+            presses: Cell::new(0),
+            wifi: Cell::new(true),
+            opt_a: Cell::new(true),
+            opt_b: Cell::new(false),
+            opt_c: Cell::new(false),
+            gain: Cell::new(-6.0),
+            scale: Cell::new(100.0),
+            pan: Cell::new(0.0),
+            level: Cell::new(72.0),
+            tone: Cell::new(45.0),
+            width: Cell::new(0.0),
+            name_field: RefCell::new(TextEdit::from_text("Ada Lovelace")),
+            secret_field: RefCell::new(TextEdit::new()),
+            demo_menu_open: Cell::new(false),
+            demo_menu: Cell::new(Motion::at(0.0, Drive::STIFF)),
             download: Cell::new(0.0),
+            busy: Cell::new(true),
+            menu_at: Cell::new(spherekit::core::Point::new(Px::ZERO, Px::ZERO)),
+            menu_field: Cell::new(0),
+            ctx_menu_open: Cell::new(false),
+            ctx_menu: Cell::new(Motion::at(0.0, Drive::STIFF)),
             maximized: Cell::new(false),
             wco_hovered: [const { Cell::new(false) }; CAPTION_BUTTONS],
             wco_fade: core::array::from_fn(|_| Cell::new(Motion::at(0.0, Drive::SMOOTH))),
@@ -294,14 +296,55 @@ impl State {
             user_menu: Cell::new(Motion::at(0.0, Drive::STIFF)),
             press_inside_account: Cell::new(false),
             pending: Cell::new(None),
-            server: RefCell::new(TextEdit::from_text("sync.futureboard.local")),
-            passphrase: RefCell::new(TextEdit::new()),
             log: RefCell::new(vec!["Ready.".into()]),
         })
     }
 
     fn theme(&self) -> Theme {
         product_theme(self.system_theme.get())
+    }
+
+    /// Opens the edit menu over `field` at a window position.
+    pub(crate) fn open_edit_menu(&self, field: u8, at: spherekit::core::Point<Px>) {
+        self.menu_field.set(field);
+        self.menu_at.set(at);
+        self.ctx_menu_open.set(true);
+    }
+
+    /// Runs one clipboard action against whichever field the menu is about.
+    ///
+    /// The clipboard comes from the tree rather than being created here, so an
+    /// embedder that replaced the system clipboard gets the same one the
+    /// shortcuts use.
+    pub(crate) fn apply_edit(&self, action: EditAction) {
+        let clipboard = spherekit::platform::Clipboard::system();
+        let which = self.menu_field.get();
+        let masked = which == 2;
+        let mut field = match which {
+            1 => self.name_field.borrow_mut(),
+            2 => self.secret_field.borrow_mut(),
+            _ => return,
+        };
+        let name = match action {
+            EditAction::Cut => {
+                field.cut_to(&clipboard, masked);
+                "Cut"
+            }
+            EditAction::Copy => {
+                field.copy_to(&clipboard, masked);
+                "Copy"
+            }
+            EditAction::Paste => {
+                field.paste_from(&clipboard);
+                "Paste"
+            }
+            EditAction::SelectAll => {
+                field.select_all();
+                "Select all"
+            }
+        };
+        drop(field);
+        self.say(format!("{name}."));
     }
 
     /// Opens or closes the account menu. Returns whether anything changed.
@@ -313,7 +356,7 @@ impl State {
         true
     }
 
-    fn say(&self, message: impl Into<String>) {
+    pub(crate) fn say(&self, message: impl Into<String>) {
         let mut log = self.log.borrow_mut();
         log.push(message.into());
         // The log is a UI element, not a record; letting it grow forever would
@@ -324,13 +367,13 @@ impl State {
     }
 }
 
-struct DesktopApp {
+struct GalleryApp {
     window: Option<Arc<spherekit::platform::backend::Window>>,
     surface: Option<SphereKitSurface>,
     input: InputTranslator,
     started: Instant,
     state: Rc<State>,
-    icons: Vec<(Section, spherekit::core::SvgId)>,
+    icons: Vec<(Page, spherekit::core::SvgId)>,
     frames: u64,
     frame_limit: Option<u64>,
     reported: bool,
@@ -343,7 +386,7 @@ struct DesktopApp {
     clock: SystemClock,
 }
 
-impl DesktopApp {
+impl GalleryApp {
     fn new() -> Self {
         Self {
             window: None,
@@ -363,7 +406,7 @@ impl DesktopApp {
         }
     }
 
-    fn icon_for(&self, section: Section) -> Option<spherekit::core::SvgId> {
+    fn icon_for(&self, section: Page) -> Option<spherekit::core::SvgId> {
         self.icons.iter().find(|(s, _)| *s == section).map(|(_, id)| *id)
     }
 
@@ -378,10 +421,11 @@ impl DesktopApp {
                 div()
                     .flex_row()
                     .flex_1()
-                    // A flex item cannot shrink below its automatic minimum
-                    // size, which here is the whole page. Without this floor
-                    // the row grows past the window and the pane inside never
-                    // overflows, so nothing scrolls.
+                    // Without this the row grows to its content instead of to
+                    // the window: a flex item cannot shrink below its automatic
+                    // minimum size, and that minimum is the whole page. The
+                    // pane inside would then never overflow, so nothing would
+                    // ever scroll — it would simply run off the bottom.
                     .min_h(px(0.0))
                     .z(1)
                     .child(self.sidebar(&theme))
@@ -390,6 +434,73 @@ impl DesktopApp {
             )
             .child(separator(false).bg(Color::TRANSPARENT))
             .child(self.status_bar(&theme))
+            // Last child of the root, so its coordinates are window
+            // coordinates and it paints over everything. A context menu that
+            // lived inside the pane it was opened from could not escape it.
+            .child(self.edit_menu(&theme))
+            .into_element()
+    }
+
+    /// The cut/copy/paste menu, opened by a right-click in a text field.
+    ///
+    /// Its items act on the application's own [`TextEdit`] buffers, not on the
+    /// field element — the element is rebuilt every frame and owns nothing. The
+    /// same `TextEdit` methods back the keyboard shortcuts, so the two cannot
+    /// disagree about what Copy means.
+    fn edit_menu(&self, theme: &Theme) -> AnyElement {
+        let open = self.state.ctx_menu.get().value();
+        let which = self.state.menu_field.get();
+        let at = self.state.menu_at.get();
+
+        // Read the buffer the menu is about, so the rows can be honest about
+        // what is available before they are clicked.
+        let (has_selection, masked) = match which {
+            1 => (self.state.name_field.borrow().has_selection(), false),
+            2 => (self.state.secret_field.borrow().has_selection(), true),
+            _ => (false, false),
+        };
+        let can_copy = has_selection && !masked;
+
+        let act = |state: &Rc<State>, action: EditAction| {
+            let state = Rc::clone(state);
+            move || {
+                state.apply_edit(action);
+                state.ctx_menu_open.set(false);
+            }
+        };
+
+        context_menu(open, at)
+            .id("ctx.menu")
+            .w(px(216.0))
+            .p(theme.spacing.xs)
+            .gap(px(1.0))
+            .child(
+                menu_item("Cut")
+                    .id("ctx.cut")
+                    .shortcut("Ctrl+X")
+                    .disabled(!can_copy)
+                    .on_select(act(&self.state, EditAction::Cut)),
+            )
+            .child(
+                menu_item("Copy")
+                    .id("ctx.copy")
+                    .shortcut("Ctrl+C")
+                    .disabled(!can_copy)
+                    .on_select(act(&self.state, EditAction::Copy)),
+            )
+            .child(
+                menu_item("Paste")
+                    .id("ctx.paste")
+                    .shortcut("Ctrl+V")
+                    .on_select(act(&self.state, EditAction::Paste)),
+            )
+            .child(separator(false).bg(theme.colors.border).m(theme.spacing.xs))
+            .child(
+                menu_item("Select all")
+                    .id("ctx.all")
+                    .shortcut("Ctrl+A")
+                    .on_select(act(&self.state, EditAction::SelectAll)),
+            )
             .into_element()
     }
 
@@ -398,6 +509,7 @@ impl DesktopApp {
         let state = Rc::clone(&self.state);
 
         div()
+            .id("chrome.header")
             .flex_row()
             .items_center()
             .gap(theme.spacing.md)
@@ -420,7 +532,10 @@ impl DesktopApp {
             )
             .child(label("/").text_size(theme.typography.sm).text_color(c.text_muted).no_wrap())
             .child(
-                label("Settings").text_size(theme.typography.sm).text_color(c.text_muted).no_wrap(),
+                label("UI Gallery")
+                    .text_size(theme.typography.sm)
+                    .text_color(c.text_muted)
+                    .no_wrap(),
             )
             .child(div().flex_1())
             // The window buttons sit inside the caption strip, which is exactly
@@ -450,7 +565,7 @@ impl DesktopApp {
 
     fn sidebar(&mut self, theme: &Theme) -> AnyElement {
         let c = theme.colors;
-        let current = self.state.section.get();
+        let current = self.state.page.get();
         let mut nav = div()
             .flex_col()
             // Grows instead of filling: the footer below claims its own height
@@ -461,7 +576,7 @@ impl DesktopApp {
             .pt(theme.spacing.md)
             .gap(theme.spacing.xs)
             .child(
-                label("SETTINGS")
+                label("WIDGETS")
                     .text_size(theme.typography.xs)
                     .weight(theme.typography.strong)
                     .text_color(c.text_muted)
@@ -469,7 +584,7 @@ impl DesktopApp {
                     .py_(theme.spacing.sm),
             );
 
-        for section in Section::ALL {
+        for section in Page::ALL {
             let selected = section == current;
             let state = Rc::clone(&self.state);
             let icon = self.icon_for(section);
@@ -504,7 +619,7 @@ impl DesktopApp {
                             .no_wrap(),
                     )
                     .on_click(move |cx: &mut EventContext<'_>| {
-                        state.section.set(section);
+                        state.page.set(section);
                         // A section switch changes what is in the pane, so this
                         // one genuinely is a layout change — unlike a hover or
                         // a slider drag, which are repaints.
@@ -673,12 +788,11 @@ impl DesktopApp {
 
     fn content(&self, theme: &Theme) -> AnyElement {
         let c = theme.colors;
-        let body = match self.state.section.get() {
-            Section::General => self.general(theme),
-            Section::Appearance => self.appearance(theme),
-            Section::Network => self.network(theme),
-            Section::About => self.about(theme),
-        };
+        // The renderer's own numbers are on the Containers page, so they have to
+        // be sampled here where the surface is reachable and handed down.
+        let adapter = self.surface.as_ref().map(|s| s.adapter_name()).unwrap_or("").to_string();
+        let stats = self.surface.as_ref().map(|s| s.stats()).unwrap_or_default();
+        let body = pages::render(self.state.page.get(), &self.state, theme, &adapter, &stats);
 
         div()
             .flex_col()
@@ -696,7 +810,7 @@ impl DesktopApp {
                     .h(px(36.0))
                     .px_(px(12.0))
                     .child(
-                        label(self.state.section.get().title())
+                        label(self.state.page.get().title())
                             .text_size(theme.typography.sm)
                             .weight(theme.typography.strong)
                             .text_color(c.text)
@@ -704,7 +818,7 @@ impl DesktopApp {
                     )
                     .child(div().flex_1())
                     .child(
-                        label("User settings · changes save automatically")
+                        label("Every control here is live")
                             .text_size(theme.typography.xs)
                             .text_color(c.text_muted)
                             .no_wrap(),
@@ -727,333 +841,11 @@ impl DesktopApp {
             .into_element()
     }
 
-    fn general(&self, theme: &Theme) -> AnyElement {
-        let c = theme.colors;
-        let state = Rc::clone(&self.state);
-
-        div()
-            .flex_col()
-            .gap(theme.spacing.md)
-            .child(page_header("General", "Everyday behavior for this SphereKit workspace.", theme))
-            .child(setting_row(
-                "Show notifications",
-                "Desktop alerts when a background task finishes.",
-                theme,
-                {
-                    let s = Rc::clone(&state);
-                    let on = s.notifications.get();
-                    toggle(on)
-                        .id("notifications")
-                        .label("Show notifications")
-                        .on_change(move |v| {
-                            s.notifications.set(v);
-                            s.say(if v { "Notifications on." } else { "Notifications off." });
-                        })
-                        .into_element()
-                },
-            ))
-            .child(separator(false).bg(Color::TRANSPARENT))
-            .child(setting_row(
-                "Install updates automatically",
-                "Download and apply in the background.",
-                theme,
-                {
-                    let s = Rc::clone(&state);
-                    let on = s.auto_update.get();
-                    checkbox(on)
-                        .id("auto-update")
-                        .label("Install updates automatically")
-                        .on_change(move |v| {
-                            s.auto_update.set(v);
-                            s.say(if v { "Auto-update enabled." } else { "Auto-update disabled." });
-                        })
-                        .into_element()
-                },
-            ))
-            .child(separator(false).bg(Color::TRANSPARENT))
-            .child(setting_row("Send usage data", "Anonymous, and off by default.", theme, {
-                let s = Rc::clone(&state);
-                let on = s.telemetry.get();
-                checkbox(on)
-                    .id("telemetry")
-                    .label("Send usage data")
-                    .on_change(move |v| s.telemetry.set(v))
-                    .into_element()
-            }))
-            .child(separator(false).bg(Color::TRANSPARENT))
-            .child(
-                div()
-                    .flex_col()
-                    .gap(theme.spacing.sm)
-                    .child(
-                        label("Output volume")
-                            .text_size(theme.typography.md)
-                            .weight(theme.typography.strong)
-                            .text_color(c.text),
-                    )
-                    .child({
-                        let s = Rc::clone(&state);
-                        let v = s.volume.get();
-                        slider(v)
-                            .id("volume")
-                            .range(0.0, 100.0)
-                            .default_value(65.0)
-                            .name("Output volume")
-                            .unit("%")
-                            .format(|x| format!("{x:.0}%"))
-                            .on_change(move |x| s.volume.set(x))
-                    })
-                    .child(
-                        label(format!("{:.0}%", state.volume.get()))
-                            .text_size(theme.typography.sm)
-                            .text_color(c.text_muted),
-                    ),
-            )
-            .into_element()
-    }
-
-    fn appearance(&self, theme: &Theme) -> AnyElement {
-        let c = theme.colors;
-        let state = Rc::clone(&self.state);
-
-        div()
-            .flex_col()
-            .gap(theme.spacing.lg)
-            .child(page_header(
-                "Appearance",
-                "Tune interface density and inspect the active type system.",
-                theme,
-            ))
-            .child(
-                div()
-                    .flex_col()
-                    .gap(theme.spacing.sm)
-                    .child(
-                        label("Interface scale")
-                            .text_size(theme.typography.md)
-                            .weight(theme.typography.strong)
-                            .text_color(c.text),
-                    )
-                    .child({
-                        let s = Rc::clone(&state);
-                        let v = s.ui_scale.get();
-                        slider(v)
-                            .id("ui-scale")
-                            .range(75.0, 200.0)
-                            .step(25.0)
-                            .default_value(100.0)
-                            .name("Interface scale")
-                            .format(|x| format!("{x:.0}%"))
-                            .on_change(move |x| s.ui_scale.set(x))
-                    })
-                    .child(
-                        label(format!(
-                            "{:.0}%  —  stepped, so it lands on the sizes the assets are drawn for",
-                            state.ui_scale.get()
-                        ))
-                        .text_size(theme.typography.sm)
-                        .text_color(c.text_muted),
-                    ),
-            )
-            .child(separator(false).bg(Color::TRANSPARENT))
-            // A type specimen. Every size below goes through the same MTSDF
-            // path, and the two smallest cross into the bitmap fallback.
-            .child(
-                label("Type specimen")
-                    .text_size(theme.typography.md)
-                    .weight(theme.typography.strong)
-                    .text_color(c.text),
-            )
-            .child(
-                div()
-                    .flex_col()
-                    .gap(theme.spacing.xs)
-                    .child(
-                        label("Extra small — 10 px")
-                            .text_size(theme.typography.xs)
-                            .text_color(c.text),
-                    )
-                    .child(label("Small — 11 px").text_size(theme.typography.sm).text_color(c.text))
-                    .child(
-                        label("Medium — 13 px").text_size(theme.typography.md).text_color(c.text),
-                    )
-                    .child(
-                        div()
-                            .flex_row()
-                            .gap(theme.spacing.lg)
-                            .child(
-                                label("Regular 400")
-                                    .text_size(theme.typography.md)
-                                    .weight(spherekit::text::FontWeight::NORMAL)
-                                    .text_color(c.text),
-                            )
-                            .child(
-                                label("SemiBold 600")
-                                    .text_size(theme.typography.md)
-                                    .weight(spherekit::text::FontWeight::SEMI_BOLD)
-                                    .text_color(c.text),
-                            )
-                            .child(
-                                label("Bold 700")
-                                    .text_size(theme.typography.md)
-                                    .weight(spherekit::text::FontWeight::BOLD)
-                                    .text_color(c.text),
-                            ),
-                    )
-                    .child(label("Large — 16 px").text_size(theme.typography.lg).text_color(c.text))
-                    .child(
-                        label("Extra large — 20 px")
-                            .text_size(theme.typography.xl)
-                            .text_color(c.text),
-                    )
-                    .child(
-                        label("ไทย · 日本語 · 中文 · 한국어 · العربية · Ελληνικά")
-                            .text_size(theme.typography.md)
-                            .text_color(c.text_muted),
-                    ),
-            )
-            .into_element()
-    }
-
-    fn network(&self, theme: &Theme) -> AnyElement {
-        let c = theme.colors;
-        let state = Rc::clone(&self.state);
-        let downloaded = state.download.get();
-
-        div()
-            .flex_col()
-            .gap(theme.spacing.lg)
-            .child(page_header(
-                "Network",
-                "Manage sync state and the server used by this workspace.",
-                theme,
-            ))
-            .child(
-                div()
-                    .flex_col()
-                    .gap(theme.spacing.sm)
-                    .p(theme.spacing.lg)
-                    .rounded(theme.radii.lg)
-                    .child(
-                        label("Sync status")
-                            .text_size(theme.typography.md)
-                            .weight(theme.typography.strong)
-                            .text_color(c.text),
-                    )
-                    .child(progress_bar(downloaded, theme))
-                    .child(
-                        label(if downloaded >= 1.0 {
-                            "Up to date.".to_string()
-                        } else {
-                            format!("Downloading… {:.0}%", downloaded * 100.0)
-                        })
-                        .text_size(theme.typography.sm)
-                        .text_color(c.text_muted),
-                    )
-                    .child(div().flex_row().gap(theme.spacing.md).child({
-                        let s = Rc::clone(&state);
-                        button("Sync now")
-                            .id("sync")
-                            .weight(theme.typography.strong)
-                            .on_press(move || {
-                                s.download.set(0.0);
-                                s.say("Sync started.");
-                            })
-                    })),
-            )
-            .child(
-                div()
-                    .flex_col()
-                    .gap(theme.spacing.md)
-                    .p(theme.spacing.lg)
-                    .rounded(theme.radii.lg)
-                    .child(
-                        label("Server")
-                            .text_size(theme.typography.md)
-                            .weight(theme.typography.strong)
-                            .text_color(c.text),
-                    )
-                    .child({
-                        let s = Rc::clone(&state);
-                        let commit = Rc::clone(&state);
-                        text_field(state.server.borrow().clone())
-                            .id("server")
-                            .placeholder("host name or address")
-                            .on_change(move |e| *s.server.borrow_mut() = e.clone())
-                            .on_submit(move |text| commit.say(format!("Server set to {text}.")))
-                    })
-                    .child(
-                        label(
-                            "Try an input method here — composition stays underlined until it is committed.",
-                        )
-                        .text_size(theme.typography.sm)
-                        .text_color(c.text_muted),
-                    )
-                    .child(
-                        label("Passphrase")
-                            .text_size(theme.typography.md)
-                            .weight(theme.typography.strong)
-                            .text_color(c.text),
-                    )
-                    .child({
-                        let s = Rc::clone(&state);
-                        text_field(state.passphrase.borrow().clone())
-                            .id("passphrase")
-                            .placeholder("optional")
-                            .mask(true)
-                            .on_change(move |e| *s.passphrase.borrow_mut() = e.clone())
-                    }),
-            )
-            .into_element()
-    }
-
-    fn about(&self, theme: &Theme) -> AnyElement {
-        let c = theme.colors;
-        let stats = self.surface.as_ref().map(|s| s.stats()).unwrap_or_default();
-        let adapter =
-            self.surface.as_ref().map(|s| s.adapter_name().to_string()).unwrap_or_default();
-
-        div()
-            .flex_col()
-            .gap(theme.spacing.md)
-            .child(page_header(
-                "About",
-                "Runtime and renderer details for this SphereKit build.",
-                theme,
-            ))
-            .child(
-                label("SphereKit")
-                    .text_size(theme.typography.lg)
-                    .weight(FontWeight::BOLD)
-                    .text_color(c.text),
-            )
-            .child(
-                label("A GPU-first graphics and UI engine written in Rust.")
-                    .text_size(theme.typography.md)
-                    .text_color(c.text_muted),
-            )
-            .child(separator(false).bg(Color::TRANSPARENT))
-            .child(info_row("Adapter", &adapter, theme))
-            .child(info_row("Draw calls", &stats.frame.draw_calls.to_string(), theme))
-            .child(info_row("Quad instances", &stats.frame.quads.to_string(), theme))
-            .child(info_row("Glyph instances", &stats.frame.glyphs.to_string(), theme))
-            .child(info_row("Mesh triangles", &stats.frame.triangles.to_string(), theme))
-            .child(info_row("Elements built", &stats.tree.elements.to_string(), theme))
-            .child(info_row("Nodes relaid out", &stats.nodes_laid_out.to_string(), theme))
-            .child(info_row("CPU per frame", &format!("{:.2} ms", stats.cpu_ms), theme))
-            .child(separator(false).bg(Color::TRANSPARENT))
-            .child(
-                label("BSD 3-Clause · Futureboard Digital Technologies")
-                    .text_size(theme.typography.sm)
-                    .text_color(c.text_muted),
-            )
-            .into_element()
-    }
-
     fn status_bar(&self, theme: &Theme) -> AnyElement {
         let c = theme.colors;
         let last = self.state.log.borrow().last().cloned().unwrap_or_default();
         div()
+            .id("chrome.status")
             .flex_row()
             .items_center()
             .gap(theme.spacing.md)
@@ -1107,15 +899,15 @@ mod wco {
 /// Segoe Fluent Icons ships with Windows 11; Segoe MDL2 Assets is its Windows
 /// 10 predecessor and carries the same codepoints for these four glyphs, so
 /// naming it second makes the caption correct on both with no version check.
-const ICON_FONT: [&str; 2] = ["Segoe Fluent Icons", "Segoe MDL2 Assets"];
+pub(crate) const ICON_FONT: [&str; 2] = ["Segoe Fluent Icons", "Segoe MDL2 Assets"];
 
 /// The signed-in account the sidebar footer shows.
 ///
 /// A constant because this example has no account system. A real application
 /// would hand the same two strings to the same two widgets.
-const USER_NAME: &str = "Ada Lovelace";
+pub(crate) const USER_NAME: &str = "Ada Lovelace";
 /// The account's address, shown under the name.
-const USER_EMAIL: &str = "ada@futureboard.local";
+pub(crate) const USER_EMAIL: &str = "ada@futureboard.local";
 
 /// Width and height of a caption button.
 const CAPTION_BUTTON: f32 = 32.0;
@@ -1293,91 +1085,15 @@ fn spherekit_text_style(size: Px) -> spherekit::text::TextStyle {
     }
 }
 
-fn page_header(title: &str, description: &str, theme: &Theme) -> AnyElement {
-    let c = theme.colors;
-    div()
-        .flex_col()
-        .gap(theme.spacing.sm)
-        .pb(theme.spacing.md)
-        .child(
-            label(title.to_string())
-                .text_size(theme.typography.xl)
-                .weight(FontWeight::BOLD)
-                .text_color(c.text),
-        )
-        .child(
-            label(description.to_string()).text_size(theme.typography.sm).text_color(c.text_muted),
-        )
-        .into_element()
-}
-
-fn progress_bar(fraction: f32, theme: &Theme) -> AnyElement {
-    let t = fraction.clamp(0.0, 1.0);
-    div()
-        .h(px(4.0))
-        .w(relative(1.0))
-        .rounded_full()
-        .bg(theme.colors.pressed)
-        .clip()
-        .child(div().h(relative(1.0)).w(relative(t)).rounded_full().bg(theme.colors.accent))
-        .into_element()
-}
-
-fn info_row(name: &str, value: &str, theme: &Theme) -> AnyElement {
-    let c = theme.colors;
-    div()
-        .flex_row()
-        .gap(theme.spacing.md)
-        .child(
-            label(name.to_string())
-                .text_size(theme.typography.sm)
-                .text_color(c.text_muted)
-                .w(px(160.0)),
-        )
-        .child(label(value.to_string()).text_size(theme.typography.sm).text_color(c.text))
-        .into_element()
-}
-
-/// A labelled row with its control on the right.
-fn setting_row(title: &str, description: &str, theme: &Theme, control: AnyElement) -> AnyElement {
-    let c = theme.colors;
-    div()
-        .flex_row()
-        .items_center()
-        .gap(theme.spacing.lg)
-        .py_(theme.spacing.md)
-        .child(
-            div()
-                .flex_col()
-                .flex_1()
-                .gap(theme.spacing.xs)
-                // The row's title carries the weight; its description stays at
-                // book weight and muted, which is the whole of the hierarchy.
-                .child(
-                    label(title.to_string())
-                        .text_size(theme.typography.md)
-                        .weight(theme.typography.strong)
-                        .text_color(c.text),
-                )
-                .child(
-                    label(description.to_string())
-                        .text_size(theme.typography.sm)
-                        .text_color(c.text_muted),
-                ),
-        )
-        .child(control)
-        .into_element()
-}
-
 /// Draws a cached SVG icon, tinted.
 ///
 /// A minimal custom element: it has no children, no layout of its own beyond a
 /// fixed size, and its whole job is one `SvgCache::render` call. Writing one is
 /// meant to be this small.
-struct IconElement {
-    svg: Option<spherekit::core::SvgId>,
-    tint: Color,
-    size: Px,
+pub(crate) struct IconElement {
+    pub(crate) svg: Option<spherekit::core::SvgId>,
+    pub(crate) tint: Color,
+    pub(crate) size: Px,
 }
 
 impl spherekit::ui::Element for IconElement {
@@ -1430,10 +1146,10 @@ fn keyboard_activate(
 /// Two strokes instead of a glyph so it can *rotate* with the menu: it points
 /// up when the panel is open and down when it is shut, and every frame in
 /// between is a real angle rather than a swap between two characters.
-struct ChevronElement {
-    tint: Color,
+pub(crate) struct ChevronElement {
+    pub(crate) tint: Color,
     /// How far open the menu is, `0..=1`.
-    open: f32,
+    pub(crate) open: f32,
 }
 
 impl spherekit::ui::Element for ChevronElement {
@@ -1476,7 +1192,7 @@ thread_local! {
     static ICONS: RefCell<SvgCache> = RefCell::new(SvgCache::new());
 }
 
-impl AppHandler for DesktopApp {
+impl AppHandler for GalleryApp {
     fn resumed(&mut self, cx: &mut AppContext<'_>) {
         if self.surface.is_some() {
             return;
@@ -1487,7 +1203,7 @@ impl AppHandler for DesktopApp {
         // is a blank rectangle for the whole of it. `WindowAttributes::visible`
         // documents this as the fix; the reveal is at the bottom of this
         // function, after a frame has actually been drawn.
-        let attrs = WindowAttributes::new("SphereKit — Preferences")
+        let attrs = WindowAttributes::new("SphereKit — UI Gallery")
             .with_inner_size(size(px(980.0), px(640.0)))
             .with_min_inner_size(size(px(560.0), px(380.0)))
             // The header is the title bar. The platform keeps the resize
@@ -1550,7 +1266,7 @@ impl AppHandler for DesktopApp {
         // Seed the shared icon cache with the same documents.
         ICONS.with(|cache| {
             if let Ok(mut cache) = cache.try_borrow_mut() {
-                for section in Section::ALL {
+                for section in Page::ALL {
                     let _ = cache.load_str(section.icon());
                 }
             }
@@ -1558,7 +1274,7 @@ impl AppHandler for DesktopApp {
         // Re-resolve the ids against the cache the painter will actually use.
         self.icons = ICONS.with(|cache| {
             let mut cache = cache.borrow_mut();
-            Section::ALL
+            Page::ALL
                 .iter()
                 .filter_map(|s| cache.load_str(s.icon()).ok().map(|id| (*s, id)))
                 .collect()
@@ -1658,8 +1374,18 @@ impl AppHandler for DesktopApp {
             // Deliberately outside the `consumed` guard below: a click on a
             // toggle in the content pane is consumed, and it should still shut
             // the menu. Only a press on the account UI is exempt.
-            if press && !self.state.press_inside_account.get() && self.state.set_user_menu(false) {
-                needs_redraw = true;
+            if press {
+                if !self.state.press_inside_account.get() && self.state.set_user_menu(false) {
+                    needs_redraw = true;
+                }
+                // The edit menu closes on any press its own rows did not
+                // consume — including the right-click that opens it over a
+                // different field, which reopens it a moment later at the new
+                // position. Checked after dispatch so a row still gets its
+                // click before the menu goes.
+                if !result.consumed && self.state.ctx_menu_open.replace(false) {
+                    needs_redraw = true;
+                }
             }
 
             if result.consumed {
@@ -1739,7 +1465,7 @@ impl AppHandler for DesktopApp {
     }
 }
 
-impl DesktopApp {
+impl GalleryApp {
     fn report(&self) {
         let stats = self.surface.as_ref().map(|s| s.stats()).unwrap_or_default();
         println!("--- desktop app report ---");
@@ -1863,6 +1589,26 @@ impl DesktopApp {
         moving |= !menu.is_settled();
         self.state.user_menu.set(menu);
 
+        // The Identity page's own dropdown. A second spring rather than a
+        // shared one, so the two panels can be open at the same time and it is
+        // visible that neither widget owns any state of its own.
+        let mut demo = self.state.demo_menu.get();
+        demo.retarget(if self.state.demo_menu_open.get() { 1.0 } else { 0.0 });
+        demo.step(frame.delta);
+        moving |= !demo.is_settled();
+        self.state.demo_menu.set(demo);
+
+        let mut ctx = self.state.ctx_menu.get();
+        ctx.retarget(if self.state.ctx_menu_open.get() { 1.0 } else { 0.0 });
+        ctx.step(frame.delta);
+        moving |= !ctx.is_settled();
+        self.state.ctx_menu.set(ctx);
+
+        // The indeterminate bar is a function of paint time, so it only moves
+        // while frames keep coming. It is on screen only on one page, so only
+        // that page pays for the continuous redraw.
+        moving |= self.state.page.get() == Page::Containers && self.state.busy.get();
+
         moving
     }
 
@@ -1900,6 +1646,13 @@ impl DesktopApp {
     }
 }
 
+fn main() {
+    if let Err(e) = App::new(GalleryApp::new()).run() {
+        eprintln!("event loop failed: {e}");
+        std::process::exit(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1907,6 +1660,101 @@ mod tests {
     use spherekit::render::{Canvas, Scene};
     use spherekit::text::{FontRequest, TextSystem};
     use spherekit::ui::UiTree;
+
+    /// Builds and lays out one page, returning the tree it produced.
+    fn lay_out(page: Page, text: &mut TextSystem) -> (UiTree, spherekit::core::Size<Px>) {
+        let mut app = GalleryApp::new();
+        app.state.page.set(page);
+        let viewport = size(px(1100.0), px(720.0));
+        let mut tree = UiTree::new();
+        tree.set_theme(app.state.theme());
+        tree.build(app.build());
+        tree.compute_layout_with_text(viewport, text).unwrap();
+        (tree, viewport)
+    }
+
+    #[test]
+    fn every_page_builds_lays_out_and_paints() {
+        // The gallery's whole claim is that these pages are live. A page that
+        // panics on build, or lays out to nothing, is the one failure mode that
+        // would make the claim false without looking broken in a screenshot.
+        let mut text = TextSystem::with_system_fonts();
+        for page in Page::ALL {
+            let (mut tree, viewport) = lay_out(page, &mut text);
+            let mut scene = Scene::new(viewport, ScaleFactor::IDENTITY);
+            {
+                let mut canvas = Canvas::new(&mut scene);
+                tree.paint(&mut canvas, &mut text, viewport, 0.0);
+            }
+            assert!(!scene.is_empty(), "the {} page painted nothing at all", page.title());
+            assert!(
+                tree.stats().elements > 40,
+                "the {} page built only {} elements — it is probably empty",
+                page.title(),
+                tree.stats().elements
+            );
+        }
+    }
+
+    #[test]
+    fn the_chrome_keeps_its_height_on_every_page() {
+        // A flex item with a height still has `flex_shrink: 1` by default, so
+        // a long page silently squashes the caption and the status bar — the
+        // status bar was down to 15 px of its 26 before this was pinned. The
+        // longest page is the one that used to break it, so every page is
+        // checked rather than a representative one.
+        let mut text = TextSystem::with_system_fonts();
+        for page in Page::ALL {
+            let (tree, _) = lay_out(page, &mut text);
+            let header = tree.bounds_of("chrome.header").expect("the header is built");
+            let status = tree.bounds_of("chrome.status").expect("the status bar is built");
+            assert_eq!(
+                header.height(),
+                px(CAPTION_HEIGHT),
+                "the caption was squashed on the {} page",
+                page.title()
+            );
+            assert_eq!(
+                status.height(),
+                px(26.0),
+                "the status bar was squashed on the {} page",
+                page.title()
+            );
+        }
+    }
+
+    #[test]
+    fn the_content_pane_can_actually_scroll_on_a_long_page() {
+        // The other half of the same flexbox trap: without `min_h(0)` on the
+        // row and the pane, the pane grows to fit the page instead of
+        // overflowing, and the wheel has nothing to move.
+        let mut text = TextSystem::with_system_fonts();
+        let (mut tree, _) = lay_out(Page::Palette, &mut text);
+        tree.dispatch(&spherekit::ui::UiEvent::Scroll(spherekit::ui::ScrollEvent {
+            position: spherekit::core::Point::new(px(700.0), px(300.0)),
+            delta: spherekit::ui::ScrollDelta::Lines(spherekit::core::Size::new(0.0, -3.0)),
+            modifiers: spherekit::ui::Modifiers::NONE,
+            momentum: false,
+        }));
+        // The wheel now sets a destination and the tree glides there, so the
+        // frames a window would draw have to be drawn here too.
+        for _ in 0..120 {
+            if !tree.advance(std::time::Duration::from_millis(16)) {
+                break;
+            }
+        }
+        let offset = tree.scroll_offset_of("content-scroll").expect("the pane is built");
+        assert!(offset.height > Px::ZERO, "a long page did not scroll: {offset:?}");
+    }
+
+    #[test]
+    fn every_page_has_a_title_and_a_blurb() {
+        for page in Page::ALL {
+            assert!(!page.title().is_empty());
+            assert!(!page.blurb().is_empty(), "{} has no summary line", page.title());
+            assert!(page.icon().starts_with("<svg"), "{} has no icon", page.title());
+        }
+    }
 
     #[test]
     fn product_theme_is_dark_but_uses_lifted_surfaces() {
@@ -1921,7 +1769,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_typography_paints_regular_semibold_and_bold_faces() {
+    fn the_text_page_paints_regular_semibold_and_bold_faces() {
         let mut text = TextSystem::with_system_fonts();
         let regular = text.fonts_mut().resolve(&FontRequest::default().weight(FontWeight::NORMAL));
         let semibold =
@@ -1936,13 +1784,8 @@ mod tests {
             return;
         }
 
-        let mut app = DesktopApp::new();
-        let viewport = size(px(980.0), px(640.0));
-        let mut tree = UiTree::new();
-        tree.set_theme(app.state.theme());
-        tree.build(app.build());
-        tree.compute_layout_with_text(viewport, &mut text).unwrap();
-
+        // The weights live on the Text page, which is the one that claims them.
+        let (mut tree, viewport) = lay_out(Page::Text, &mut text);
         let mut scene = Scene::new(viewport, ScaleFactor::IDENTITY);
         {
             let mut canvas = Canvas::new(&mut scene);
@@ -1952,15 +1795,8 @@ mod tests {
         for (name, face) in [("regular", regular), ("semibold", semibold), ("bold", bold)] {
             assert!(
                 scene.runs.iter().any(|run| run.font == face),
-                "desktop app never painted its {name} face"
+                "the Text page never painted its {name} face"
             );
         }
-    }
-}
-
-fn main() {
-    if let Err(e) = App::new(DesktopApp::new()).run() {
-        eprintln!("event loop failed: {e}");
-        std::process::exit(1);
     }
 }
