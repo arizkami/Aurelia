@@ -491,9 +491,15 @@ const TEMPLATE_FILES: &[Template] = &[
         "src/renderer/index.ts",
         include_bytes!("../../../template/spherekit-app-react/src/renderer/index.ts"),
     ),
+    // `.tmpl` on disk, `Cargo.toml` once written. The name is load-bearing:
+    // this file's dependency values are `{{PLACEHOLDER}}`, which is not valid
+    // TOML, and Cargo walks every `Cargo.toml` in a git checkout when the repo
+    // is used as a git dependency. Named `Cargo.toml` it makes
+    // `cargo add spherekit --git ...` report a parse error in someone else's
+    // project — a template they never asked for breaking a dependency they did.
     (
         "src/app/Cargo.toml",
-        include_bytes!("../../../template/spherekit-app-react/src/app/Cargo.toml"),
+        include_bytes!("../../../template/spherekit-app-react/src/app/Cargo.toml.tmpl"),
     ),
     (
         "src/app/src/main.rs",
@@ -509,6 +515,98 @@ const TEMPLATE_FILES: &[Template] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Walks the repository for files named exactly `Cargo.toml`.
+    fn manifests_in(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            if path.is_dir() {
+                // `target` holds vendored manifests that are none of our
+                // business, and `.git` holds no manifests at all.
+                if name != "target" && name != ".git" && name != "node_modules" {
+                    manifests_in(&path, out);
+                }
+            } else if name == "Cargo.toml" {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn no_manifest_in_the_repository_is_a_template() {
+        // Cargo parses *every* `Cargo.toml` in a git checkout when the repo is
+        // consumed as a git dependency. One containing `{{PLACEHOLDER}}` is not
+        // valid TOML, so it surfaces as a parse error inside the *consumer's*
+        // project — for a file they will never use. Template manifests
+        // therefore live under a `.tmpl` name and are renamed on scaffold.
+        //
+        // This walks the real tree rather than checking the one known file,
+        // because the failure mode is someone adding a second template later.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("crates/spherekit-cli sits two levels below the root")
+            .to_path_buf();
+
+        let mut manifests = Vec::new();
+        manifests_in(&root, &mut manifests);
+        assert!(!manifests.is_empty(), "walked {} and found no manifests", root.display());
+
+        let mut bad = Vec::new();
+        for manifest in &manifests {
+            let Ok(text) = fs::read_to_string(manifest) else { continue };
+            if text.contains("{{") {
+                bad.push(manifest.display().to_string());
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "these manifests hold template placeholders and will break \
+             `cargo add --git` for every external consumer: {bad:#?}"
+        );
+    }
+
+    #[test]
+    fn the_scaffolded_manifest_is_valid_toml() {
+        // The other half: once the placeholders are substituted the result has
+        // to actually parse. A template that is merely *absent* from Cargo's
+        // walk is not the same as one that works.
+        let source = String::from_utf8(
+            include_bytes!("../../../template/spherekit-app-react/src/app/Cargo.toml.tmpl")
+                .to_vec(),
+        )
+        .expect("template is UTF-8");
+        assert!(source.contains("{{"), "the template stopped being a template");
+
+        let rendered = source
+            .replace("{{RUST_CRATE_NAME}}", "demo_app")
+            .replace("{{SPHEREKIT_REACT_CARGO_DEP}}", "{ version = \"0.1.0\" }")
+            .replace("{{SPHEREKIT_BRIDGE_CARGO_DEP}}", "{ version = \"0.1.0\" }")
+            .replace("{{SPHEREKIT_CSS_CARGO_DEP}}", "{ version = \"0.1.0\" }");
+        assert!(!rendered.contains("{{"), "a placeholder survived substitution: {rendered}");
+
+        // No TOML parser is a dependency here, so this checks the shape that
+        // actually broke: a dependency whose value is not a table or a string.
+        for line in rendered.lines() {
+            let Some((key, value)) = line.split_once('=') else { continue };
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            assert!(
+                value.starts_with('{')
+                    || value.starts_with('"')
+                    || value.starts_with('[')
+                    || value.parse::<f64>().is_ok()
+                    || value == "true"
+                    || value == "false",
+                "`{}` has a value TOML cannot read: {value}",
+                key.trim()
+            );
+        }
+    }
 
     #[test]
     fn parses_flags_and_values() {
