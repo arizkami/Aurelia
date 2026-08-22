@@ -52,6 +52,14 @@ struct BuiltNode {
     opacity: f32,
     /// Optional post-process for this element and its subtree.
     filter: Option<Filter>,
+    /// Whether this element or an ancestor is `display: none`.
+    ///
+    /// Such a subtree is still built — the elements exist, they simply have no
+    /// layout — so paint has to be told to leave it alone. Culling by bounds is
+    /// not enough: a hidden node keeps its parent's origin, and a zero-extent
+    /// rect is only reliably rejected when the element also has no group of its
+    /// own to open.
+    hidden: bool,
 }
 
 /// Per-node state that must outlive a rebuild.
@@ -291,11 +299,18 @@ impl UiTree {
             element: AnyElement,
             parent: Option<usize>,
             identity: ElementId,
+            /// Whether an ancestor — or this node — is `display: none`.
+            ///
+            /// Carried down rather than looked up, because a hidden subtree is
+            /// still *built*: the elements exist, they simply have no layout.
+            /// Without this the focus ring would happily land inside a closed
+            /// dropdown, and Tab would appear to skip into nothing.
+            hidden: bool,
         }
 
         let root_identity = ElementId::from_key("spherekit.root");
         let mut stack: Vec<Pending> =
-            vec![Pending { element: root, parent: None, identity: root_identity }];
+            vec![Pending { element: root, parent: None, identity: root_identity, hidden: false }];
         let mut child_lists: FxHashMap<usize, SmallVec<[usize; 4]>> = FxHashMap::default();
 
         while let Some(mut pending) = stack.pop() {
@@ -304,6 +319,8 @@ impl UiTree {
             // Hidden and Scroll both establish a clip; Visible does not.
             let clips = !matches!(style.overflow_x, spherekit_layout::Overflow::Visible)
                 || !matches!(style.overflow_y, spherekit_layout::Overflow::Visible);
+            // Read before `style` is moved into the layout tree.
+            let style_display = style.display;
 
             let node = self.reconcile(pending.identity, style);
             let index = self.built.len();
@@ -312,7 +329,9 @@ impl UiTree {
                 child_lists.entry(parent).or_default().push(index);
             }
 
-            if pending.element.focusable() {
+            let hidden = pending.hidden || matches!(style_display, spherekit_layout::Display::None);
+
+            if !hidden && pending.element.focusable() {
                 let tab_index = pending.element.semantics().and_then(|s| s.tab_index);
                 self.focus.register(Focusable {
                     element: pending.identity,
@@ -337,6 +356,7 @@ impl UiTree {
                 clips,
                 opacity,
                 filter,
+                hidden,
             });
             self.index_for_node.insert(node, index);
             self.node_for_element.insert(pending.identity, node);
@@ -346,7 +366,7 @@ impl UiTree {
             // document order.
             for (i, child) in children.into_iter().enumerate().rev() {
                 let identity = child.id().unwrap_or_else(|| pending.identity.child(i));
-                stack.push(Pending { element: child, parent: Some(index), identity });
+                stack.push(Pending { element: child, parent: Some(index), identity, hidden });
             }
         }
 
@@ -479,6 +499,14 @@ impl UiTree {
                 }
                 Step::Enter(index, visible) => {
                     let Some(built) = self.built.get(index) else { continue };
+                    // `display: none` leaves the frame entirely: no box, no
+                    // glyphs shaped, and — the part that actually bit — no
+                    // group opened. An empty layer costs an offscreen target
+                    // and splits the surface pass around nothing.
+                    if built.hidden {
+                        self.stats.elements_culled += 1;
+                        continue;
+                    }
                     let node = built.node;
                     let bounds =
                         self.layout.layout(node).map(|l| l.absolute_bounds).unwrap_or(Rect::ZERO);
@@ -1046,6 +1074,33 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_transparent_sibling_does_not_erase_what_was_painted_before_it() {
+        // A closed dropdown is `display: none` *and* fully transparent. If the
+        // walk still opens a group for it, the layer it pushes is empty and the
+        // renderer resolves it by re-clearing the target — taking everything
+        // already drawn with it.
+        let mut tree = UiTree::new();
+        build_and_layout(
+            &mut tree,
+            div()
+                .flex_col()
+                .w(relative(1.0))
+                .h(relative(1.0))
+                .child(div().w(px(50.0)).h(px(50.0)).bg(Color::BLUE))
+                .child(div().hidden().opacity(0.0).child(div().w(px(10.0)).h(px(10.0))))
+                .into_element(),
+        );
+        let mut scene = Scene::new(viewport(), ScaleFactor::IDENTITY);
+        {
+            let mut canvas = Canvas::new(&mut scene);
+            let mut text = spherekit_text::TextSystem::new();
+            tree.paint(&mut canvas, &mut text, viewport(), 0.0);
+        }
+        assert_eq!(scene.layers.len(), 0, "an out-of-layout element opened a layer");
+        assert_eq!(scene.len(), 1, "expected just the blue quad, got {:?}", scene.commands);
+    }
+
+    #[test]
     fn a_layout_container_with_no_appearance_records_nothing() {
         let mut tree = UiTree::new();
         build_and_layout(&mut tree, div().flex_col().child(div()).into_element());
@@ -1360,6 +1415,61 @@ mod tests {
         assert_eq!(tree.focus().focused(), Some(ElementId::from_key("a")));
         assert!(tree.navigate_focus(FocusDirection::Next));
         assert_eq!(tree.focus().focused(), Some(ElementId::from_key("b")));
+    }
+
+    #[test]
+    fn a_hidden_subtree_is_not_in_the_tab_order() {
+        // A closed dropdown is still *built* — its rows exist as elements and
+        // only lose their layout. Registering them would let Tab walk into a
+        // panel nobody can see, and the focus ring would vanish for three
+        // presses running.
+        let mut tree = UiTree::new();
+        build_and_layout(
+            &mut tree,
+            div()
+                .flex_col()
+                .w(relative(1.0))
+                .child(div().id("visible").focusable().w(px(50.0)).h(px(20.0)))
+                .child(
+                    div()
+                        .id("panel")
+                        .hidden()
+                        .child(div().id("buried").focusable().w(px(50.0)).h(px(20.0))),
+                )
+                .child(div().id("after").focusable().w(px(50.0)).h(px(20.0)))
+                .into_element(),
+        );
+
+        assert_eq!(tree.focus().len(), 2, "a hidden row was registered as focusable");
+        assert!(tree.navigate_focus(FocusDirection::Next));
+        assert_eq!(tree.focus().focused(), Some(ElementId::from_key("visible")));
+        // Straight past the hidden panel, not into it.
+        assert!(tree.navigate_focus(FocusDirection::Next));
+        assert_eq!(tree.focus().focused(), Some(ElementId::from_key("after")));
+    }
+
+    #[test]
+    fn a_subtree_that_stops_being_hidden_rejoins_the_tab_order() {
+        let build = |tree: &mut UiTree, open: bool| {
+            let mut panel = div().id("panel");
+            if !open {
+                panel = panel.hidden();
+            }
+            build_and_layout(
+                tree,
+                div()
+                    .flex_col()
+                    .w(relative(1.0))
+                    .child(div().id("visible").focusable().w(px(50.0)).h(px(20.0)))
+                    .child(panel.child(div().id("buried").focusable().w(px(50.0)).h(px(20.0))))
+                    .into_element(),
+            );
+        };
+        let mut tree = UiTree::new();
+        build(&mut tree, false);
+        assert_eq!(tree.focus().len(), 1);
+        build(&mut tree, true);
+        assert_eq!(tree.focus().len(), 2, "opening the panel did not restore its row");
     }
 
     #[test]

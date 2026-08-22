@@ -1115,15 +1115,25 @@ impl RendererBackend for WgpuRenderer {
                     wgpu::LoadOp::Load
                 };
 
-                // A pass resumed after a nested layer must reload what it
-                // already drew, and a multisampled attachment that was
-                // discarded has nothing to reload — so a resumed pass keeps its
-                // samples rather than discarding them.
-                let store = if samples > 1 && pass.composite.is_none() && pass.clear {
-                    wgpu::StoreOp::Discard
-                } else {
-                    wgpu::StoreOp::Store
-                };
+                // Discarding a multisampled attachment throws its samples away
+                // once they have resolved, which saves writing back a 4x buffer
+                // — but only when nothing needs them again. A later pass on the
+                // same target resumes with `LoadOp::Load`, and loading an
+                // attachment whose samples were discarded brings back garbage:
+                // in practice the whole first pass vanishes. So a target that
+                // is written again later is always stored.
+                //
+                // This is what a translucent panel, a group opacity or a
+                // backdrop blur does *after* other content has drawn: it opens
+                // an offscreen layer and the surface resumes behind it.
+                let resumed_later =
+                    passes[pass_index + 1..].iter().any(|later| later.target == pass.target);
+                let store =
+                    if samples > 1 && pass.composite.is_none() && pass.clear && !resumed_later {
+                        wgpu::StoreOp::Discard
+                    } else {
+                        wgpu::StoreOp::Store
+                    };
                 let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("spherekit.pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {

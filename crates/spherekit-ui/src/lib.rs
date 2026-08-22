@@ -92,8 +92,9 @@ pub use text::{Label, draw_layout, label};
 pub use theme::{Palette, Radii, Shadows, Spacing, Theme, Typography};
 pub use tree::{DispatchResult, TreeStats, UiTree};
 pub use widgets::{
-    Button, ButtonVariant, ScrollView, Toggle, ValueControl, ValueShape, button, checkbox, fader,
-    knob, panel, progress, scroll_view, separator, slider, toggle,
+    Avatar, Button, ButtonVariant, Dropdown, DropdownSide, Presence, ScrollView, Toggle,
+    ValueControl, ValueShape, avatar, button, checkbox, dropdown, fader, knob, panel, progress,
+    scroll_view, separator, slider, toggle,
 };
 
 /// Everything a typical consumer needs, in one import.

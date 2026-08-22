@@ -532,6 +532,23 @@ pub(crate) unsafe fn to_winit_attributes(
         .with_maximized(attrs.maximized)
         .with_active(attrs.active)
         .with_theme(attrs.theme.map(theme_to_winit));
+    // A transparent window must not keep a GDI redirection bitmap. DWM
+    // composites that bitmap *between* the system backdrop and the window's
+    // DirectComposition visual, and it is opaque, so the renderer's alpha
+    // resolves against it instead of against Mica — a window that is correctly
+    // transparent but shows flat white where the material belongs.
+    //
+    // `with_no_redirection_bitmap` sets `WS_EX_NOREDIRECTIONBITMAP` and, as a
+    // side effect, stops winit installing the legacy `DwmEnableBlurBehindWindow`
+    // hack it otherwise uses for transparency. Nothing here draws with GDI or
+    // child HWNDs, so losing the redirection surface costs us nothing.
+    #[cfg(windows)]
+    {
+        use ::winit::platform::windows::WindowAttributesExtWindows as _;
+        if attrs.transparent {
+            w = w.with_no_redirection_bitmap(true);
+        }
+    }
     if let Some(min) = min {
         w = w.with_min_inner_size(logical(min));
     }

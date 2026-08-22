@@ -314,7 +314,12 @@ pub(crate) fn set_backdrop(hwnd: *mut core::ffi::c_void, backdrop: WindowBackdro
         )
     };
     if result >= 0 {
-        let _ = extend_frame_into_client(hwnd);
+        // Deliberately *not* extending the frame here. `DWMWA_SYSTEM_BACKDROP_TYPE`
+        // already draws the material behind the whole window, and asking for the
+        // "sheet of glass" frame on top of it makes DWM render the system caption
+        // buttons as well — which a `Custom` frame has already drawn for itself,
+        // so they arrive as a second, wider-pitched set overlapping ours.
+        // The legacy `DWMWA_MICA_EFFECT` path below still needs the extension.
         if backdrop == WindowBackdrop::None {
             let disabled: i32 = 0;
             // Clear the legacy flag as well. Some early Windows 11 builds keep

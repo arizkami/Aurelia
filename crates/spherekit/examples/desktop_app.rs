@@ -35,10 +35,47 @@ use spherekit::svg::SvgCache;
 use spherekit::text::FontWeight;
 use spherekit::ui::{
     AnyElement, Cursor, Element, EventContext, InputTranslator, Interactive, IntoElement,
-    ParentElement, Role, Semantics, Styled, StyledInteraction, TextEdit, Theme, button, checkbox,
-    div, label, scroll_view, separator, slider, text_field, toggle,
+    ParentElement, Presence, Role, Semantics, Styled, StyledInteraction, TextEdit, Theme, avatar,
+    button, checkbox, div, dropdown, label, scroll_view, separator, slider, text_field, toggle,
 };
 use spherekit::{SphereKitSurface, SurfaceOptions};
+
+// ---------------------------------------------------------------------------
+// Composition diagnostics (env-driven; defaults reproduce the shipping app).
+//
+//   SPHEREKIT_DIAG_TRANSPARENT = 0 | 1        window + surface transparency
+//   SPHEREKIT_DIAG_BACKDROP    = none | mica | acrylic
+//   SPHEREKIT_DIAG_CLEAR       = transparent | opaque
+//
+// These exist so the opaque/no-Mica baseline and the DX12-vs-Vulkan comparison
+// run the *same* scene; nothing here changes any theme colour.
+// ---------------------------------------------------------------------------
+fn diag_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name).ok().as_deref() {
+        Some("0") | Some("false") => false,
+        Some("1") | Some("true") => true,
+        _ => default,
+    }
+}
+
+fn diag_backdrop() -> Option<WindowBackdrop> {
+    match std::env::var("SPHEREKIT_DIAG_BACKDROP").ok().as_deref() {
+        Some("none") => Some(WindowBackdrop::None),
+        Some("acrylic") => Some(WindowBackdrop::Acrylic),
+        Some("off") => None,
+        _ => Some(WindowBackdrop::Mica),
+    }
+}
+
+fn diag_clear() -> Color {
+    if std::env::var("SPHEREKIT_DIAG_CLEAR").ok().as_deref() == Some("opaque") {
+        // Opaque baseline only: an alpha-1 clear so the surface can never be
+        // composited against anything behind the window.
+        Color::hex(0x1F2023)
+    } else {
+        Color::TRANSPARENT
+    }
+}
 
 /// The desktop example's product theme.
 ///
@@ -211,6 +248,23 @@ struct State {
     /// from wherever it is with whatever momentum it has, and a tween would
     /// have to restart and jump.
     wco_fade: [Cell<Motion<f32>>; CAPTION_BUTTONS],
+    /// Whether the account menu in the sidebar footer is open.
+    ///
+    /// The flag and the animation are separate on purpose: this is the truth an
+    /// event handler writes, and [`State::user_menu`] is where it has got to.
+    user_menu_open: Cell<bool>,
+    /// How far open the account menu has actually travelled, `0..=1`.
+    ///
+    /// A spring for the same reason the caption fades are: clicking the row
+    /// twice in quick succession retargets a panel that is still moving, and it
+    /// reverses from where it is rather than snapping back to the start.
+    user_menu: Cell<Motion<f32>>,
+    /// Whether the press being dispatched landed on the account row or its menu.
+    ///
+    /// Set while the event bubbles through the footer and read by the runner
+    /// once dispatch is over. That is how "click anywhere else to dismiss" is
+    /// answered without the runner knowing where the panel ended up.
+    press_inside_account: Cell<bool>,
     /// A window command the caption asked for, drained by the runner.
     ///
     /// Queued rather than executed inline because a widget callback has no
@@ -236,6 +290,9 @@ impl State {
             maximized: Cell::new(false),
             wco_hovered: [const { Cell::new(false) }; CAPTION_BUTTONS],
             wco_fade: core::array::from_fn(|_| Cell::new(Motion::at(0.0, Drive::SMOOTH))),
+            user_menu_open: Cell::new(false),
+            user_menu: Cell::new(Motion::at(0.0, Drive::STIFF)),
+            press_inside_account: Cell::new(false),
             pending: Cell::new(None),
             server: RefCell::new(TextEdit::from_text("sync.futureboard.local")),
             passphrase: RefCell::new(TextEdit::new()),
@@ -245,6 +302,15 @@ impl State {
 
     fn theme(&self) -> Theme {
         product_theme(self.system_theme.get())
+    }
+
+    /// Opens or closes the account menu. Returns whether anything changed.
+    fn set_user_menu(&self, open: bool) -> bool {
+        if self.user_menu_open.get() == open {
+            return false;
+        }
+        self.user_menu_open.set(open);
+        true
     }
 
     fn say(&self, message: impl Into<String>) {
@@ -377,10 +443,12 @@ impl DesktopApp {
         let current = self.state.section.get();
         let mut nav = div()
             .flex_col()
-            .w(px(220.0))
-            .shrink(0.0)
-            .h(relative(1.0))
-            .p(theme.spacing.md)
+            // Grows instead of filling: the footer below claims its own height
+            // first, and whatever is left over is the navigation's.
+            .grow(1.0)
+            .min_h(px(0.0))
+            .px_(theme.spacing.md)
+            .pt(theme.spacing.md)
             .gap(theme.spacing.xs)
             .child(
                 label("SETTINGS")
@@ -445,6 +513,151 @@ impl DesktopApp {
             .h(relative(1.0))
             .child(div().absolute().inset(px(0.0)).backdrop_blur(px(18.0)))
             .child(nav)
+            // Last, so it paints over the navigation: the account menu opens
+            // upward across it.
+            .child(self.account_footer(theme))
+            .into_element()
+    }
+
+    /// The signed-in account, pinned to the bottom of the sidebar.
+    ///
+    /// The row and the menu share one container, and that container is what the
+    /// [`dropdown`] anchors against — every node is a containing block here, so
+    /// the panel lands on the row's top edge without anyone measuring the row.
+    fn account_footer(&self, theme: &Theme) -> AnyElement {
+        let c = theme.colors;
+        let open = self.state.user_menu.get().value();
+        let expanded = self.state.user_menu_open.get();
+        let state = Rc::clone(&self.state);
+
+        let menu = dropdown(open)
+            .above()
+            .offset(theme.spacing.sm)
+            .p(theme.spacing.xs)
+            .gap(theme.spacing.xs)
+            .child(self.account_menu_item(theme, "acct.profile", "Profile", false))
+            .child(self.account_menu_item(theme, "acct.keys", "Account keys", false))
+            .child(separator(false).bg(c.border).m(theme.spacing.xs))
+            .child(self.account_menu_item(theme, "acct.signout", "Sign out", true));
+
+        let row = div()
+            .id("acct.row")
+            .focusable()
+            .flex_row()
+            .items_center()
+            .gap(theme.spacing.md)
+            .h(px(44.0))
+            .px_(theme.spacing.sm)
+            .rounded(theme.radii.md)
+            .bg(if expanded { c.pressed } else { Color::TRANSPARENT })
+            .hover_bg(c.hover)
+            .active_bg(c.pressed)
+            .cursor(Cursor::Pointer)
+            .focus_ring(spherekit::ui::FocusRing { color: c.focus, ..Default::default() })
+            .semantics(Semantics::new(Role::Button, "Account menu"))
+            .child(
+                avatar(USER_NAME)
+                    .size(px(28.0))
+                    .presence(Presence::Online)
+                    // The dot is cut out of what is actually behind it. The
+                    // sidebar is translucent over Mica, so the theme's surface
+                    // would read as a lighter blob than the row it sits on.
+                    .ring(c.background),
+            )
+            .child(
+                div()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(
+                        label(USER_NAME)
+                            .text_size(theme.typography.sm)
+                            .weight(theme.typography.strong)
+                            .text_color(c.text)
+                            .no_wrap(),
+                    )
+                    .child(
+                        label(USER_EMAIL)
+                            .text_size(theme.typography.xs)
+                            .text_color(c.text_muted)
+                            .no_wrap(),
+                    ),
+            )
+            .child(ChevronElement { tint: c.text_muted, open })
+            .on_click(move |cx: &mut EventContext<'_>| {
+                state.set_user_menu(!state.user_menu_open.get());
+                // A repaint, not a relayout: the panel is already in the tree
+                // and only its open amount changes. The spring in
+                // `advance_motion` drives every frame after this one.
+                cx.notify();
+            })
+            // `on_click` is a mouse contract — it only ever fires on MouseUp —
+            // so a row that calls itself a button has to answer the keyboard
+            // itself, or Tab would reach it and nothing would happen.
+            .on_key(keyboard_activate(Rc::clone(&self.state), |state| {
+                state.set_user_menu(!state.user_menu_open.get());
+            }));
+
+        let claim = Rc::clone(&self.state);
+        div()
+            .flex_col()
+            .shrink(0.0)
+            .px_(theme.spacing.sm)
+            .pb(theme.spacing.sm)
+            .pt(theme.spacing.xs)
+            // Presses bubble out through here, so this is the one place that
+            // knows a press landed on the account UI — whichever part of it.
+            // `on_mouse_down` does not consume, so the row and the menu rows
+            // still get the event.
+            .on_mouse_down(move |_| claim.press_inside_account.set(true))
+            .child(separator(false).bg(c.border))
+            .child(div().h(theme.spacing.xs))
+            // Row first, panel second. The panel is absolutely positioned, so
+            // order costs it nothing in layout, but it buys two things: Tab
+            // walks from the row *into* the menu it just opened, and the
+            // popover paints last, over anything it ever overlaps.
+            .child(div().flex_col().child(row).child(menu))
+            .into_element()
+    }
+
+    /// One row inside the account menu.
+    fn account_menu_item(
+        &self,
+        theme: &Theme,
+        key: &'static str,
+        text: &'static str,
+        danger: bool,
+    ) -> AnyElement {
+        let c = theme.colors;
+        let state = Rc::clone(&self.state);
+        div()
+            .id(key)
+            .focusable()
+            .flex_row()
+            .items_center()
+            .h(px(30.0))
+            .px_(theme.spacing.sm)
+            .rounded(theme.radii.sm)
+            .hover_bg(if danger { c.danger.with_alpha(0.16) } else { c.hover })
+            .active_bg(if danger { c.danger.with_alpha(0.24) } else { c.pressed })
+            .cursor(Cursor::Pointer)
+            .focus_ring(spherekit::ui::FocusRing { color: c.focus, ..Default::default() })
+            .semantics(Semantics::new(Role::MenuItem, text))
+            .child(
+                label(text)
+                    .text_size(theme.typography.sm)
+                    .text_color(if danger { c.danger } else { c.text })
+                    .no_wrap(),
+            )
+            .on_click(move |cx: &mut EventContext<'_>| {
+                state.set_user_menu(false);
+                state.say(format!("{text} selected."));
+                cx.notify();
+            })
+            .on_key(keyboard_activate(Rc::clone(&self.state), move |state| {
+                state.set_user_menu(false);
+                state.say(format!("{text} selected."));
+            }))
             .into_element()
     }
 
@@ -882,6 +1095,14 @@ mod wco {
 /// naming it second makes the caption correct on both with no version check.
 const ICON_FONT: [&str; 2] = ["Segoe Fluent Icons", "Segoe MDL2 Assets"];
 
+/// The signed-in account the sidebar footer shows.
+///
+/// A constant because this example has no account system. A real application
+/// would hand the same two strings to the same two widgets.
+const USER_NAME: &str = "Ada Lovelace";
+/// The account's address, shown under the name.
+const USER_EMAIL: &str = "ada@futureboard.local";
+
 /// Width and height of a caption button.
 const CAPTION_BUTTON: f32 = 32.0;
 /// Height of the caption strip.
@@ -1169,6 +1390,69 @@ impl spherekit::ui::Element for IconElement {
     }
 }
 
+/// Turns Space and Enter on a focused row into the same action a click does.
+///
+/// `on_click` fires only on `MouseUp`, so anything that is `focusable()` and
+/// styled as a control needs this as well or the keyboard reaches it and can do
+/// nothing with it. Returned as a handler so the two call sites cannot drift.
+fn keyboard_activate(
+    state: Rc<State>,
+    mut action: impl FnMut(&State) + 'static,
+) -> impl FnMut(&mut EventContext<'_>) -> spherekit::ui::EventFlow + 'static {
+    use spherekit::ui::{EventFlow, Key, UiEvent};
+    move |cx: &mut EventContext<'_>| {
+        let UiEvent::Key(key) = cx.event else { return EventFlow::Continue };
+        if key.state.is_pressed() && matches!(key.key, Key::Space | Key::Enter) {
+            action(&state);
+            cx.notify();
+            return EventFlow::Stop;
+        }
+        EventFlow::Continue
+    }
+}
+
+/// The chevron on the account row, drawn rather than shaped.
+///
+/// Two strokes instead of a glyph so it can *rotate* with the menu: it points
+/// up when the panel is open and down when it is shut, and every frame in
+/// between is a real angle rather than a swap between two characters.
+struct ChevronElement {
+    tint: Color,
+    /// How far open the menu is, `0..=1`.
+    open: f32,
+}
+
+impl spherekit::ui::Element for ChevronElement {
+    fn layout_style(&self) -> spherekit::layout::Style {
+        spherekit::layout::Style {
+            size: spherekit::core::Size {
+                width: spherekit::core::Length::Px(px(12.0)),
+                height: spherekit::core::Length::Px(px(12.0)),
+            },
+            flex_shrink: 0.0,
+            ..spherekit::layout::Style::DEFAULT
+        }
+    }
+
+    fn paint(&mut self, cx: &mut spherekit::ui::PaintContext<'_, '_>) {
+        let b = cx.bounds;
+        if b.is_empty() {
+            return;
+        }
+        // `1.0` points down, `-1.0` points up; the spring supplies everything
+        // between, so the arrow sweeps through flat instead of flipping.
+        let dir = 1.0 - 2.0 * self.open.clamp(0.0, 1.0);
+        let c = b.center();
+        let half = b.width() * 0.28;
+        let rise = b.height() * 0.18 * dir;
+        let left = spherekit::core::Point::new(c.x - half, c.y - rise);
+        let tip = spherekit::core::Point::new(c.x, c.y + rise);
+        let right = spherekit::core::Point::new(c.x + half, c.y - rise);
+        cx.canvas.draw_line(left, tip, self.tint, px(1.5));
+        cx.canvas.draw_line(tip, right, self.tint, px(1.5));
+    }
+}
+
 thread_local! {
     /// The icon cache the paint pass reaches for.
     ///
@@ -1196,7 +1480,7 @@ impl AppHandler for DesktopApp {
             // borders, snap, the drop shadow and the window menu; only the
             // caption strip becomes ours to draw.
             .with_chrome(WindowChrome::Custom)
-            .with_transparent(true)
+            .with_transparent(diag_flag("SPHEREKIT_DIAG_TRANSPARENT", true))
             .with_visible(false);
         let window = match cx.create_window(&attrs) {
             Ok(w) => w,
@@ -1212,7 +1496,10 @@ impl AppHandler for DesktopApp {
             Arc::clone(&window),
             window.physical_size(),
             window.scale_factor(),
-            SurfaceOptions { transparent: true, ..SurfaceOptions::default() },
+            SurfaceOptions {
+                transparent: diag_flag("SPHEREKIT_DIAG_TRANSPARENT", true),
+                ..SurfaceOptions::default()
+            },
         )) {
             Ok(s) => {
                 let t = s.init_timing();
@@ -1224,8 +1511,16 @@ impl AppHandler for DesktopApp {
                 // Apply Mica after the DX12 DirectComposition surface exists:
                 // creating that visual can otherwise replace the composition
                 // state that was attached to the HWND before GPU setup.
-                if let Err(error) = window.set_backdrop(WindowBackdrop::Mica) {
-                    eprintln!("system Mica unavailable; using transparent fallback: {error}");
+                match diag_backdrop() {
+                    Some(backdrop) => {
+                        eprintln!("diag: requesting backdrop {backdrop:?}");
+                        if let Err(error) = window.set_backdrop(backdrop) {
+                            eprintln!(
+                                "system backdrop unavailable; using transparent fallback: {error}"
+                            );
+                        }
+                    }
+                    None => eprintln!("diag: skipping set_backdrop entirely"),
                 }
                 if let Some(surface) = self.surface.as_mut() {
                     surface.set_theme(self.state.theme());
@@ -1330,11 +1625,28 @@ impl AppHandler for DesktopApp {
 
         let mut needs_redraw = false;
         for ui_event in self.input.translate(&event) {
+            // A press anywhere dismisses the account menu unless it landed on
+            // the account UI itself. The footer sets the flag while the press
+            // bubbles through it, so this reads the answer immediately after
+            // dispatch rather than trying to hit-test the panel from out here.
+            let press = matches!(&ui_event, spherekit::ui::UiEvent::MouseDown(e)
+                if e.button == spherekit::ui::MouseButton::Primary);
+            if press {
+                self.state.press_inside_account.set(false);
+            }
+
             let result = match self.surface.as_mut() {
                 Some(surface) => surface.dispatch(&ui_event),
                 None => continue,
             };
             needs_redraw |= result.repaint || result.relayout || result.focus_changed;
+
+            // Deliberately outside the `consumed` guard below: a click on a
+            // toggle in the content pane is consumed, and it should still shut
+            // the menu. Only a press on the account UI is exempt.
+            if press && !self.state.press_inside_account.get() && self.state.set_user_menu(false) {
+                needs_redraw = true;
+            }
 
             if result.consumed {
                 continue;
@@ -1343,7 +1655,16 @@ impl AppHandler for DesktopApp {
                 && key.state.is_pressed()
             {
                 match &key.key {
-                    spherekit::ui::Key::Escape => cx.exit(),
+                    // Escape dismisses the account menu before it quits: an
+                    // open popover is what the key most recently opened, and
+                    // closing the window out from under it would be a surprise.
+                    spherekit::ui::Key::Escape => {
+                        if self.state.set_user_menu(false) {
+                            needs_redraw = true;
+                        } else {
+                            cx.exit();
+                        }
+                    }
                     spherekit::ui::Key::Tab => {
                         if let Some(surface) = self.surface.as_mut() {
                             surface.tree_mut().navigate_focus(if key.modifiers.shift {
@@ -1423,7 +1744,7 @@ impl DesktopApp {
     fn draw(&mut self) {
         let moving = self.advance_motion();
         let root = self.build();
-        let clear = Color::TRANSPARENT;
+        let clear = diag_clear();
         let Some(surface) = self.surface.as_mut() else { return };
         match surface.render(root, clear) {
             Ok(Some(_)) => self.frames += 1,
@@ -1517,6 +1838,17 @@ impl DesktopApp {
             moving |= !motion.is_settled();
             self.state.wco_fade[i].set(motion);
         }
+
+        // The account menu rides the same clock. Nothing here calls
+        // `notify_layout`: the panel's open amount is a style value, and
+        // `UiTree::build` marks a node layout-dirty exactly when its style
+        // changed, so animating the style *is* the invalidation.
+        let mut menu = self.state.user_menu.get();
+        menu.retarget(if self.state.user_menu_open.get() { 1.0 } else { 0.0 });
+        menu.step(frame.delta);
+        moving |= !menu.is_settled();
+        self.state.user_menu.set(menu);
+
         moving
     }
 

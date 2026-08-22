@@ -1256,11 +1256,442 @@ impl Element for ScrollView {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Avatar
+// ---------------------------------------------------------------------------
+
+/// Whether a person is available, drawn as a dot on their [`Avatar`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Presence {
+    /// Available.
+    Online,
+    /// Idle, or away from the keyboard.
+    Away,
+    /// Busy, or in do-not-disturb.
+    Busy,
+    /// Signed out.
+    Offline,
+}
+
+impl Presence {
+    /// The dot colour for this state, from the theme's status palette.
+    pub fn color(self, theme: &crate::theme::Theme) -> Color {
+        match self {
+            Presence::Online => theme.colors.success,
+            Presence::Away => theme.colors.warning,
+            Presence::Busy => theme.colors.danger,
+            Presence::Offline => theme.colors.text_muted,
+        }
+    }
+}
+
+/// The tints an [`Avatar`] picks from when the caller does not name one.
+///
+/// A fixed set rather than a hue computed from the hash: eight colours a
+/// designer signed off on beat a continuous ramp that will eventually land on
+/// something that clashes with the accent, and two names that hash close
+/// together get visibly different colours instead of two shades of one.
+const AVATAR_TINTS: [Color; 8] = [
+    Color::hex(0x4C6FEF),
+    Color::hex(0x8B5CF6),
+    Color::hex(0xD9488A),
+    Color::hex(0xE06C3B),
+    Color::hex(0xC9A227),
+    Color::hex(0x3FA372),
+    Color::hex(0x2E9BB5),
+    Color::hex(0x6470A8),
+];
+
+/// A circular portrait: initials on a tint, with optional presence.
+///
+/// The tint is derived from the name, so the same person is the same colour in
+/// every window of every session without anyone storing a preference.
+pub struct Avatar {
+    id: Option<ElementId>,
+    name: String,
+    initials: Option<String>,
+    diameter: Px,
+    color: Option<Color>,
+    presence: Option<Presence>,
+    ring: Option<Color>,
+}
+
+/// Creates an [`Avatar`] for a display name.
+pub fn avatar(name: impl Into<String>) -> Avatar {
+    Avatar {
+        id: None,
+        name: name.into(),
+        initials: None,
+        diameter: px(32.0),
+        color: None,
+        presence: None,
+        ring: None,
+    }
+}
+
+impl Avatar {
+    /// Gives the avatar a stable identity.
+    pub fn id(mut self, id: impl core::hash::Hash) -> Self {
+        self.id = Some(ElementId::from_key(id));
+        self
+    }
+
+    /// Overrides the derived initials.
+    ///
+    /// Worth setting for names the two-leading-letters rule reads wrongly —
+    /// mononyms, handles, and every name whose family part comes first.
+    pub fn initials(mut self, initials: impl Into<String>) -> Self {
+        self.initials = Some(initials.into());
+        self
+    }
+
+    /// Diameter in logical pixels. Defaults to 32.
+    pub fn size(mut self, diameter: Px) -> Self {
+        self.diameter = diameter;
+        self
+    }
+
+    /// Overrides the tint derived from the name.
+    pub fn color(mut self, color: Color) -> Self {
+        self.color = Some(color);
+        self
+    }
+
+    /// Shows a presence dot on the lower-right edge.
+    pub fn presence(mut self, presence: Presence) -> Self {
+        self.presence = Some(presence);
+        self
+    }
+
+    /// The colour the presence dot is cut out of.
+    ///
+    /// Defaults to the theme's surface. Set it when the avatar sits on
+    /// something else, or the dot's ring will not read as a hole.
+    pub fn ring(mut self, color: Color) -> Self {
+        self.ring = Some(color);
+        self
+    }
+}
+
+/// Up to two leading letters, one per word.
+///
+/// Returns empty for a name with no alphanumerics at all, and the circle is
+/// then just a tint — which is the right answer for a placeholder account.
+fn initials_of(name: &str) -> String {
+    let mut out = String::new();
+    for word in name.split_whitespace() {
+        if let Some(ch) = word.chars().find(|c| c.is_alphanumeric()) {
+            out.extend(ch.to_uppercase());
+            if out.chars().count() == 2 {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Picks a stable tint for a name. FNV-1a, because it only has to be
+/// well-distributed over short strings and identical on every platform.
+fn tint_for(name: &str) -> Color {
+    let mut hash: u32 = 0x811C_9DC5;
+    for byte in name.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    AVATAR_TINTS[hash as usize % AVATAR_TINTS.len()]
+}
+
+impl Element for Avatar {
+    fn id(&self) -> Option<ElementId> {
+        self.id
+    }
+
+    fn layout_style(&self) -> Style {
+        Style {
+            size: Size {
+                width: spherekit_core::Length::Px(self.diameter),
+                height: spherekit_core::Length::Px(self.diameter),
+            },
+            // An avatar in a row is the one thing that must not be squashed:
+            // a name beside it can ellipsise, a circle cannot.
+            flex_shrink: 0.0,
+            ..Style::DEFAULT
+        }
+    }
+
+    fn paint(&mut self, cx: &mut PaintContext<'_, '_>) {
+        let bounds = cx.bounds;
+        if bounds.is_empty() {
+            return;
+        }
+        let radius = Px(bounds.width().get().min(bounds.height().get()) * 0.5);
+        let center = bounds.center();
+        let fill = self.color.unwrap_or_else(|| tint_for(&self.name));
+        cx.canvas.fill_circle(center, radius, fill);
+
+        let initials = match self.initials.as_deref() {
+            Some(explicit) => explicit.to_string(),
+            None => initials_of(&self.name),
+        };
+        if !initials.is_empty() {
+            // The ink is chosen against the tint, not taken from the theme: a
+            // tint is the same colour in light and dark, so a theme text
+            // colour would be unreadable on half of them.
+            let ink =
+                if fill.luminance() > 0.55 { Color::hex(0x14161A) } else { Color::hex(0xFFFFFF) };
+            let style = spherekit_text::TextStyle {
+                font_size: Px(radius.get() * 0.82),
+                font: spherekit_text::FontRequest {
+                    weight: cx.theme.typography.strong,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let layout = cx.text.layout(&initials, &style, None);
+            let origin =
+                Point::new(center.x - layout.size.width * 0.5, center.y - layout.size.height * 0.5);
+            crate::text::draw_layout(
+                cx.canvas,
+                &layout,
+                origin,
+                ink,
+                spherekit_render::TextRasterMode::Auto,
+                (Px::ZERO, Color::TRANSPARENT),
+                spherekit_render::coverage_contrast_for(ink, fill),
+            );
+        }
+
+        if let Some(presence) = self.presence {
+            // On the 45-degree diagonal, straddling the edge, which is where
+            // every shell puts it and where it costs the least of the face.
+            let offset = radius * core::f32::consts::FRAC_1_SQRT_2;
+            let at = Point::new(center.x + offset, center.y + offset);
+            let dot = radius * 0.34;
+            let ring = self.ring.unwrap_or(cx.theme.colors.surface);
+            cx.canvas.fill_circle(at, dot, ring);
+            cx.canvas.fill_circle(at, dot - Px(2.0), presence.color(cx.theme));
+        }
+    }
+
+    fn semantics(&self) -> Option<Semantics> {
+        Some(Semantics::new(Role::Image, self.name.clone()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dropdown
+// ---------------------------------------------------------------------------
+
+/// Which way a [`Dropdown`] opens from its anchor.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum DropdownSide {
+    /// Downward, from the anchor's bottom edge.
+    #[default]
+    Below,
+    /// Upward, from the anchor's top edge. What a sidebar footer wants.
+    Above,
+}
+
+/// Below this the panel is treated as shut and leaves layout entirely.
+const DROPDOWN_CLOSED: f32 = 0.002;
+
+/// An animated popover panel.
+///
+/// The widget owns no timer and no open flag. It takes `open` in `0..=1` and
+/// draws the frame that value describes, which is what lets one
+/// [`Motion`](spherekit_core::animate::Motion) in the application drive it —
+/// and what lets a test pass `0.5` and assert on a half-open panel without
+/// running a clock. Pass a constant `1.0` for a menu that is simply there.
+///
+/// Anchoring is by containment. Every node is a containing block here, so a
+/// `Dropdown` places itself against its **direct parent**: wrap the trigger and
+/// the dropdown in one container and the panel lands on the trigger's edge
+/// whatever height the trigger turns out to be.
+///
+/// ```ignore
+/// div()
+///     .flex_col()
+///     .child(dropdown(self.menu.get().value()).above().child(/* items */))
+///     .child(/* the row that opens it */)
+/// ```
+///
+/// At `0.0` it sets `display: none` rather than merely going transparent: an
+/// invisible panel that still hit-tested would swallow clicks meant for
+/// whatever is behind it.
+pub struct Dropdown {
+    id: Option<ElementId>,
+    children: Vec<AnyElement>,
+    style: Style,
+    paint: PaintStyle,
+    open: f32,
+    rise: Px,
+    gap: Px,
+    side: DropdownSide,
+}
+
+/// Creates a [`Dropdown`] at the given open amount, `0..=1`.
+pub fn dropdown(open: f32) -> Dropdown {
+    let mut style = Style::DEFAULT;
+    style.flex_direction = spherekit_layout::FlexDirection::Column;
+    Dropdown {
+        id: None,
+        children: Vec::new(),
+        style,
+        paint: PaintStyle::default(),
+        open,
+        rise: px(8.0),
+        gap: px(6.0),
+        side: DropdownSide::default(),
+    }
+}
+
+impl Dropdown {
+    /// Gives the panel a stable identity.
+    pub fn id(mut self, id: impl core::hash::Hash) -> Self {
+        self.id = Some(ElementId::from_key(id));
+        self
+    }
+
+    /// Sets which edge the panel opens from.
+    pub fn side(mut self, side: DropdownSide) -> Self {
+        self.side = side;
+        self
+    }
+
+    /// Opens upward, from the anchor's top edge.
+    pub fn above(self) -> Self {
+        self.side(DropdownSide::Above)
+    }
+
+    /// Opens downward, from the anchor's bottom edge.
+    pub fn below(self) -> Self {
+        self.side(DropdownSide::Below)
+    }
+
+    /// How far the panel travels as it opens. Defaults to 8 px.
+    pub fn rise(mut self, rise: Px) -> Self {
+        self.rise = rise;
+        self
+    }
+
+    /// The resting distance between panel and anchor. Defaults to 6 px.
+    ///
+    /// Named `offset` rather than `gap` because [`Styled::gap`] already means
+    /// the space *between this panel's children*, and an inherent method of the
+    /// same name would silently shadow it in a builder chain — the panel would
+    /// take the value as its anchor distance and its rows would sit flush.
+    pub fn offset(mut self, offset: Px) -> Self {
+        self.gap = offset;
+        self
+    }
+
+    /// How far open the panel is once eased, `0..=1`.
+    fn eased(&self) -> f32 {
+        ease_out_cubic(self.open.clamp(0.0, 1.0))
+    }
+}
+
+/// Cubic ease-out. The panel arrives quickly and settles, which reads as the
+/// menu landing rather than drifting into place.
+fn ease_out_cubic(t: f32) -> f32 {
+    let inv = 1.0 - t.clamp(0.0, 1.0);
+    1.0 - inv * inv * inv
+}
+
+impl ParentElement for Dropdown {
+    fn extend_children(&mut self, children: impl IntoIterator<Item = AnyElement>) {
+        self.children.extend(children);
+    }
+}
+
+impl Styled for Dropdown {
+    fn style_mut(&mut self) -> &mut Style {
+        &mut self.style
+    }
+    fn paint_style_mut(&mut self) -> &mut PaintStyle {
+        &mut self.paint
+    }
+}
+
+impl Element for Dropdown {
+    fn id(&self) -> Option<ElementId> {
+        self.id
+    }
+
+    fn layout_style(&self) -> Style {
+        let mut style = self.style.clone();
+        if self.open.clamp(0.0, 1.0) <= DROPDOWN_CLOSED {
+            style.display = spherekit_layout::Display::None;
+            return style;
+        }
+        style.position = spherekit_layout::Position::Absolute;
+        // The slide is a margin rather than the inset itself, because the
+        // inset is already spending its budget on `100 %` and a `Length`
+        // cannot hold "100 % plus eight pixels".
+        let travel = spherekit_core::Length::Px(self.gap + self.rise * (1.0 - self.eased()));
+        match self.side {
+            DropdownSide::Above => {
+                style.inset.bottom = spherekit_core::Length::Fraction(1.0);
+                style.margin.bottom = travel;
+            }
+            DropdownSide::Below => {
+                style.inset.top = spherekit_core::Length::Fraction(1.0);
+                style.margin.top = travel;
+            }
+        }
+        // With no width and no horizontal anchor of its own, span the trigger.
+        let unanchored = matches!(style.inset.left, spherekit_core::Length::Auto)
+            && matches!(style.inset.right, spherekit_core::Length::Auto)
+            && matches!(style.size.width, spherekit_core::Length::Auto);
+        if unanchored {
+            style.inset.left = spherekit_core::Length::Px(Px::ZERO);
+            style.inset.right = spherekit_core::Length::Px(Px::ZERO);
+        }
+        style
+    }
+
+    fn children(&mut self) -> &mut [AnyElement] {
+        &mut self.children
+    }
+
+    fn take_children(&mut self) -> Vec<AnyElement> {
+        core::mem::take(&mut self.children)
+    }
+
+    fn paint(&mut self, cx: &mut PaintContext<'_, '_>) {
+        // A popover is one of the few things that has to be opaque over
+        // whatever it covers, so it takes the theme's surface rather than
+        // inheriting the translucency a Mica-backed window uses elsewhere.
+        let mut style = self.paint.clone();
+        if style.background.is_none() {
+            style.background = Some(cx.theme.colors.surface.into());
+            style.border_width = px(1.0);
+            style.border_color = cx.theme.colors.border;
+            style.corner_radii = Corners::all(cx.theme.radii.lg);
+            style.shadows.push(cx.theme.shadows.md);
+        }
+        style.paint_box(cx.canvas, cx.bounds, cx.state);
+    }
+
+    fn paint_opacity(&self) -> f32 {
+        (self.eased() * self.paint.opacity).clamp(0.0, 1.0)
+    }
+
+    fn paint_filter(&self) -> Option<spherekit_render::Filter> {
+        self.paint.filter
+    }
+
+    fn semantics(&self) -> Option<Semantics> {
+        Some(Semantics::new(Role::Menu, String::new()))
+    }
+}
+
 /// Everything in this module, for a glob import.
 pub mod prelude {
     pub use super::{
-        Button, ButtonVariant, ScrollView, Toggle, ValueControl, ValueShape, button, checkbox,
-        fader, knob, panel, progress, scroll_view, separator, slider, toggle,
+        Avatar, Button, ButtonVariant, Dropdown, DropdownSide, Presence, ScrollView, Toggle,
+        ValueControl, ValueShape, avatar, button, checkbox, dropdown, fader, knob, panel, progress,
+        scroll_view, separator, slider, toggle,
     };
 }
 
@@ -1791,5 +2222,124 @@ mod tests {
             spherekit_render::DrawCommand::Quad(q) => assert_eq!(q.bounds.height(), px(1.0)),
             other => panic!("expected a quad, got {other:?}"),
         }
+    }
+
+    // ----------------------------------------------------------- avatar
+
+    #[test]
+    fn initials_take_one_letter_from_each_of_the_first_two_words() {
+        assert_eq!(initials_of("Ada Lovelace"), "AL");
+        // A third word is not a third letter.
+        assert_eq!(initials_of("Ada King Lovelace"), "AK");
+        assert_eq!(initials_of("ada"), "A");
+        // Leading punctuation is skipped rather than shown.
+        assert_eq!(initials_of("@ada  lovelace"), "AL");
+    }
+
+    #[test]
+    fn a_nameless_avatar_is_a_bare_tint_rather_than_a_stray_glyph() {
+        assert_eq!(initials_of(""), "");
+        assert_eq!(initials_of("   "), "");
+        assert_eq!(initials_of("--"), "");
+    }
+
+    #[test]
+    fn a_tint_is_stable_for_a_name_and_comes_from_the_palette() {
+        // Stability is the whole contract: the same person must be the same
+        // colour in every session, with nothing persisted anywhere.
+        assert_eq!(tint_for("Ada Lovelace"), tint_for("Ada Lovelace"));
+        assert!(AVATAR_TINTS.contains(&tint_for("Ada Lovelace")));
+        assert!(AVATAR_TINTS.contains(&tint_for("")));
+    }
+
+    #[test]
+    fn an_avatar_is_square_and_refuses_to_be_squashed() {
+        let style = avatar("Ada Lovelace").size(px(28.0)).layout_style();
+        assert_eq!(style.size.width, spherekit_core::Length::Px(px(28.0)));
+        assert_eq!(style.size.height, spherekit_core::Length::Px(px(28.0)));
+        // A name beside it can ellipsise; a circle cannot go oval.
+        assert_eq!(style.flex_shrink, 0.0);
+    }
+
+    // --------------------------------------------------------- dropdown
+
+    #[test]
+    fn a_shut_dropdown_leaves_layout_rather_than_going_transparent() {
+        // Merely invisible would still hit-test, and the panel would swallow
+        // clicks meant for whatever it covers.
+        let style = dropdown(0.0).layout_style();
+        assert_eq!(style.display, spherekit_layout::Display::None);
+    }
+
+    #[test]
+    fn an_opening_dropdown_travels_and_fades_together() {
+        let gap = px(6.0);
+        let rise = px(8.0);
+
+        let shut = dropdown(0.02).offset(gap).rise(rise);
+        let half = dropdown(0.5).offset(gap).rise(rise);
+        let open = dropdown(1.0).offset(gap).rise(rise);
+
+        let margin = |d: &Dropdown| match d.layout_style().margin.bottom {
+            spherekit_core::Length::Px(v) => v,
+            other => panic!("expected a pixel margin, got {other:?}"),
+        };
+
+        // Fully open sits exactly at the resting gap, with no layer pushed.
+        assert_eq!(margin(&open.above()), gap);
+        assert_eq!(dropdown(1.0).paint_opacity(), 1.0);
+
+        // Part-open is further away and more transparent, in step.
+        let half_margin = margin(&half.above());
+        assert!(half_margin > gap, "{half_margin:?} should still be travelling");
+        assert!(half_margin < gap + rise);
+        let a = dropdown(0.5).paint_opacity();
+        assert!(a > 0.0 && a < 1.0, "half-open opacity was {a}");
+
+        // Barely open is nearly the full rise away and nearly invisible.
+        assert!(margin(&shut.above()) > half_margin);
+        assert!(dropdown(0.02).paint_opacity() < a);
+    }
+
+    #[test]
+    fn a_dropdown_anchors_to_the_edge_it_opens_from() {
+        let above = dropdown(1.0).above().layout_style();
+        assert_eq!(above.inset.bottom, spherekit_core::Length::Fraction(1.0));
+        assert_eq!(above.inset.top, spherekit_core::Length::Auto);
+
+        let below = dropdown(1.0).below().layout_style();
+        assert_eq!(below.inset.top, spherekit_core::Length::Fraction(1.0));
+        assert_eq!(below.inset.bottom, spherekit_core::Length::Auto);
+    }
+
+    #[test]
+    fn an_unanchored_dropdown_spans_its_trigger_but_an_explicit_width_wins() {
+        let spanning = dropdown(1.0).layout_style();
+        assert_eq!(spanning.inset.left, spherekit_core::Length::Px(Px::ZERO));
+        assert_eq!(spanning.inset.right, spherekit_core::Length::Px(Px::ZERO));
+
+        // A caller who names a width means it, and stretching would override it.
+        let sized = dropdown(1.0).w(px(200.0)).layout_style();
+        assert_eq!(sized.inset.left, spherekit_core::Length::Auto);
+        assert_eq!(sized.inset.right, spherekit_core::Length::Auto);
+    }
+
+    #[test]
+    fn a_dropdowns_own_gap_is_the_one_between_its_rows() {
+        // `Dropdown::offset` is deliberately not called `gap`: an inherent
+        // method of that name would shadow `Styled::gap` in a builder chain and
+        // the rows would silently sit flush.
+        let style = dropdown(1.0).above().offset(px(12.0)).gap(px(4.0)).layout_style();
+        assert_eq!(style.gap, Size::new(px(4.0), px(4.0)));
+        match style.margin.bottom {
+            spherekit_core::Length::Px(v) => assert_eq!(v, px(12.0)),
+            other => panic!("expected the offset as a pixel margin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dropdown_lays_its_children_out_as_a_column_by_default() {
+        let style = dropdown(1.0).layout_style();
+        assert_eq!(style.flex_direction, spherekit_layout::FlexDirection::Column);
     }
 }
