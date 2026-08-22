@@ -195,10 +195,25 @@ routes as caption is swallowed by the modal move loop, so an unlisted button rec
 ### Transparent windows and system backdrops
 
 `WindowAttributes::with_transparent(true)` makes the client surface respect alpha. On Windows 11,
-`Window::set_backdrop(WindowBackdrop::Mica)` or `WindowBackdrop::Acrylic` then asks DWM to blur the
-desktop behind that transparent surface. `WindowBackdrop::None` removes the material. The call
+`Window::set_backdrop(WindowBackdrop::Mica)` asks DWM for the wallpaper-tinted main-window
+material, while `WindowBackdrop::Acrylic` asks for the live desktop-blur material. The desktop
+example uses Mica for its long-lived preferences window and keeps the root/pane backgrounds
+translucent so the material remains visible. `WindowBackdrop::None` removes the material. The call
 returns `Unsupported` on platforms without a system compositor API, where renderer-side
 `Styled::backdrop_blur` remains the portable fallback.
+
+On Windows, transparent surfaces default to wgpu's DX12/DXGI DirectComposition-visual path because
+Vulkan WSI transparency is driver-dependent, especially on discrete NVIDIA adapters. The plain
+DX12 `DxgiFromHwnd` presentation path does not support transparency, so it is not used for this
+case. Set `WGPU_BACKEND=vulkan` only when that backend is required for a particular deployment; the
+renderer logs the selected alpha mode and surface usages so a driver that exposes only opaque
+composition is immediately visible in diagnostics.
+On Windows 11 24H2 and later, the platform also enables premultiplied redirection alpha and
+extends the DWM frame through the custom client area; older Windows builds keep the blur-behind
+compatibility path.
+The platform also reapplies the transparent blur region and selected DWM material after
+`WM_DWMCOMPOSITIONCHANGED`, so a display-driver or DWM restart does not require recreating the
+window.
 
 ### The system menu
 

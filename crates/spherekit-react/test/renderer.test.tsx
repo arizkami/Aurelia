@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { Button, Slider, Text, View, createApiBridge, createRoot, jsonBridge } from "../src/index";
+import { Button, Slider, Text, View, createApiBridge, createRoot, cx, jsonBridge } from "../src/index";
 import type { NativeEvent, NativeTreeSnapshot } from "../src/types";
 
 describe("SphereKit React renderer", () => {
@@ -38,6 +38,21 @@ describe("SphereKit React renderer", () => {
     const snapshot = JSON.parse(json) as NativeTreeSnapshot;
     expect(snapshot.children[0]?.type).toBe("text");
     expect(snapshot.children[0]?.children[0]?.text).toBe("Rust boundary");
+  });
+
+  it("keeps CSS classes and inline properties in the native snapshot", () => {
+    const snapshots: NativeTreeSnapshot[] = [];
+    const root = createRoot({ commit: (snapshot) => snapshots.push(snapshot) });
+
+    root.render(
+      <View id="app" className={cx("panel", false, "primary")} style={{ gap: 8 }} />,
+    );
+
+    expect(snapshots.at(-1)?.children[0]?.props).toMatchObject({
+      id: "app",
+      className: "panel primary",
+      style: { gap: 8 },
+    });
   });
 
   it("routes native events back to React callbacks by node id", () => {
@@ -83,5 +98,8 @@ describe("SphereKit React renderer", () => {
     expect(sent[0]?.endsWith("\n")).toBe(true);
     expect(JSON.parse(sent[0] ?? "{}").kind).toBe("hello");
     expect(JSON.parse(sent[1] ?? "{}").kind).toBe("invoke");
+
+    await bridge.setStylesheet(".panel { gap: 8px; }");
+    expect(JSON.parse(sent[2] ?? "{}").method).toBe("spherekit.setStylesheet");
   });
 });

@@ -889,8 +889,9 @@ impl HasDisplayHandle for Window {
 }
 /// Installs the custom-frame procedure, if this window wants one.
 ///
-/// Returns `None` for [`WindowChrome::System`], where the platform's own frame
-/// is already what the application asked for and a subclass would be pure cost.
+/// Ordinary opaque [`WindowChrome::System`] windows do not need a subclass.
+/// Transparent system-framed windows keep a lightweight subclass so DWM blur
+/// can be restored after composition resets.
 #[cfg(windows)]
 fn install_chrome(
     inner: &::winit::window::Window,
@@ -898,7 +899,7 @@ fn install_chrome(
 ) -> Option<std::sync::Arc<super::ffi::ChromeState>> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-    if attrs.chrome == WindowChrome::System {
+    if attrs.chrome == WindowChrome::System && !attrs.transparent {
         return None;
     }
     // A window with no HWND is a foreign or headless target. Subclassing
@@ -953,7 +954,22 @@ impl Window {
             let Some(hwnd) = self.hwnd() else {
                 return Err(PlatformError::Unsupported("system window backdrop"));
             };
+            // Custom chrome does not get winit's normal theme synchronization.
+            // Set this before the material so DWM chooses the dark/light Mica
+            // variant that matches the window's reported appearance.
+            let _ = super::ffi::set_immersive_dark_mode(
+                hwnd,
+                matches!(self.theme(), Some(Theme::Dark)),
+            );
+            // Windows 11 24H2+ otherwise treats the redirection bitmap as
+            // opaque, which hides the native Mica material behind our
+            // premultiplied transparent surface. Older builds simply reject
+            // this optional attribute and keep the blur-behind fallback.
+            let _ = super::ffi::set_redirection_bitmap_alpha(hwnd);
             if super::ffi::set_backdrop(hwnd, backdrop) {
+                if let Some(state) = self.chrome.as_ref() {
+                    state.set_backdrop(backdrop);
+                }
                 return Ok(());
             }
             Err(PlatformError::Unsupported("system window backdrop"))

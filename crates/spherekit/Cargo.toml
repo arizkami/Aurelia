@@ -18,6 +18,7 @@ spherekit-svg.workspace = true
 spherekit-image.workspace = true
 spherekit-platform.workspace = true
 spherekit-ui.workspace = true
+spherekit-css.workspace = true
 spherekit-audio-ui.workspace = true
 rustc-hash.workspace = true
 raw-window-handle.workspace = true

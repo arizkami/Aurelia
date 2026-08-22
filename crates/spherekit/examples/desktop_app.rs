@@ -51,6 +51,7 @@ fn spherekit_dark_theme() -> Theme {
 
     // Neutral graphite base
     c.background = Color::hex(0x2B2C2F);
+    c.mica_surface = Color::hex(0x2B2C2F).with_alpha(0.72);
     c.surface = Color::hex(0x333438);
     c.elevated = Color::hex(0x3B3D41);
 
@@ -103,6 +104,7 @@ fn product_theme(system_theme: PlatformTheme) -> Theme {
         PlatformTheme::Dark => spherekit_dark_theme(),
         PlatformTheme::Light => {
             let mut theme = Theme::light();
+            theme.colors.mica_surface = Color::hex(0xF8F9FB).with_alpha(0.72);
             theme.typography.xs = px(10.0);
             theme.typography.sm = px(12.0);
             theme.typography.md = px(14.0);
@@ -460,7 +462,9 @@ impl DesktopApp {
             .flex_1()
             .min_w(px(0.0))
             .h(relative(1.0))
-            .bg(c.background)
+            // Keep the app pane translucent so the native DWM Mica material
+            // remains visible in the gaps and margins around the controls.
+            .bg(c.mica_surface)
             .child(
                 div()
                     .flex_row()
@@ -1202,9 +1206,6 @@ impl AppHandler for DesktopApp {
                 return;
             }
         };
-        if let Err(error) = window.set_backdrop(WindowBackdrop::Mica) {
-            eprintln!("system Mica unavailable; using transparent fallback: {error}");
-        }
         self.state.system_theme.set(window.theme().unwrap_or(PlatformTheme::Dark));
 
         match pollster::block_on(SphereKitSurface::new(
@@ -1220,6 +1221,12 @@ impl AppHandler for DesktopApp {
                 println!("init: gpu {:.0} ms, fonts {:.0} ms", t.gpu_ms, t.fonts_ms);
                 println!("chrome: {:?}", window.chrome());
                 self.surface = Some(s);
+                // Apply Mica after the DX12 DirectComposition surface exists:
+                // creating that visual can otherwise replace the composition
+                // state that was attached to the HWND before GPU setup.
+                if let Err(error) = window.set_backdrop(WindowBackdrop::Mica) {
+                    eprintln!("system Mica unavailable; using transparent fallback: {error}");
+                }
                 if let Some(surface) = self.surface.as_mut() {
                     surface.set_theme(self.state.theme());
                 }

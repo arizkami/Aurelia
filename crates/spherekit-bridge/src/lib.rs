@@ -240,6 +240,7 @@ impl ApiBridge {
                         "api.invoke".into(),
                         "spherekit.getTree".into(),
                         "spherekit.getNode".into(),
+                        "spherekit.setStylesheet".into(),
                     ],
                 }]
             }
@@ -293,12 +294,22 @@ impl ApiBridge {
                 serde_json::to_value(node)
                     .map_err(|error| BridgeError::new("serialization_error", error.to_string()))
             }
+            "spherekit.setStylesheet" => {
+                let css = params.get("css").and_then(Value::as_str).ok_or_else(|| {
+                    BridgeError::new("invalid_params", "expected { css: string }")
+                })?;
+                self.host
+                    .set_stylesheet(css)
+                    .map_err(|error| BridgeError::new("invalid_css", error.to_string()))?;
+                Ok(serde_json::json!({ "rules": self.host.stylesheet().rule_count() }))
+            }
             "spherekit.capabilities" => Ok(serde_json::json!([
                 "react.commit",
                 "react.events",
                 "api.invoke",
                 "spherekit.getTree",
-                "spherekit.getNode"
+                "spherekit.getNode",
+                "spherekit.setStylesheet"
             ])),
             _ => Err(BridgeError::new("method_not_found", format!("unknown API method {method}"))),
         }
@@ -369,6 +380,25 @@ mod tests {
             params: json!({}),
         });
         assert!(matches!(response.as_slice(), [BridgeMessage::Response { ok: true, .. }]));
+    }
+
+    #[test]
+    fn stylesheet_can_be_updated_through_the_builtin_api() {
+        let mut bridge = ApiBridge::new();
+        let response = bridge.dispatch(BridgeMessage::Invoke {
+            id: "css".into(),
+            method: "spherekit.setStylesheet".into(),
+            params: json!({ "css": ".panel { gap: 8px; }" }),
+        });
+        assert_eq!(
+            response,
+            vec![BridgeMessage::Response {
+                id: "css".into(),
+                ok: true,
+                result: Some(json!({ "rules": 1 })),
+                error: None,
+            }]
+        );
     }
 
     #[test]

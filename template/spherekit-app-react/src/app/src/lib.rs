@@ -1,6 +1,7 @@
 //! Rust backend for the `spherekit-app-react` template.
 
 use spherekit_bridge::{decode, encode, ApiBridge, BridgeProtocolError};
+use spherekit_css::CssError;
 use spherekit_react::{AnyElement, NativeTree, ReactHostError};
 
 /// State owned by the native application side.
@@ -23,6 +24,11 @@ impl AppBackend {
     /// Returns the current committed tree for diagnostics or native layout.
     pub fn react_tree(&self) -> &NativeTree {
         self.bridge.host().tree()
+    }
+
+    /// Installs the same stylesheet used when lowering React nodes.
+    pub fn set_stylesheet(&mut self, css: &str) -> Result<(), CssError> {
+        self.bridge.host_mut().set_stylesheet(css)
     }
 
     /// Builds the committed React tree as SphereKit native elements.

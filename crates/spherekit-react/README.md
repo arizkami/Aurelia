@@ -32,6 +32,7 @@ import { createApiBridge, createRoot } from "@spherekit/react";
 
 const bridge = createApiBridge(transport);
 const root = createRoot(bridge);
+await bridge.setStylesheet(`.panel { display: flex; gap: 8px; }`);
 bridge.on("appReady", () => console.log("native app ready"));
 const tree = await bridge.invoke("spherekit.getTree");
 ```
@@ -44,3 +45,8 @@ The authoring syntax intentionally resembles React Native, but the host set is
 small: `View`, `Text`, `Button`, `Slider`, `ScrollView`, and `Native`. `on*`
 React props remain on the TypeScript side and are routed by native node ID when
 the bridge emits `event` messages such as `press` or `valueChange`.
+
+`className`, `id`, and inline `style` props are serializable and resolved by the
+shared `spherekit-css` runtime. `css()` and `cx()` are small TypeScript helpers
+for authoring those props; the native host remains the source of truth for CSS
+cascade and layout.

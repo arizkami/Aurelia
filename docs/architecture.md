@@ -93,16 +93,18 @@ redesigning anything above it.
 | `spherekit-svg` | SVG parsing, cached tessellation | core, render |
 | `spherekit-platform` | Windows, input, IME, monitors, scheduling | core |
 | `spherekit-ui` | Elements, events, focus, widgets | core, render, layout, text, platform |
+| `spherekit-css` | CSS parsing, selector cascade, native style adapter | core, layout, ui |
 | `spherekit-audio-ui` | Meters, waveforms, spectrums, lock-free transfer | core, render, ui |
 | `spherekit` | Facade | all |
 | `spherekit-react` | React host tree and native lowering | ui, core |
 | `spherekit-bridge` | JSON Lines API and event transport | spherekit-react |
 | `spherekit-cli` | React scaffolding and cross-platform builds | — |
 
-The React integration adds three boundary layers: `spherekit-react` owns the
-host-tree adapter, `spherekit-bridge` owns the transport protocol, and
-`spherekit-cli` owns project/build orchestration. They remain outside the GPU
-and widget layers so the native engine stays usable without React.
+The React integration adds four boundary layers: `spherekit-css` owns the
+shared stylesheet runtime, `spherekit-react` owns the host-tree adapter,
+`spherekit-bridge` owns the transport protocol, and `spherekit-cli` owns
+project/build orchestration. They remain outside the GPU layer so the native
+engine stays usable without React.
 
 ## The frame lifecycle
 

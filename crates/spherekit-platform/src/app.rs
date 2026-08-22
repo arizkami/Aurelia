@@ -581,7 +581,7 @@ mod tests {
         s.frame_presented(now);
         let interval = s.frame_interval();
         let too_early = now + interval / 2;
-        assert!(!(too_early >= s.next_frame_time(too_early)));
+        assert!(too_early < s.next_frame_time(too_early));
         assert!(!s.should_redraw(too_early));
 
         let due = now + interval;

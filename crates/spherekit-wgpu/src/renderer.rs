@@ -169,8 +169,7 @@ impl WgpuRenderer {
             + raw_window_handle::HasDisplayHandle
             + 'static,
     {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let instance = create_instance(transparent);
         let surface =
             instance.create_surface(window).map_err(|e| InitError::Surface(e.to_string()))?;
 
@@ -236,6 +235,27 @@ impl WgpuRenderer {
         let surface_copy_src = caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
         let surface_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
             | caps.usages.intersection(wgpu::TextureUsages::COPY_SRC);
+        tracing::info!(
+            target: "spherekit_wgpu",
+            adapter = %adapter_info,
+            alpha_modes = ?caps.alpha_modes,
+            selected_alpha = ?alpha_mode,
+            surface_usages = ?caps.usages,
+            surface_copy_src,
+            "surface capabilities selected"
+        );
+        if transparent && alpha_mode == wgpu::CompositeAlphaMode::Opaque {
+            tracing::warn!(
+                target: "spherekit_wgpu",
+                "transparent surface requested but the selected backend only exposes opaque alpha"
+            );
+        }
+        if transparent {
+            eprintln!(
+                "transparent surface: alpha modes {:?}, selected {:?}",
+                caps.alpha_modes, alpha_mode
+            );
+        }
 
         let (w, h) = (size.width.as_u32().max(1), size.height.as_u32().max(1));
         let surface_config = wgpu::SurfaceConfiguration {
@@ -694,6 +714,63 @@ fn pick_surface_format(caps: &wgpu::SurfaceCapabilities) -> wgpu::TextureFormat 
         .find(|f| *f == wgpu::TextureFormat::Bgra8UnormSrgb)
         .or_else(|| caps.formats.iter().copied().find(|f| f.is_srgb()))
         .unwrap_or(caps.formats[0])
+}
+
+/// Creates the instance used by a surface.
+///
+/// Windows Vulkan swapchains have historically exposed different WSI
+/// behaviour for transparent windows across GPU drivers. DXGI/D3D12 with a
+/// DirectComposition visual is the stable Windows composition path, so
+/// transparent windows use it by default while still allowing an explicit
+/// `WGPU_BACKEND` override for diagnostics or applications that deliberately
+/// need Vulkan.
+fn create_instance(transparent: bool) -> wgpu::Instance {
+    #[cfg(windows)]
+    if transparent {
+        let requested_backends = std::env::var("WGPU_BACKEND")
+            .ok()
+            .map(|value| wgpu::Backends::from_comma_list(&value))
+            .filter(|backends| !backends.is_empty());
+        let backend_override = requested_backends.is_some();
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = requested_backends.unwrap_or(wgpu::Backends::DX12);
+        descriptor.backend_options = descriptor.backend_options.with_env();
+
+        // wgpu 30's `Auto` compiler probes `dxcompiler.dll` from the process
+        // search path. A host application can put an unrelated Chromium/CEF
+        // DXC beside its executable; that DLL is not a safe compiler for this
+        // renderer and has caused STATUS_ILLEGAL_INSTRUCTION on NVIDIA.
+        // Keep DX12 deterministic with the built-in Windows FXC unless the
+        // application explicitly opts into another compiler.
+        if descriptor.backends.contains(wgpu::Backends::DX12)
+            && std::env::var_os("WGPU_DX12_COMPILER").is_none()
+        {
+            descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
+        }
+
+        // `DxgiFromHwnd` is wgpu's default, but it explicitly does not support
+        // transparent swapchains. Use the DirectComposition visual path for a
+        // transparent window; it is the DX12 presentation mode designed for
+        // alpha-composited surfaces. Keep an explicit presentation-system
+        // override for diagnostics and host applications that manage their own
+        // composition policy.
+        if descriptor.backends.contains(wgpu::Backends::DX12)
+            && std::env::var_os("WGPU_DX12_PRESENTATION_SYSTEM").is_none()
+        {
+            descriptor.backend_options.dx12.presentation_system =
+                wgpu::Dx12SwapchainKind::DxgiFromVisual;
+        }
+        tracing::info!(
+            target: "spherekit_wgpu",
+            forced_dx12 = !backend_override,
+            shader_compiler = ?descriptor.backend_options.dx12.shader_compiler,
+            presentation = ?descriptor.backend_options.dx12.presentation_system,
+            "transparent Windows surface: using the DX12 DirectComposition path"
+        );
+        return wgpu::Instance::new(descriptor);
+    }
+
+    wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env())
 }
 
 fn pick_alpha_mode(
@@ -1635,6 +1712,31 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(pick_surface_format(&caps), wgpu::TextureFormat::Rgba8Unorm);
+    }
+
+    #[test]
+    fn transparent_surfaces_prefer_premultiplied_alpha() {
+        let caps = wgpu::SurfaceCapabilities {
+            alpha_modes: vec![
+                wgpu::CompositeAlphaMode::Opaque,
+                wgpu::CompositeAlphaMode::PostMultiplied,
+                wgpu::CompositeAlphaMode::PreMultiplied,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(pick_alpha_mode(&caps, true), wgpu::CompositeAlphaMode::PreMultiplied);
+    }
+
+    #[test]
+    fn opaque_surfaces_keep_the_backend_preferred_alpha_mode() {
+        let caps = wgpu::SurfaceCapabilities {
+            alpha_modes: vec![
+                wgpu::CompositeAlphaMode::Opaque,
+                wgpu::CompositeAlphaMode::PreMultiplied,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(pick_alpha_mode(&caps, false), wgpu::CompositeAlphaMode::Opaque);
     }
 
     #[test]

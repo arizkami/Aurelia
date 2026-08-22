@@ -26,11 +26,16 @@ button and slider interactions can call the original React `onPress` and
 ```ts
 const bridge = createApiBridge(transport);
 const root = createRoot(bridge);
+await bridge.setStylesheet(`.panel { display: flex; gap: 8px; }`);
 const status = await bridge.invoke<{ ready: boolean }>("app.status");
 const stop = bridge.on("appReady", () => console.log("ready"));
 ```
 
 `ApiBridgeTransport` only needs `send`, `subscribe`, and optionally `close`.
+
+`setStylesheet` sends CSS to the native host. Both React's `className` and
+inline `style` props are resolved by the same `spherekit-css` runtime used by
+native elements.
 
 ## Rust
 

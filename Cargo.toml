@@ -14,6 +14,7 @@ members = [
     "crates/spherekit",
     "crates/spherekit-jsengine",
     "crates/spherekit-react",
+    "crates/spherekit-css",
     "crates/spherekit-bridge",
     "crates/spherekit-cli",
 ]
@@ -39,6 +40,7 @@ spherekit-platform = { path = "crates/spherekit-platform", version = "0.1.0" }
 spherekit-ui       = { path = "crates/spherekit-ui",       version = "0.1.0" }
 spherekit-audio-ui = { path = "crates/spherekit-audio-ui", version = "0.1.0" }
 spherekit-react    = { path = "crates/spherekit-react",    version = "0.1.0" }
+spherekit-css      = { path = "crates/spherekit-css",      version = "0.1.0" }
 spherekit-bridge   = { path = "crates/spherekit-bridge",   version = "0.1.0" }
 
 # --- foundation ---
@@ -71,6 +73,7 @@ unicode-bidi        = "0.3"
 unicode-script      = "0.5"
 unicode-linebreak   = "0.1"
 unicode-segmentation = "1.12"
+cssparser = "0.37"
 image  = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 usvg   = { version = "0.48", default-features = false }
 

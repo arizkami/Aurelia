@@ -13,6 +13,8 @@ export interface ApiBridgeTransport {
 /** Public request/event surface available to application code. */
 export interface SphereKitApiBridge extends NativeBridge {
   invoke<TResult = NativeValue>(method: string, params?: NativeValue): Promise<TResult>;
+  /** Installs the shared native CSS stylesheet and returns its rule count. */
+  setStylesheet(css: string): Promise<{ readonly rules: number }>;
   on<TPayload = NativeValue>(event: string, listener: (payload: TPayload) => void): () => void;
   close(): void;
 }
@@ -140,6 +142,10 @@ export function createApiBridge(
         pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
         send({ kind: "invoke", id, method, params } satisfies InvokeMessage, id);
       });
+    },
+
+    setStylesheet(css) {
+      return bridge.invoke<{ readonly rules: number }>("spherekit.setStylesheet", { css });
     },
 
     on<TPayload = NativeValue>(event: string, listener: (payload: TPayload) => void): () => void {

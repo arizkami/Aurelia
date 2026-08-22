@@ -11,3 +11,4 @@ publish = false
 [dependencies]
 spherekit-react = {{SPHEREKIT_REACT_CARGO_DEP}}
 spherekit-bridge = {{SPHEREKIT_BRIDGE_CARGO_DEP}}
+spherekit-css = {{SPHEREKIT_CSS_CARGO_DEP}}

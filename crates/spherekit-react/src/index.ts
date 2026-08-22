@@ -1,4 +1,5 @@
 export { createRoot, type ReactRoot } from "./renderer";
+export { css, cx, type CssProperties, type CssValue } from "./css";
 export {
   API_BRIDGE_VERSION,
   ApiBridgeError,

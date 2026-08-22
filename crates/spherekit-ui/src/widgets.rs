@@ -80,6 +80,7 @@ pub struct Button {
     text: String,
     variant: ButtonVariant,
     style: Style,
+    css_paint: Option<PaintStyle>,
     disabled: bool,
     /// Overrides the theme's body size. For an icon button, whose glyph is
     /// designed at a size unrelated to the body text around it.
@@ -98,6 +99,7 @@ pub fn button(text: impl Into<String>) -> Button {
         text: text.into(),
         variant: ButtonVariant::default(),
         style: Style::DEFAULT,
+        css_paint: None,
         disabled: false,
         text_size: None,
         font: None,
@@ -217,7 +219,30 @@ impl Button {
             style.hover_background = None;
             style.active_background = None;
         }
+        if let Some(custom) = &self.css_paint {
+            if custom.background.is_some() {
+                style.background = custom.background.clone();
+            }
+            if custom.border_width > Px::ZERO {
+                style.border_width = custom.border_width;
+                style.border_color = custom.border_color;
+            }
+            if !custom.corner_radii.is_zero() {
+                style.corner_radii = custom.corner_radii;
+            }
+            style.opacity *= custom.opacity;
+        }
         style
+    }
+}
+
+impl Styled for Button {
+    fn style_mut(&mut self) -> &mut Style {
+        &mut self.style
+    }
+
+    fn paint_style_mut(&mut self) -> &mut PaintStyle {
+        self.css_paint.get_or_insert_with(PaintStyle::default)
     }
 }
 
@@ -573,6 +598,7 @@ pub struct ValueControl {
     bipolar: bool,
     disabled: bool,
     style: Style,
+    css_paint: Option<PaintStyle>,
     on_change: Option<OnChange>,
 }
 
@@ -607,6 +633,7 @@ impl ValueControl {
             bipolar: false,
             disabled: false,
             style: Style::DEFAULT,
+            css_paint: None,
             on_change: None,
         }
     }
@@ -762,6 +789,16 @@ impl ValueControl {
                 (Rect::new(Point::new(centre.x - r, centre.y - r), Size::new(r * 2.0, r * 2.0)), r)
             }
         }
+    }
+}
+
+impl Styled for ValueControl {
+    fn style_mut(&mut self) -> &mut Style {
+        &mut self.style
+    }
+
+    fn paint_style_mut(&mut self) -> &mut PaintStyle {
+        self.css_paint.get_or_insert_with(PaintStyle::default)
     }
 }
 

@@ -136,6 +136,12 @@ JSON Lines protocol. It supports committed trees, request/response API calls,
 and native events, while leaving the underlying transport open to WebView, FFI,
 child process, or socket integrations.
 
+`spherekit-css` provides the shared stylesheet runtime for native and React
+apps. Use `Stylesheet`/`ResolvedStyle` in native code, or call
+`bridge.setStylesheet(css)` and use `className`, `id`, and inline `style` props
+from React. See [the CSS design note](docs/spherekit-css.md) for the research
+tradeoffs and supported v1 property boundary.
+
 ## Status
 
 Measured on an NVIDIA GTX 1060 (Vulkan), running

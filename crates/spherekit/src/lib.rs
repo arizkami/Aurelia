@@ -75,6 +75,8 @@ pub use surface::{InitTiming, SphereKitSurface, SurfaceOptions, SurfaceStats};
 pub use spherekit_audio_ui as audio;
 /// Units, geometry, transforms, colour, paths, paint, identity and errors.
 pub use spherekit_core as core;
+/// CSS parsing, selector cascade and native style application.
+pub use spherekit_css as css;
 /// Image decoding and the texture cache.
 pub use spherekit_image as image;
 /// The retained layout tree, style and dirty propagation.
@@ -97,6 +99,7 @@ pub mod prelude {
     pub use crate::{SphereKitSurface, SurfaceOptions};
     pub use spherekit_audio_ui::prelude::*;
     pub use spherekit_core::prelude::*;
+    pub use spherekit_css::{Node as CssNode, ResolvedStyle, Stylesheet};
     pub use spherekit_layout::prelude::*;
     pub use spherekit_render::prelude::*;
     pub use spherekit_ui::prelude::*;
@@ -110,6 +113,7 @@ mod tests {
         let _ = crate::core::Color::BLACK;
         let _ = crate::render::Scene::default();
         let _ = crate::layout::Style::DEFAULT;
+        let _ = crate::css::Stylesheet::default();
         let _: crate::ui::Theme = crate::ui::Theme::dark();
         let _ = crate::audio::MeterScale::default();
         let _ = crate::text::TextStyle::default();

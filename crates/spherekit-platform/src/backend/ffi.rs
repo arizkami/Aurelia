@@ -39,7 +39,12 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+use windows_sys::Win32::Graphics::Dwm::{
+    DWM_BB_BLURREGION, DWM_BB_ENABLE, DWM_BLURBEHIND, DwmEnableBlurBehindWindow,
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+};
+use windows_sys::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject};
+use windows_sys::Win32::UI::Controls::MARGINS;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::Shell::{
     ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETSTATE, ABM_GETTASKBARPOS, ABS_AUTOHIDE,
@@ -53,6 +58,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_INITMENUPOPUP, WM_NCCALCSIZE,
     WM_NCDESTROY, WM_NCHITTEST, WM_NCRBUTTONUP, WM_SYSCOMMAND,
 };
+
+/// `windows-sys` does not expose this message on every SDK feature set.
+const WM_DWMCOMPOSITIONCHANGED: u32 = 0x031E;
 
 /// The subclass ID. Arbitrary but must be stable, because it is half the key
 /// `RemoveWindowSubclass` matches on.
@@ -78,6 +86,8 @@ pub(crate) struct ChromeState {
     frame_caption: AtomicI32,
     /// `f32` scale factor, as bits.
     scale: AtomicU32,
+    /// The DWM material to restore after a composition reset.
+    backdrop: AtomicU8,
     regions: Mutex<CaptionRegions>,
 }
 
@@ -94,6 +104,7 @@ impl ChromeState {
             frame_y: AtomicI32::new(FrameMetrics::AT_96_DPI.y),
             frame_caption: AtomicI32::new(FrameMetrics::AT_96_DPI.caption),
             scale: AtomicU32::new(scale.to_bits()),
+            backdrop: AtomicU8::new(backdrop_bits(WindowBackdrop::None)),
             regions: Mutex::new(CaptionRegions::default()),
         }
     }
@@ -125,6 +136,16 @@ impl ChromeState {
     /// The scale factor used to convert hit-test coordinates.
     pub(crate) fn set_scale(&self, scale: f32) {
         self.scale.store(scale.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Remembers the native material so it can be restored after DWM
+    /// composition is toggled by the OS or a display-driver transition.
+    pub(crate) fn set_backdrop(&self, backdrop: WindowBackdrop) {
+        self.backdrop.store(backdrop_bits(backdrop), Ordering::Relaxed);
+    }
+
+    fn backdrop(&self) -> WindowBackdrop {
+        backdrop_from_bits(self.backdrop.load(Ordering::Relaxed))
     }
 
     fn scale(&self) -> f32 {
@@ -174,13 +195,101 @@ const fn mode_bits(chrome: WindowChrome) -> u8 {
     }
 }
 
+const fn backdrop_bits(backdrop: WindowBackdrop) -> u8 {
+    match backdrop {
+        WindowBackdrop::None => 0,
+        WindowBackdrop::Mica => 1,
+        WindowBackdrop::Acrylic => 2,
+    }
+}
+
+const fn backdrop_from_bits(bits: u8) -> WindowBackdrop {
+    match bits {
+        1 => WindowBackdrop::Mica,
+        2 => WindowBackdrop::Acrylic,
+        _ => WindowBackdrop::None,
+    }
+}
+
 /// DWM attribute added in Windows 11 22000.
 const DWMWA_SYSTEM_BACKDROP_TYPE: u32 = 38;
+/// DWM attribute used to make the native frame/material follow dark mode.
+const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+/// DWM attribute that lets a non-UWP window participate in host backdrop composition.
+const DWMWA_USE_HOSTBACKDROPBRUSH: u32 = 17;
+/// DWM attribute added in Windows 11 24H2 for premultiplied redirection alpha.
+const DWMWA_REDIRECTIONBITMAP_ALPHA: u32 = 39;
 /// Legacy Mica attribute used by early Windows 11 builds.
 const DWMWA_MICA_EFFECT: u32 = 1029;
 const DWMSBT_NONE: u32 = 1;
 const DWMSBT_MAINWINDOW: u32 = 2;
 const DWMSBT_TRANSIENTWINDOW: u32 = 3;
+
+/// Makes DWM draw the native frame and system backdrop in the requested theme.
+pub(crate) fn set_immersive_dark_mode(hwnd: *mut core::ffi::c_void, dark: bool) -> bool {
+    let enabled: i32 = if dark { 1 } else { 0 };
+    let result = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&enabled as *const i32).cast(),
+            core::mem::size_of::<i32>() as u32,
+        )
+    };
+    result >= 0
+}
+
+/// Tells DWM to preserve the surface's premultiplied alpha channel.
+///
+/// This attribute is unavailable on older Windows builds, so a failed call is
+/// an expected compatibility result; the transparent-window blur path remains
+/// responsible for those systems.
+pub(crate) fn set_redirection_bitmap_alpha(hwnd: *mut core::ffi::c_void) -> bool {
+    let enabled: i32 = 1;
+    let result = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_REDIRECTIONBITMAP_ALPHA,
+            (&enabled as *const i32).cast(),
+            core::mem::size_of::<i32>() as u32,
+        )
+    };
+    result >= 0
+}
+
+/// Lets DWM route the native material through the transparent client surface.
+fn set_host_backdrop_brush(hwnd: *mut core::ffi::c_void, enabled: bool) -> bool {
+    let enabled: i32 = i32::from(enabled);
+    let result = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_HOSTBACKDROPBRUSH,
+            (&enabled as *const i32).cast(),
+            core::mem::size_of::<i32>() as u32,
+        )
+    };
+    result >= 0
+}
+
+/// Extends the DWM frame through the entire client area.
+///
+/// A custom frame otherwise leaves the system material behind only the
+/// non-client strip, so transparent renderer pixels reveal the default window
+/// surface instead of Mica. Negative margins are the documented "whole
+/// window" form of `DwmExtendFrameIntoClientArea`.
+fn extend_frame_into_client(hwnd: *mut core::ffi::c_void) -> bool {
+    let margins =
+        MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
+    let result = unsafe { DwmExtendFrameIntoClientArea(hwnd.cast(), &margins) };
+    if result >= 0 {
+        // The frame extension changes the non-client/client boundary. Ask
+        // Windows to run the custom-frame calculation immediately rather than
+        // waiting for a resize, otherwise the first transparent frame can be
+        // composed against the old client region.
+        recalculate_frame(hwnd.cast());
+    }
+    result >= 0
+}
 
 /// Applies the native compositor material behind a transparent client area.
 ///
@@ -189,6 +298,8 @@ const DWMSBT_TRANSIENTWINDOW: u32 = 3;
 /// available, which keeps older Windows 11 builds usable without affecting
 /// Acrylic's semantics.
 pub(crate) fn set_backdrop(hwnd: *mut core::ffi::c_void, backdrop: WindowBackdrop) -> bool {
+    let _ = enable_blur_behind(hwnd.cast());
+    let _ = set_host_backdrop_brush(hwnd, backdrop != WindowBackdrop::None);
     let system_type = match backdrop {
         WindowBackdrop::None => DWMSBT_NONE,
         WindowBackdrop::Mica => DWMSBT_MAINWINDOW,
@@ -203,6 +314,7 @@ pub(crate) fn set_backdrop(hwnd: *mut core::ffi::c_void, backdrop: WindowBackdro
         )
     };
     if result >= 0 {
+        let _ = extend_frame_into_client(hwnd);
         if backdrop == WindowBackdrop::None {
             let disabled: i32 = 0;
             // Clear the legacy flag as well. Some early Windows 11 builds keep
@@ -229,9 +341,40 @@ pub(crate) fn set_backdrop(hwnd: *mut core::ffi::c_void, backdrop: WindowBackdro
                 core::mem::size_of::<i32>() as u32,
             )
         };
+        if legacy >= 0 {
+            let _ = extend_frame_into_client(hwnd);
+        }
         return legacy >= 0;
     }
     false
+}
+
+/// Re-enables the transparent-window blur region used by winit.
+///
+/// Windows requires this call again after DWM composition is toggled. The
+/// empty region means the entire client area participates in composition;
+/// the renderer still controls the final per-pixel alpha.
+pub(crate) fn enable_blur_behind(hwnd: HWND) -> bool {
+    // SAFETY: the region is created for this call, passed to DWM only while it
+    // is alive, and released immediately after DwmEnableBlurBehindWindow
+    // returns. The HWND belongs to the caller's window.
+    let region = unsafe { CreateRectRgn(0, 0, -1, -1) };
+    if region.is_null() {
+        return false;
+    }
+    let blur = DWM_BLURBEHIND {
+        dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
+        fEnable: true.into(),
+        hRgnBlur: region,
+        fTransitionOnMaximized: false.into(),
+    };
+    let result = unsafe { DwmEnableBlurBehindWindow(hwnd, &blur) };
+    // SAFETY: `region` is a GDI region returned by CreateRectRgn and is no
+    // longer needed after the synchronous DWM call.
+    unsafe {
+        DeleteObject(region);
+    }
+    result >= 0
 }
 
 /// Frame thickness for a DPI.
@@ -446,6 +589,17 @@ unsafe extern "system" fn subclass_proc(
     let state: &ChromeState = unsafe { &*(refdata as *const ChromeState) };
 
     match msg {
+        WM_DWMCOMPOSITIONCHANGED => {
+            // DWM discards both the blur-behind region and system material
+            // when composition is restarted. Restore them before forwarding
+            // the message so the next presented frame is composed correctly.
+            let _ = enable_blur_behind(hwnd);
+            let _ = set_redirection_bitmap_alpha(hwnd);
+            let _ = set_backdrop(hwnd, state.backdrop());
+            // SAFETY: forwards the message to the next subclass/window proc.
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+
         WM_NCDESTROY => {
             // The last message a window ever receives. Reclaim the reference
             // first, then let the chain run so the subclass is removed.

@@ -144,7 +144,7 @@ fn scaffold_react(options: Options) -> Result<()> {
     if crate_name.is_empty() {
         return Err(CliError::new("project name must contain at least one letter or digit"));
     }
-    let (npm_dependency, cargo_react_dependency, cargo_bridge_dependency) =
+    let (npm_dependency, cargo_react_dependency, cargo_bridge_dependency, cargo_css_dependency) =
         local_dependencies(&root);
     for &(relative, bytes) in TEMPLATE_FILES {
         let relative = Path::new(relative);
@@ -162,7 +162,8 @@ fn scaffold_react(options: Options) -> Result<()> {
             .replace("{{SPHEREKIT_VERSION}}", VERSION)
             .replace("{{SPHEREKIT_REACT_NPM_DEP}}", &npm_dependency)
             .replace("{{SPHEREKIT_REACT_CARGO_DEP}}", &cargo_react_dependency)
-            .replace("{{SPHEREKIT_BRIDGE_CARGO_DEP}}", &cargo_bridge_dependency);
+            .replace("{{SPHEREKIT_BRIDGE_CARGO_DEP}}", &cargo_bridge_dependency)
+            .replace("{{SPHEREKIT_CSS_CARGO_DEP}}", &cargo_css_dependency);
         fs::write(&destination, rendered)?;
     }
 
@@ -384,13 +385,14 @@ fn rust_crate_name(name: &str) -> String {
     crate_name
 }
 
-fn local_dependencies(project_root: &Path) -> (String, String, String) {
+fn local_dependencies(project_root: &Path) -> (String, String, String, String) {
     let Some(repository_root) = Path::new(REPOSITORY_ROOT).parent().and_then(Path::parent) else {
         return registry_dependencies();
     };
     let react_source = repository_root.join("crates/spherekit-react");
     let bridge_source = repository_root.join("crates/spherekit-bridge");
-    if !react_source.is_dir() || !bridge_source.is_dir() {
+    let css_source = repository_root.join("crates/spherekit-css");
+    if !react_source.is_dir() || !bridge_source.is_dir() || !css_source.is_dir() {
         return registry_dependencies();
     }
 
@@ -401,16 +403,24 @@ fn local_dependencies(project_root: &Path) -> (String, String, String) {
         .unwrap_or_else(|| react_source.to_string_lossy().into_owned());
     let bridge_path = relative_path(&cargo_base, &bridge_source)
         .unwrap_or_else(|| bridge_source.to_string_lossy().into_owned());
+    let css_path = relative_path(&cargo_base, &css_source)
+        .unwrap_or_else(|| css_source.to_string_lossy().into_owned());
 
     (
         format!("\"file:{npm_path}\""),
         format!("{{ path = \"{react_path}\" }}"),
         format!("{{ path = \"{bridge_path}\" }}"),
+        format!("{{ path = \"{css_path}\" }}"),
     )
 }
 
-fn registry_dependencies() -> (String, String, String) {
-    (format!("\"^{VERSION}\""), format!("\"^{VERSION}\""), format!("\"^{VERSION}\""))
+fn registry_dependencies() -> (String, String, String, String) {
+    (
+        format!("\"^{VERSION}\""),
+        format!("\"^{VERSION}\""),
+        format!("\"^{VERSION}\""),
+        format!("\"^{VERSION}\""),
+    )
 }
 
 fn relative_path(from: &Path, to: &Path) -> Option<String> {

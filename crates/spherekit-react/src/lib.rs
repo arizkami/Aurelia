@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use spherekit_core::{Color, px};
+use spherekit_css::{Node as CssNode, Stylesheet};
 pub use spherekit_ui::AnyElement;
 use spherekit_ui::{IntoElement, ParentElement, Styled, button, div, label, scroll_view, slider};
 use std::collections::{BTreeMap, HashSet};
@@ -80,6 +80,7 @@ pub enum ReactHostError {
 #[derive(Clone, Debug, Default)]
 pub struct ReactHost {
     tree: NativeTree,
+    stylesheet: Stylesheet,
 }
 
 impl ReactHost {
@@ -125,6 +126,21 @@ impl ReactHost {
         serde_json::to_string(&self.tree)
     }
 
+    /// Replaces the CSS stylesheet used when lowering the React tree.
+    ///
+    /// The stylesheet is parsed before it is installed, so a malformed update
+    /// leaves the previous stylesheet active.
+    pub fn set_stylesheet(&mut self, css: &str) -> Result<(), spherekit_css::CssError> {
+        let stylesheet = Stylesheet::parse(css)?;
+        self.stylesheet = stylesheet;
+        Ok(())
+    }
+
+    /// Returns the stylesheet currently used for native lowering.
+    pub fn stylesheet(&self) -> &Stylesheet {
+        &self.stylesheet
+    }
+
     /// Looks up a committed node by its React host identity.
     pub fn node(&self, id: u64) -> Option<&NativeNode> {
         self.tree.children.iter().find_map(|node| find_node(node, id))
@@ -137,22 +153,33 @@ impl ReactHost {
     /// plain layout container. React event callbacks are intentionally not
     /// reconstructed here; the event bridge will route them by node ID.
     pub fn ui_element(&self) -> AnyElement {
-        let mut root = apply_style(div().flex_col(), &NativeNode::root());
-        root = root.children_iter(self.tree.children.iter().map(node_to_element));
+        let mut root = div().flex_col();
+        root = root.children_iter(
+            self.tree.children.iter().map(|node| node_to_element(node, &self.stylesheet)),
+        );
         root.into_element()
     }
 }
 
-fn node_to_element(node: &NativeNode) -> AnyElement {
+fn node_to_element(node: &NativeNode, stylesheet: &Stylesheet) -> AnyElement {
     match node.node_type.as_str() {
-        "#text" => label(node.text.as_deref().unwrap_or_default()).id(node.id).into_element(),
-        "text" => label(text_content(node)).id(node.id).into_element(),
+        "#text" => apply_style(
+            label(node.text.as_deref().unwrap_or_default()).id(node.id),
+            node,
+            stylesheet,
+        )
+        .into_element(),
         "button" => {
             let title = prop_string(node, "title").unwrap_or_else(|| text_content(node));
-            button(title)
-                .id(node.id)
-                .disabled(prop_bool(node, "disabled").unwrap_or(false))
-                .into_element()
+            apply_style(
+                button(title).id(node.id).disabled(prop_bool(node, "disabled").unwrap_or(false)),
+                node,
+                stylesheet,
+            )
+            .into_element()
+        }
+        "text" => {
+            apply_style(label(text_content(node)).id(node.id), node, stylesheet).into_element()
         }
         "slider" => {
             let value = prop_number(node, "value").unwrap_or(0.0);
@@ -165,61 +192,35 @@ fn node_to_element(node: &NativeNode) -> AnyElement {
             if prop_bool(node, "disabled").unwrap_or(false) {
                 control = control.disabled(true);
             }
-            control.into_element()
+            apply_style(control, node, stylesheet).into_element()
         }
         "scroll-view" => {
             let scroll = scroll_view()
                 .id(node.id)
                 .horizontal(prop_bool(node, "horizontal").unwrap_or(false));
-            apply_style(scroll, node)
-                .children_iter(node.children.iter().map(node_to_element))
+            apply_style(scroll, node, stylesheet)
+                .children_iter(node.children.iter().map(|child| node_to_element(child, stylesheet)))
                 .into_element()
         }
         _ => {
-            let view = apply_style(div().id(node.id), node);
-            view.children_iter(node.children.iter().map(node_to_element)).into_element()
+            let view = apply_style(div().id(node.id), node, stylesheet);
+            view.children_iter(node.children.iter().map(|child| node_to_element(child, stylesheet)))
+                .into_element()
         }
     }
 }
 
-fn apply_style<T: Styled>(mut element: T, node: &NativeNode) -> T {
+fn apply_style<T: Styled>(element: T, node: &NativeNode, stylesheet: &Stylesheet) -> T {
+    let css_id = prop_string(node, "id");
+    let css_classes = prop_string(node, "className").or_else(|| prop_string(node, "class"));
+    let inline = inline_css(node);
+    let css_node = CssNode::new(&node.node_type)
+        .with_id_option(css_id.as_deref())
+        .with_classes(css_classes.as_deref().unwrap_or(""));
+    let resolved = stylesheet.resolve(css_node, inline.as_deref());
+    let mut element = resolved.apply_to(element);
     if node.hidden {
         element = element.hidden();
-    }
-    if let Some(direction) = prop_string(node, "flexDirection") {
-        element = match direction.as_str() {
-            "column" => element.flex_col(),
-            _ => element.flex_row(),
-        };
-    }
-    if let Some(gap) = prop_number(node, "gap") {
-        element = element.gap(px(gap));
-    }
-    if let Some(padding) = prop_number(node, "padding") {
-        element = element.p(px(padding));
-    }
-    if let Some(width) = prop_number(node, "width") {
-        element = element.w(px(width));
-    }
-    if let Some(height) = prop_number(node, "height") {
-        element = element.h(px(height));
-    }
-    if let Some(grow) = prop_number(node, "flexGrow") {
-        element = element.grow(grow);
-    }
-    if let Some(color) = prop_color(node, "backgroundColor") {
-        element = element.bg(color);
-    }
-    if let Some(radius) = prop_number(node, "borderRadius") {
-        element = element.rounded(px(radius));
-    }
-    if let (Some(width), Some(color)) =
-        (prop_number(node, "borderWidth"), prop_color(node, "borderColor"))
-    {
-        element = element.border(px(width), color);
-    }
-    if let Some(opacity) = prop_number(node, "opacity") {
-        element = element.opacity(opacity);
     }
     element
 }
@@ -250,29 +251,49 @@ fn prop_string(node: &NativeNode, name: &str) -> Option<String> {
     prop_value(node, name).and_then(Value::as_str).map(ToOwned::to_owned)
 }
 
-fn prop_color(node: &NativeNode, name: &str) -> Option<Color> {
-    let value = prop_value(node, name)?;
-    if let Some(text) = value.as_str() {
-        let hex = text.strip_prefix('#')?;
-        return match hex.len() {
-            6 => u32::from_str_radix(hex, 16).ok().map(Color::hex),
-            8 => u32::from_str_radix(hex, 16).ok().map(Color::hex_rgba),
-            _ => None,
-        };
+fn inline_css(node: &NativeNode) -> Option<String> {
+    let mut declarations = Vec::new();
+    if let Some(style) = node.props.get("style").and_then(Value::as_object) {
+        for (property, value) in style {
+            if let Some(value) = css_value(property, value) {
+                declarations.push(format!("{property}: {value}"));
+            }
+        }
     }
-    value.as_u64().and_then(|value| u32::try_from(value).ok()).map(Color::hex)
+    for (property, value) in &node.props {
+        if matches!(property.as_str(), "style" | "className" | "class" | "id") {
+            continue;
+        }
+        if let Some(value) = css_value(property, value) {
+            declarations.push(format!("{property}: {value}"));
+        }
+    }
+    (!declarations.is_empty()).then(|| declarations.join("; "))
 }
 
-impl NativeNode {
-    fn root() -> Self {
-        Self {
-            id: 0,
-            node_type: "view".into(),
-            props: BTreeMap::new(),
-            text: None,
-            hidden: false,
-            children: Vec::new(),
+fn css_value(property: &str, value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => {
+            let value = value.as_f64()?;
+            let normalized =
+                property.replace('_', "-").chars().fold(String::new(), |mut output, character| {
+                    if character.is_ascii_uppercase() {
+                        output.push('-');
+                        output.push(character.to_ascii_lowercase());
+                    } else {
+                        output.push(character);
+                    }
+                    output
+                });
+            let unitless = matches!(
+                normalized.as_str(),
+                "flex-grow" | "flex-shrink" | "opacity" | "z-index" | "aspect-ratio"
+            );
+            Some(if unitless { value.to_string() } else { format!("{value}px") })
         }
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
     }
 }
 
@@ -353,5 +374,19 @@ mod tests {
         let mut tree = spherekit_ui::UiTree::new();
         tree.build(host.ui_element());
         assert_eq!(tree.stats().elements, 3);
+    }
+
+    #[test]
+    fn uses_a_shared_stylesheet_when_lowering_react_nodes() {
+        let mut host = ReactHost::new();
+        host.set_stylesheet(".panel { flex-direction: column; gap: 4px; }")
+            .expect("stylesheet parses");
+        let snapshot = r#"{"revision":1,"children":[{"id":1,"type":"view","props":{"className":"panel"},"children":[]}] }"#;
+        host.commit_json(snapshot).expect("valid React commit");
+
+        let mut tree = spherekit_ui::UiTree::new();
+        tree.build(host.ui_element());
+        assert_eq!(host.stylesheet().rule_count(), 1);
+        assert_eq!(tree.stats().elements, 2);
     }
 }

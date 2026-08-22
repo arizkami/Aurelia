@@ -51,6 +51,10 @@ export function jsonBridge(commitJson: (snapshot: string) => void): NativeBridge
 /** Props accepted by a native host component. React event functions stay local. */
 export type NativeProps = Readonly<Record<string, unknown>> & {
   readonly children?: ReactNode;
+  /** CSS class names resolved by the shared native CSS runtime. */
+  readonly className?: string;
+  /** Author-facing CSS id used by stylesheet selectors. */
+  readonly id?: string;
 };
 
 export function serializeProps(props: NativeProps): Readonly<Record<string, NativeValue>> {
