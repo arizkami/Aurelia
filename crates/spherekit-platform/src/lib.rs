@@ -74,8 +74,8 @@ pub use monitor::{MonitorInfo, MonitorList, RefreshRate, VideoMode};
 pub use registry::{WindowRegistry, WindowState};
 pub use scheduler::{ControlFlow, FrameScheduler, RedrawPolicy};
 pub use window::{
-    CaptionRegions, ForeignWindow, ForeignWindowHandle, ResizeEdge, WindowAttributes, WindowChrome,
-    WindowLevel, WindowPosition, WindowTarget,
+    CaptionRegions, ForeignWindow, ForeignWindowHandle, ResizeEdge, WindowAttributes,
+    WindowBackdrop, WindowChrome, WindowLevel, WindowPosition, WindowTarget,
 };
 
 #[cfg(feature = "winit-backend")]
@@ -101,7 +101,9 @@ pub mod prelude {
     pub use crate::monitor::{MonitorInfo, RefreshRate};
     pub use crate::registry::WindowState;
     pub use crate::scheduler::{FrameScheduler, RedrawPolicy};
-    pub use crate::window::{CaptionRegions, WindowAttributes, WindowChrome, WindowTarget};
+    pub use crate::window::{
+        CaptionRegions, WindowAttributes, WindowBackdrop, WindowChrome, WindowTarget,
+    };
     pub use spherekit_core::WindowId;
 
     #[cfg(feature = "winit-backend")]

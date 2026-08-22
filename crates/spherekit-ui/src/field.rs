@@ -111,8 +111,9 @@ impl TextField {
 
     /// Masks the content, for a password.
     ///
-    /// Masking happens at paint time only; the buffer keeps the real text, which
-    /// is what makes the caret land in the right place.
+    /// Masking happens at paint time only; the buffer keeps the real text and
+    /// the field maps its byte offsets to the bullet layout for caret and hit
+    /// testing.
     pub fn mask(mut self, mask: bool) -> Self {
         self.mask = mask;
         self
@@ -168,10 +169,49 @@ impl TextField {
         if !self.mask {
             return std::borrow::Cow::Borrowed(self.edit.text());
         }
+        Self::masked_text(self.edit.text())
+    }
+
+    /// Masks one grapheme at a time, keeping the real text private while
+    /// preserving the number of user-perceived characters.
+    fn masked_text(text: &str) -> std::borrow::Cow<'_, str> {
         // One bullet per grapheme, not per byte: masking per byte would make a
         // password field leak the byte length of the text it is hiding.
         use unicode_segmentation::UnicodeSegmentation;
-        std::borrow::Cow::Owned(self.edit.text().graphemes(true).map(|_| '\u{2022}').collect())
+        std::borrow::Cow::Owned(text.graphemes(true).map(|_| '\u{2022}').collect())
+    }
+
+    /// Converts a byte offset in the real buffer to the corresponding byte
+    /// offset in the painted string. A bullet is three UTF-8 bytes, while the
+    /// source text may use one or more bytes per grapheme.
+    fn display_offset(&self, source: usize) -> usize {
+        if !self.mask {
+            return source.min(self.edit.text().len());
+        }
+        use unicode_segmentation::UnicodeSegmentation;
+        let source = source.min(self.edit.text().len());
+        self.edit.text().grapheme_indices(true).take_while(|(start, _)| *start < source).count()
+            * '\u{2022}'.len_utf8()
+    }
+
+    /// Converts a byte offset in the painted string back to the real buffer.
+    fn source_offset(&self, display: usize) -> usize {
+        if !self.mask {
+            return display.min(self.edit.text().len());
+        }
+        use unicode_segmentation::UnicodeSegmentation;
+        let grapheme = display / '\u{2022}'.len_utf8();
+        self.edit
+            .text()
+            .grapheme_indices(true)
+            .nth(grapheme)
+            .map(|(start, _)| start)
+            .unwrap_or(self.edit.text().len())
+    }
+
+    /// Converts a real-text range to the range used by the painted layout.
+    fn display_range(&self, range: core::ops::Range<usize>) -> core::ops::Range<usize> {
+        self.display_offset(range.start)..self.display_offset(range.end)
     }
 
     /// How far the text is scrolled left, in logical pixels.
@@ -205,7 +245,8 @@ impl TextField {
         let style = Self::text_style(theme);
         let display = self.display_text();
         let layout = text.layout(&display, &style, None);
-        let caret_x = layout.caret(self.edit.caret()).map(|c| c.x).unwrap_or(Px::ZERO);
+        let caret_x =
+            layout.caret(self.display_offset(self.edit.caret())).map(|c| c.x).unwrap_or(Px::ZERO);
         let offset = Self::scroll_offset(caret_x, layout.size.width, inner.width());
         // Vertically centred on the box rather than on the baseline, which is
         // what makes a field with a taller-than-usual font still look centred.
@@ -219,7 +260,11 @@ impl TextField {
         let bounds = cx.bounds;
         let text = cx.text.as_deref_mut()?;
         let (layout, origin) = self.geometry(bounds, text, theme);
-        Some(layout.hit(Point::new(position.x - origin.x, position.y - origin.y)))
+        Some(
+            self.source_offset(
+                layout.hit(Point::new(position.x - origin.x, position.y - origin.y)),
+            ),
+        )
     }
 
     /// Reports the buffer upward and asks for a repaint.
@@ -232,13 +277,17 @@ impl TextField {
         cx.notify();
     }
 
-    /// Handles one key press. Returns whether it was consumed.
-    fn handle_key(&mut self, key: &crate::event::KeyEvent) -> bool {
+    /// Handles one key press.
+    ///
+    /// `Some(true)` means the field state changed and the bound edit must be
+    /// reported back to the application. `Some(false)` means the shortcut was
+    /// consumed without changing the edit (copy is the usual case).
+    fn handle_key(&mut self, key: &crate::event::KeyEvent, cx: &EventContext<'_>) -> Option<bool> {
         let shift = key.modifiers.shift;
         // Ctrl on Windows and Linux, Command on macOS; the platform layer has
         // already resolved which one the user pressed.
         let word = key.modifiers.control || key.modifiers.alt;
-        let accel = key.modifiers.control || key.modifiers.meta;
+        let accel = key.modifiers.command();
 
         match &key.key {
             Key::Left => {
@@ -251,35 +300,58 @@ impl TextField {
             Key::End => self.edit.move_caret(Motion::End, shift),
             Key::Backspace => {
                 if !self.edit.backspace() {
-                    return true;
+                    return Some(true);
                 }
             }
             Key::Delete => {
                 if !self.edit.delete_forward() {
-                    return true;
+                    return Some(true);
                 }
             }
             Key::Escape => {
                 // Escape cancels a composition and otherwise does not belong to
                 // the field: a dialog above it wants to close on Escape, and
                 // swallowing it here would break that.
-                return self.edit.cancel_composition();
+                return Some(self.edit.cancel_composition());
             }
             Key::Enter => {
                 if self.edit.is_composing() {
-                    return true;
+                    return Some(true);
                 }
                 if let Some(f) = self.on_submit.as_mut() {
                     f(&self.edit.committed_text());
                 }
-                return true;
+                return Some(false);
             }
             Key::Character(c) if accel && c.eq_ignore_ascii_case("a") => {
                 self.edit.select_all();
             }
-            _ => return false,
+            Key::Character(c) if accel && c.eq_ignore_ascii_case("c") => {
+                // A password field must never make its secret available to a
+                // global clipboard. Paste remains enabled below.
+                if !self.mask && self.edit.has_selection() {
+                    let _ = cx.clipboard.set_text(self.edit.selected_text());
+                }
+                return Some(false);
+            }
+            Key::Character(c) if accel && c.eq_ignore_ascii_case("x") => {
+                if self.mask || !self.edit.has_selection() {
+                    return Some(false);
+                }
+                let selected = self.edit.selected_text().to_owned();
+                if cx.clipboard.set_text(&selected).is_ok() {
+                    self.edit.delete_forward();
+                    return Some(true);
+                }
+                return Some(false);
+            }
+            Key::Character(c) if accel && c.eq_ignore_ascii_case("v") => {
+                let Ok(pasted) = cx.clipboard.get_text() else { return Some(false) };
+                return Some(self.edit.insert(&pasted));
+            }
+            _ => return None,
         }
-        true
+        Some(true)
     }
 }
 
@@ -374,7 +446,7 @@ impl Element for TextField {
 
         if self.edit.has_selection() {
             let mut rects = Vec::new();
-            layout.selection_rects(self.edit.selection(), &mut rects);
+            layout.selection_rects(self.display_range(self.edit.selection()), &mut rects);
             for r in rects {
                 cx.canvas.fill_rect(
                     r.translate(Size::new(origin.x, origin.y)),
@@ -400,7 +472,7 @@ impl Element for TextField {
         // uses to say "this is not committed yet".
         if let Some(pre) = self.edit.preedit() {
             let mut rects = Vec::new();
-            layout.selection_rects(pre.range.clone(), &mut rects);
+            layout.selection_rects(self.display_range(pre.range.clone()), &mut rects);
             for r in rects {
                 let r = r.translate(Size::new(origin.x, origin.y));
                 cx.canvas.fill_rect(
@@ -418,7 +490,7 @@ impl Element for TextField {
             // caret. Drawing one anyway makes it flicker at the start of every
             // composition, which is where a hidden cursor is reported.
             let hidden = self.edit.preedit().is_some_and(|p| p.cursor.is_none());
-            if let Some(caret) = layout.caret(self.edit.caret()) {
+            if let Some(caret) = layout.caret(self.display_offset(self.edit.caret())) {
                 let bar = Rect::new(
                     Point::new(origin.x + caret.x, origin.y + caret.top),
                     Size::new(px(CARET_W), caret.height),
@@ -433,6 +505,14 @@ impl Element for TextField {
         }
 
         cx.canvas.restore();
+    }
+
+    fn paint_filter(&self) -> Option<spherekit_render::Filter> {
+        self.paint.filter
+    }
+
+    fn paint_opacity(&self) -> f32 {
+        self.paint.opacity
     }
 
     fn handle_event(&mut self, cx: &mut EventContext<'_>) -> EventFlow {
@@ -486,8 +566,12 @@ impl Element for TextField {
                 EventFlow::Stop
             }
             UiEvent::Key(key) if key.state.is_pressed() => {
-                if self.handle_key(key) {
-                    self.changed(cx);
+                if let Some(changed) = self.handle_key(key, cx) {
+                    if changed {
+                        self.changed(cx);
+                    } else {
+                        cx.notify();
+                    }
                     EventFlow::Stop
                 } else {
                     EventFlow::Continue
@@ -528,7 +612,13 @@ impl Element for TextField {
     }
 
     fn semantics(&self) -> Option<Semantics> {
-        Some(Semantics::new(Role::TextField, self.edit.committed_text().into_owned()))
+        let committed = self.edit.committed_text();
+        let value = if self.mask {
+            Self::masked_text(&committed).into_owned()
+        } else {
+            committed.into_owned()
+        };
+        Some(Semantics::new(Role::TextField, value))
     }
 }
 
@@ -542,6 +632,20 @@ mod tests {
     use spherekit_render::{Canvas, Scene};
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::{Arc as SyncArc, Mutex};
+
+    struct TestClipboard(SyncArc<Mutex<String>>);
+
+    impl spherekit_platform::ClipboardProvider for TestClipboard {
+        fn get_text(&self) -> Result<String, spherekit_core::PlatformError> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+
+        fn set_text(&self, text: &str) -> Result<(), spherekit_core::PlatformError> {
+            *self.0.lock().unwrap() = text.to_owned();
+            Ok(())
+        }
+    }
 
     fn viewport() -> Size<Px> {
         size(px(400.0), px(300.0))
@@ -578,11 +682,15 @@ mod tests {
     }
 
     fn key(k: Key, shift: bool) -> UiEvent {
+        key_with_modifiers(k, Modifiers { shift, ..Modifiers::NONE })
+    }
+
+    fn key_with_modifiers(k: Key, modifiers: Modifiers) -> UiEvent {
         UiEvent::Key(crate::event::KeyEvent {
             key: k,
             state: ElementState::Pressed,
             repeat: false,
-            modifiers: Modifiers { shift, ..Modifiers::NONE },
+            modifiers,
         })
     }
 
@@ -657,6 +765,50 @@ mod tests {
         tree.navigate_focus(crate::focus::FocusDirection::Next);
         tree.dispatch(&key(Key::Left, true));
         assert_eq!(state.borrow().selection(), 4..5);
+    }
+
+    #[test]
+    fn ctrl_a_paints_a_selection_and_standard_clipboard_shortcuts_work() {
+        let state = Rc::new(RefCell::new(TextEdit::from_text("hello")));
+        let clipboard = SyncArc::new(Mutex::new(String::new()));
+        let mut tree = mount(field_over(&state));
+        tree.set_clipboard(spherekit_platform::Clipboard::with_provider(Box::new(TestClipboard(
+            SyncArc::clone(&clipboard),
+        ))));
+        tree.navigate_focus(crate::focus::FocusDirection::Next);
+
+        let Some(mut text) = text_system() else {
+            eprintln!("no system font; skipping");
+            return;
+        };
+        let before = paint_with(&mut tree, &mut text).commands.len();
+
+        tree.dispatch(&key_with_modifiers(
+            Key::Character("a".into()),
+            Modifiers { control: true, ..Modifiers::NONE },
+        ));
+        assert_eq!(state.borrow().selection(), 0..5);
+        let after_select = paint_with(&mut tree, &mut text).commands.len();
+        assert!(after_select > before, "Ctrl+A must add a visible selection quad");
+
+        tree.dispatch(&key_with_modifiers(
+            Key::Character("c".into()),
+            Modifiers { control: true, ..Modifiers::NONE },
+        ));
+        assert_eq!(clipboard.lock().unwrap().as_str(), "hello");
+        assert_eq!(state.borrow().text(), "hello");
+
+        tree.dispatch(&key_with_modifiers(
+            Key::Character("x".into()),
+            Modifiers { control: true, ..Modifiers::NONE },
+        ));
+        assert_eq!(state.borrow().text(), "");
+
+        tree.dispatch(&key_with_modifiers(
+            Key::Character("v".into()),
+            Modifiers { control: true, ..Modifiers::NONE },
+        ));
+        assert_eq!(state.borrow().text(), "hello");
     }
 
     #[test]
@@ -871,6 +1023,20 @@ mod tests {
         let scene = paint_with(&mut tree, &mut text);
         assert!(!scene.is_empty(), "a masked field still draws something");
         assert_eq!(state.borrow().text(), "secret", "the buffer keeps the real text");
+    }
+
+    #[test]
+    fn a_masked_field_maps_real_offsets_to_bullet_offsets() {
+        let field = text_field(TextEdit::from_text("a界b")).mask(true);
+        assert_eq!(field.display_offset(0), 0);
+        assert_eq!(field.display_offset(1), 3);
+        assert_eq!(field.display_offset(4), 6);
+        assert_eq!(field.source_offset(0), 0);
+        assert_eq!(field.source_offset(3), 1);
+        assert_eq!(field.source_offset(6), 4);
+
+        let semantics = field.semantics().expect("text fields have semantics");
+        assert_eq!(semantics.label.as_deref(), Some("•••"));
     }
 
     #[test]

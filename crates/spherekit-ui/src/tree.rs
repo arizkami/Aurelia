@@ -35,7 +35,8 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use spherekit_core::{ElementId, NodeId, Point, Px, Rect, Size};
 use spherekit_layout::{DirtyFlags, LayoutEngine, LayoutTree, Style, TaffyLayoutEngine};
-use spherekit_render::Canvas;
+use spherekit_render::{Canvas, Filter};
+use std::sync::Arc;
 
 /// One node of the flattened element tree.
 struct BuiltNode {
@@ -49,6 +50,8 @@ struct BuiltNode {
     clips: bool,
     /// Whether this element opens an opacity layer.
     opacity: f32,
+    /// Optional post-process for this element and its subtree.
+    filter: Option<Filter>,
 }
 
 /// Per-node state that must outlive a rebuild.
@@ -143,6 +146,8 @@ pub struct UiTree {
     captured: Option<usize>,
     hovered_chain: SmallVec<[usize; 12]>,
     theme: Theme,
+    /// Text clipboard shared with event handlers.
+    clipboard: Arc<spherekit_platform::Clipboard>,
     /// Where the focused editable element wants an input method, as of the last
     /// paint. `None` means nothing on screen accepts text, and the platform's
     /// input method should be switched off.
@@ -177,6 +182,7 @@ impl UiTree {
             captured: None,
             hovered_chain: SmallVec::new(),
             theme: Theme::dark(),
+            clipboard: Arc::new(spherekit_platform::Clipboard::system()),
             ime: None,
             caption_exclusions: Vec::new(),
             stats: TreeStats::default(),
@@ -218,6 +224,14 @@ impl UiTree {
         if let Some(root) = self.root {
             self.layout.mark_dirty(root, DirtyFlags::PAINT);
         }
+    }
+
+    /// Replaces the clipboard used by editable fields.
+    ///
+    /// Standalone trees default to the system clipboard. Plug-in hosts can
+    /// provide a host-routed [`spherekit_platform::Clipboard`] here instead.
+    pub fn set_clipboard(&mut self, clipboard: spherekit_platform::Clipboard) {
+        self.clipboard = Arc::new(clipboard);
     }
 
     /// The focus registry.
@@ -314,12 +328,15 @@ impl UiTree {
                 });
             }
 
+            let opacity = pending.element.paint_opacity().clamp(0.0, 1.0);
+            let filter = pending.element.paint_filter();
             self.built.push(BuiltNode {
                 node,
                 element: pending.element,
                 children: SmallVec::new(),
                 clips,
-                opacity: 1.0,
+                opacity,
+                filter,
             });
             self.index_for_node.insert(node, index);
             self.node_for_element.insert(pending.identity, node);
@@ -483,7 +500,8 @@ impl UiTree {
 
                     let clips = built.clips;
                     let opacity = built.opacity;
-                    let needs_group = opacity < 1.0;
+                    let filter = built.filter;
+                    let needs_group = opacity < 1.0 || filter.is_some();
 
                     if clips || needs_group {
                         canvas.save();
@@ -491,10 +509,18 @@ impl UiTree {
                             canvas.clip_rect(bounds);
                         }
                     }
-                    let opened_layer = needs_group && canvas.push_opacity_layer(bounds, opacity);
+                    let opened_layer = needs_group
+                        && canvas.push_layer(
+                            bounds,
+                            opacity,
+                            spherekit_core::BlendMode::Normal,
+                            filter,
+                        );
 
                     // The element is borrowed mutably for `paint`, so the
-                    // child list is copied out first.
+                    // child list is copied out first. Paint order must match
+                    // hit-test order: z-index is a visual stacking contract,
+                    // not just an input-routing hint.
                     let children = self.built[index].children.clone();
                     {
                         let built = &mut self.built[index];
@@ -519,7 +545,15 @@ impl UiTree {
                     if clips || needs_group {
                         stack.push(Step::Exit { restore: true, layer: opened_layer });
                     }
-                    // Reverse so children are entered in document order.
+                    let mut children = children;
+                    let needs_sort = children
+                        .iter()
+                        .any(|child| self.built[*child].element.layout_style().z_index != 0);
+                    if needs_sort {
+                        children
+                            .sort_by_key(|child| self.built[*child].element.layout_style().z_index);
+                    }
+                    // Reverse so children are entered in bottom-to-top order.
                     for child in children.iter().rev() {
                         stack.push(Step::Enter(*child, child_visible));
                     }
@@ -570,9 +604,11 @@ impl UiTree {
         mut text: Option<&mut spherekit_text::TextSystem>,
     ) -> DispatchResult {
         let mut result = DispatchResult::default();
+        let clipboard = Arc::clone(&self.clipboard);
 
         if event.is_focus_routed() {
-            if let Some(handled) = self.dispatch_to_focused(event, text.as_deref_mut()) {
+            if let Some(handled) = self.dispatch_to_focused(event, text.as_deref_mut(), &clipboard)
+            {
                 result.merge(handled);
             }
             result.focus_changed |= self.focus.take_changed();
@@ -593,7 +629,7 @@ impl UiTree {
         };
 
         if matches!(event, UiEvent::MouseMove(_)) {
-            result.merge(self.update_hover(&indices, position));
+            result.merge(self.update_hover(&indices, position, &clipboard));
         }
         self.update_active(event, &indices);
 
@@ -616,6 +652,7 @@ impl UiTree {
                 &chain,
                 &mut result,
                 text.as_deref_mut(),
+                &clipboard,
             );
             if flow.is_stopped() {
                 result.consumed = true;
@@ -632,6 +669,7 @@ impl UiTree {
                 &chain,
                 &mut result,
                 text.as_deref_mut(),
+                &clipboard,
             );
             if flow.is_stopped() {
                 result.consumed = true;
@@ -647,6 +685,7 @@ impl UiTree {
         &mut self,
         event: &UiEvent,
         mut text: Option<&mut spherekit_text::TextSystem>,
+        clipboard: &spherekit_platform::Clipboard,
     ) -> Option<DispatchResult> {
         let node = self.focus.focused_node()?;
         let index = *self.index_for_node.get(&node)?;
@@ -676,8 +715,15 @@ impl UiTree {
             .collect();
 
         for index in chain_indices {
-            let flow =
-                self.deliver(index, event, Phase::Bubble, &chain, &mut result, text.as_deref_mut());
+            let flow = self.deliver(
+                index,
+                event,
+                Phase::Bubble,
+                &chain,
+                &mut result,
+                text.as_deref_mut(),
+                clipboard,
+            );
             if flow.is_stopped() {
                 result.consumed = true;
                 break;
@@ -694,6 +740,7 @@ impl UiTree {
         chain: &[HitTarget],
         result: &mut DispatchResult,
         text: Option<&mut spherekit_text::TextSystem>,
+        clipboard: &spherekit_platform::Clipboard,
     ) -> EventFlow {
         let Some(built) = self.built.get(index) else { return EventFlow::Continue };
         let node = built.node;
@@ -718,6 +765,7 @@ impl UiTree {
                 release_pointer: false,
                 cursor: None,
                 text,
+                clipboard,
                 theme: &self.theme,
             };
             let flow = self.built[index].element.handle_event(&mut cx);
@@ -768,7 +816,12 @@ impl UiTree {
     /// Enter and leave must fire exactly once per boundary crossing. Deriving
     /// them from "is the pointer inside" on every move produces a storm of
     /// duplicate events and makes hover animations restart every frame.
-    fn update_hover(&mut self, indices: &[usize], position: Point<Px>) -> DispatchResult {
+    fn update_hover(
+        &mut self,
+        indices: &[usize],
+        position: Point<Px>,
+        clipboard: &spherekit_platform::Clipboard,
+    ) -> DispatchResult {
         let mut result = DispatchResult::default();
         let new_chain: SmallVec<[usize; 12]> = SmallVec::from_slice(indices);
 
@@ -797,7 +850,7 @@ impl UiTree {
                 self.layout.mark_dirty(node, DirtyFlags::PAINT);
             }
             let ev = synth(UiEvent::MouseLeave);
-            self.deliver(index, &ev, Phase::Bubble, &[], &mut result, None);
+            self.deliver(index, &ev, Phase::Bubble, &[], &mut result, None, clipboard);
             result.repaint = true;
         }
         for index in entered {
@@ -807,7 +860,7 @@ impl UiTree {
                 self.layout.mark_dirty(node, DirtyFlags::PAINT);
             }
             let ev = synth(UiEvent::MouseEnter);
-            self.deliver(index, &ev, Phase::Bubble, &[], &mut result, None);
+            self.deliver(index, &ev, Phase::Bubble, &[], &mut result, None, clipboard);
             result.repaint = true;
         }
 

@@ -1,0 +1,12 @@
+[workspace]
+
+[package]
+name = "spherekit-app-react-backend"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+license = "BSD-3-Clause"
+publish = false
+
+[dependencies]
+spherekit-react = { path = "../../../../crates/spherekit-react" }

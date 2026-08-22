@@ -14,6 +14,11 @@ use spherekit_core::{Color, Px, Shadow, Size};
 pub struct Palette {
     /// The window's own backdrop.
     pub background: Color,
+    /// A translucent tint for Mica or frosted-glass surfaces.
+    ///
+    /// The alpha is part of the token so a surface can show the backdrop
+    /// without every application having to hand-tune opacity for each theme.
+    pub mica_surface: Color,
     /// A panel or card sitting on the background.
     pub surface: Color,
     /// A control sitting on a surface.
@@ -139,6 +144,7 @@ impl Theme {
         Self {
             colors: Palette {
                 background: Color::hex(0x14161A),
+                mica_surface: Color::hex(0x303744).with_alpha(0.44),
                 surface: Color::hex(0x1B1E23),
                 elevated: Color::hex(0x24282F),
                 hover: Color::hex(0x2C313A),
@@ -164,12 +170,17 @@ impl Theme {
         Self {
             colors: Palette {
                 background: Color::hex(0xF5F6F8),
+                // Keep the light sidebar visually calm and flat. A translucent
+                // white here lets a desktop wallpaper's dark bands show
+                // through the Mica blur, which reads as an unintended gradient
+                // in a light application.
+                mica_surface: Color::hex(0xF8F9FB),
                 surface: Color::hex(0xFFFFFF),
                 elevated: Color::hex(0xF0F2F5),
                 hover: Color::hex(0xE7EAEF),
                 pressed: Color::hex(0xDCE0E7),
-                border: Color::hex(0xDDE1E7),
-                border_strong: Color::hex(0xB9C0CA),
+                border: Color::hex(0xE7E9ED),
+                border_strong: Color::hex(0xD8DCE3),
                 text: Color::hex(0x1A1D22),
                 text_muted: Color::hex(0x606772),
                 text_on_accent: Color::hex(0xFFFFFF),
@@ -189,6 +200,7 @@ impl Theme {
         Self {
             colors: Palette {
                 background: Color::BLACK,
+                mica_surface: Color::BLACK,
                 surface: Color::BLACK,
                 elevated: Color::BLACK,
                 hover: Color::BLACK,

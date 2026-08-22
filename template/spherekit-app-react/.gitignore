@@ -1,0 +1,7 @@
+node_modules
+target
+dist
+out
+*.tsbuildinfo
+.DS_Store
+.idea

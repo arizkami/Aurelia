@@ -192,6 +192,14 @@ frame of drag, which beats blocking a compositor inside its own dispatch.
 routes as caption is swallowed by the modal move loop, so an unlisted button receives no click
 **ever** — not merely a delayed one. That is the single most likely way to get this wrong.
 
+### Transparent windows and system backdrops
+
+`WindowAttributes::with_transparent(true)` makes the client surface respect alpha. On Windows 11,
+`Window::set_backdrop(WindowBackdrop::Mica)` or `WindowBackdrop::Acrylic` then asks DWM to blur the
+desktop behind that transparent surface. `WindowBackdrop::None` removes the material. The call
+returns `Unsupported` on platforms without a system compositor API, where renderer-side
+`Styled::backdrop_blur` remains the portable fallback.
+
 ### The system menu
 
 Right-click on a published caption region opens the real window menu, and Alt+Space still works.

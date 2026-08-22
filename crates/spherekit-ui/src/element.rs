@@ -30,7 +30,7 @@ use crate::style::PaintStyle;
 use smallvec::SmallVec;
 use spherekit_core::{Color, Corners, ElementId, Length, Px, Rect, Size};
 use spherekit_layout::{MeasureRequest, Style};
-use spherekit_render::Canvas;
+use spherekit_render::{Canvas, Filter};
 
 /// Interaction state the framework resolves before painting.
 ///
@@ -186,6 +186,12 @@ pub struct EventContext<'a> {
     /// `Option` rather than required, so a tree can still be driven, tested and
     /// dispatched to without a font stack.
     pub text: Option<&'a mut spherekit_text::TextSystem>,
+    /// The application's text clipboard.
+    ///
+    /// The field uses this for the standard copy, cut and paste shortcuts.
+    /// It is supplied by the UI tree so an embedder can replace the system
+    /// clipboard with one owned by its host.
+    pub clipboard: &'a spherekit_platform::Clipboard,
     /// The active theme.
     ///
     /// Needed because a widget's *geometry* can depend on it. A text field turns
@@ -301,6 +307,23 @@ pub trait Element: 'static {
     /// Records this element's own painting. Children are painted by the
     /// framework, after this returns.
     fn paint(&mut self, cx: &mut PaintContext<'_, '_>);
+
+    /// Returns the post-process applied to this element and its subtree.
+    ///
+    /// The default is no effect so custom elements remain direct-to-parent.
+    /// Built-in styled elements expose their [`PaintStyle`] filter here, which
+    /// lets the tree open the required offscreen layer before painting them.
+    fn paint_filter(&self) -> Option<Filter> {
+        None
+    }
+
+    /// Returns the opacity applied to this element and its subtree.
+    ///
+    /// This is separate from [`Element::paint`] because group opacity must be
+    /// resolved before children are painted.
+    fn paint_opacity(&self) -> f32 {
+        1.0
+    }
 
     /// Responds to an event. The default ignores everything.
     fn handle_event(&mut self, _cx: &mut EventContext<'_>) -> EventFlow {
@@ -629,6 +652,25 @@ pub trait Styled: Sized {
         self.paint_style_mut().opacity = v.clamp(0.0, 1.0);
         self
     }
+    /// Blurs this element's rendered content before compositing it.
+    fn blur(mut self, sigma: Px) -> Self {
+        self.paint_style_mut().filter =
+            Some(spherekit_render::Filter::Blur { sigma: sigma.max(Px::ZERO) });
+        self
+    }
+    /// Blurs the content behind this element before compositing its children.
+    fn backdrop_blur(mut self, sigma: Px) -> Self {
+        self.paint_style_mut().filter =
+            Some(spherekit_render::Filter::BackdropBlur { sigma: sigma.max(Px::ZERO) });
+        self
+    }
+    /// Applies a theme-coloured Mica surface with a blurred backdrop.
+    fn mica(mut self, tint: Color, sigma: Px) -> Self {
+        let style = self.paint_style_mut();
+        style.background = Some(tint.into());
+        style.filter = Some(spherekit_render::Filter::BackdropBlur { sigma: sigma.max(Px::ZERO) });
+        self
+    }
     /// Clips children to this element's box.
     fn clip(mut self) -> Self {
         self.paint_style_mut().clip_content = true;
@@ -912,6 +954,14 @@ impl Element for Div {
         self.paint.paint_box(cx.canvas, cx.bounds, cx.state);
     }
 
+    fn paint_filter(&self) -> Option<Filter> {
+        self.paint.filter
+    }
+
+    fn paint_opacity(&self) -> f32 {
+        self.paint.opacity
+    }
+
     fn handle_event(&mut self, cx: &mut EventContext<'_>) -> EventFlow {
         if self.handlers.is_empty() {
             return EventFlow::Continue;
@@ -958,6 +1008,7 @@ mod tests {
             release_pointer: false,
             cursor: None,
             text: None,
+            clipboard: Box::leak(Box::new(spherekit_platform::Clipboard::unsupported())),
             theme: TEST_THEME.get_or_init(crate::theme::Theme::dark),
         }
     }

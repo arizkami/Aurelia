@@ -225,7 +225,7 @@ pub struct PipelineCache {
     quad_layout: wgpu::PipelineLayout,
     composite_layout: wgpu::PipelineLayout,
     blur_layout: wgpu::PipelineLayout,
-    blur_pipeline: Option<wgpu::RenderPipeline>,
+    blur_pipelines: FxHashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     /// How many pipelines have been built, for diagnostics.
     built: u32,
 }
@@ -256,7 +256,7 @@ impl PipelineCache {
             quad_layout,
             composite_layout,
             blur_layout,
-            blur_pipeline: None,
+            blur_pipelines: FxHashMap::default(),
             built: 0,
         }
     }
@@ -441,7 +441,7 @@ impl PipelineCache {
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
     ) -> Result<&wgpu::RenderPipeline, ShaderError> {
-        if self.blur_pipeline.is_none() {
+        if !self.blur_pipelines.contains_key(&format) {
             let layout = &self.blur_layout;
             let module = Self::module_for(&mut self.modules, device, "blur.wgsl")?;
             let p = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -473,9 +473,9 @@ impl PipelineCache {
                 cache: None,
             });
             self.built += 1;
-            self.blur_pipeline = Some(p);
+            self.blur_pipelines.insert(format, p);
         }
-        Ok(self.blur_pipeline.as_ref().unwrap())
+        Ok(self.blur_pipelines.get(&format).expect("blur pipeline was inserted"))
     }
 }
 

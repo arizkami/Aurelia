@@ -27,9 +27,10 @@ use spherekit::core::animate::{Drive, Motion};
 use spherekit::core::time::{Clock, SystemClock, Timeline};
 use spherekit::core::{Color, Px, px, relative, size};
 use spherekit::platform::{
-    App, AppContext, AppHandler, RedrawPolicy, WindowAttributes, WindowEvent, WindowId,
+    App, AppContext, AppHandler, RedrawPolicy, Theme as PlatformTheme, WindowAttributes,
+    WindowEvent, WindowId,
 };
-use spherekit::platform::{CaptionRegions, WindowChrome};
+use spherekit::platform::{CaptionRegions, WindowBackdrop, WindowChrome};
 use spherekit::svg::SvgCache;
 use spherekit::text::FontWeight;
 use spherekit::ui::{
@@ -93,9 +94,26 @@ fn spherekit_dark_theme() -> Theme {
     theme
 }
 
-/// Title/status bars sit one step above the panel and content surfaces.
-fn chrome_background() -> Color {
-    Color::hex(0x343A45)
+/// Maps the operating system appearance to the product theme.
+///
+/// The renderer does not need to know about platform theme APIs; an app owns
+/// this small policy and hands the resulting semantic tokens to the UI tree.
+fn product_theme(system_theme: PlatformTheme) -> Theme {
+    match system_theme {
+        PlatformTheme::Dark => spherekit_dark_theme(),
+        PlatformTheme::Light => {
+            let mut theme = Theme::light();
+            theme.typography.xs = px(10.0);
+            theme.typography.sm = px(12.0);
+            theme.typography.md = px(14.0);
+            theme.typography.lg = px(17.0);
+            theme.typography.xl = px(22.0);
+            theme.radii.sm = px(4.0);
+            theme.radii.md = px(6.0);
+            theme.radii.lg = px(8.0);
+            theme
+        }
+    }
 }
 
 /// The sections the sidebar navigates between.
@@ -168,6 +186,7 @@ impl Section {
 /// able to change what the *next* build reads. This is the pattern the engine
 /// intends — explicit, and impossible to panic on.
 struct State {
+    system_theme: Cell<PlatformTheme>,
     section: Cell<Section>,
     notifications: Cell<bool>,
     auto_update: Cell<bool>,
@@ -204,6 +223,7 @@ struct State {
 impl State {
     fn new() -> Rc<Self> {
         Rc::new(Self {
+            system_theme: Cell::new(PlatformTheme::Dark),
             section: Cell::new(Section::General),
             notifications: Cell::new(true),
             auto_update: Cell::new(false),
@@ -222,7 +242,7 @@ impl State {
     }
 
     fn theme(&self) -> Theme {
-        spherekit_dark_theme()
+        product_theme(self.system_theme.get())
     }
 
     fn say(&self, message: impl Into<String>) {
@@ -281,22 +301,21 @@ impl DesktopApp {
 
     fn build(&mut self) -> AnyElement {
         let theme = self.state.theme();
-        let c = theme.colors;
 
         div()
             .flex_col()
             .full()
-            .bg(c.background)
             .child(self.header(&theme))
             .child(
                 div()
                     .flex_row()
                     .flex_1()
+                    .z(1)
                     .child(self.sidebar(&theme))
-                    .child(separator(true))
+                    .child(separator(true).bg(Color::TRANSPARENT))
                     .child(self.content(&theme)),
             )
-            .child(separator(false))
+            .child(separator(false).bg(Color::TRANSPARENT))
             .child(self.status_bar(&theme))
             .into_element()
     }
@@ -313,7 +332,7 @@ impl DesktopApp {
             // Padded on the left only: the window buttons run flush to the
             // right edge, exactly as the shell's do.
             .pl(px(12.0))
-            .bg(chrome_background())
+            .z(2)
             .child(
                 label("SphereKit")
                     .text_size(theme.typography.sm)
@@ -357,10 +376,10 @@ impl DesktopApp {
         let mut nav = div()
             .flex_col()
             .w(px(220.0))
+            .shrink(0.0)
             .h(relative(1.0))
             .p(theme.spacing.md)
             .gap(theme.spacing.xs)
-            .bg(c.surface)
             .child(
                 label("SETTINGS")
                     .text_size(theme.typography.xs)
@@ -387,7 +406,7 @@ impl DesktopApp {
                     .px_(theme.spacing.md)
                     .rounded(theme.radii.sm)
                     .bg(if selected { c.pressed } else { Color::TRANSPARENT })
-                    .hover_bg(if selected { c.pressed } else { c.hover })
+                    .hover_bg(c.hover)
                     .active_bg(c.pressed)
                     .cursor(Cursor::Pointer)
                     .focus_ring(spherekit::ui::FocusRing { color: c.focus, ..Default::default() })
@@ -413,7 +432,18 @@ impl DesktopApp {
                     }),
             );
         }
-        nav.into_element()
+        // Keep the backdrop effect isolated from the navigation content. A
+        // filtered parent composites an off-screen layer; putting the labels
+        // in that same layer can make them disappear when the adjacent opaque
+        // content pane is repainted.
+        div()
+            .flex_col()
+            .w(px(220.0))
+            .shrink(0.0)
+            .h(relative(1.0))
+            .child(div().absolute().inset(px(0.0)).backdrop_blur(px(18.0)))
+            .child(nav)
+            .into_element()
     }
 
     fn content(&self, theme: &Theme) -> AnyElement {
@@ -428,6 +458,7 @@ impl DesktopApp {
         div()
             .flex_col()
             .flex_1()
+            .min_w(px(0.0))
             .h(relative(1.0))
             .bg(c.background)
             .child(
@@ -436,7 +467,6 @@ impl DesktopApp {
                     .items_center()
                     .h(px(36.0))
                     .px_(px(12.0))
-                    .bg(c.surface)
                     .child(
                         label(self.state.section.get().title())
                             .text_size(theme.typography.sm)
@@ -452,7 +482,7 @@ impl DesktopApp {
                             .no_wrap(),
                     ),
             )
-            .child(separator(false))
+            .child(separator(false).bg(Color::TRANSPARENT))
             .child(
                 scroll_view().id("content-scroll").flex_1().w(relative(1.0)).child(
                     div().flex_row().justify_center().w(relative(1.0)).child(
@@ -494,7 +524,7 @@ impl DesktopApp {
                         .into_element()
                 },
             ))
-            .child(separator(false))
+            .child(separator(false).bg(Color::TRANSPARENT))
             .child(setting_row(
                 "Install updates automatically",
                 "Download and apply in the background.",
@@ -512,7 +542,7 @@ impl DesktopApp {
                         .into_element()
                 },
             ))
-            .child(separator(false))
+            .child(separator(false).bg(Color::TRANSPARENT))
             .child(setting_row("Send usage data", "Anonymous, and off by default.", theme, {
                 let s = Rc::clone(&state);
                 let on = s.telemetry.get();
@@ -522,7 +552,7 @@ impl DesktopApp {
                     .on_change(move |v| s.telemetry.set(v))
                     .into_element()
             }))
-            .child(separator(false))
+            .child(separator(false).bg(Color::TRANSPARENT))
             .child(
                 div()
                     .flex_col()
@@ -597,7 +627,7 @@ impl DesktopApp {
                         .text_color(c.text_muted),
                     ),
             )
-            .child(separator(false))
+            .child(separator(false).bg(Color::TRANSPARENT))
             // A type specimen. Every size below goes through the same MTSDF
             // path, and the two smallest cross into the bitmap fallback.
             .child(
@@ -675,7 +705,6 @@ impl DesktopApp {
                     .flex_col()
                     .gap(theme.spacing.sm)
                     .p(theme.spacing.lg)
-                    .bg(c.surface)
                     .rounded(theme.radii.lg)
                     .child(
                         label("Sync status")
@@ -709,7 +738,6 @@ impl DesktopApp {
                     .flex_col()
                     .gap(theme.spacing.md)
                     .p(theme.spacing.lg)
-                    .bg(c.surface)
                     .rounded(theme.radii.lg)
                     .child(
                         label("Server")
@@ -776,7 +804,7 @@ impl DesktopApp {
                     .text_size(theme.typography.md)
                     .text_color(c.text_muted),
             )
-            .child(separator(false))
+            .child(separator(false).bg(Color::TRANSPARENT))
             .child(info_row("Adapter", &adapter, theme))
             .child(info_row("Draw calls", &stats.frame.draw_calls.to_string(), theme))
             .child(info_row("Quad instances", &stats.frame.quads.to_string(), theme))
@@ -785,7 +813,7 @@ impl DesktopApp {
             .child(info_row("Elements built", &stats.tree.elements.to_string(), theme))
             .child(info_row("Nodes relaid out", &stats.nodes_laid_out.to_string(), theme))
             .child(info_row("CPU per frame", &format!("{:.2} ms", stats.cpu_ms), theme))
-            .child(separator(false))
+            .child(separator(false).bg(Color::TRANSPARENT))
             .child(
                 label("BSD 3-Clause · Futureboard Digital Technologies")
                     .text_size(theme.typography.sm)
@@ -803,7 +831,7 @@ impl DesktopApp {
             .gap(theme.spacing.md)
             .h(px(26.0))
             .px_(theme.spacing.lg)
-            .bg(chrome_background())
+            .z(1)
             .child(label(last).text_size(theme.typography.xs).text_color(c.text_muted).no_wrap())
             .child(div().flex_1())
             .child(
@@ -1164,6 +1192,7 @@ impl AppHandler for DesktopApp {
             // borders, snap, the drop shadow and the window menu; only the
             // caption strip becomes ours to draw.
             .with_chrome(WindowChrome::Custom)
+            .with_transparent(true)
             .with_visible(false);
         let window = match cx.create_window(&attrs) {
             Ok(w) => w,
@@ -1173,12 +1202,16 @@ impl AppHandler for DesktopApp {
                 return;
             }
         };
+        if let Err(error) = window.set_backdrop(WindowBackdrop::Mica) {
+            eprintln!("system Mica unavailable; using transparent fallback: {error}");
+        }
+        self.state.system_theme.set(window.theme().unwrap_or(PlatformTheme::Dark));
 
         match pollster::block_on(SphereKitSurface::new(
             Arc::clone(&window),
             window.physical_size(),
             window.scale_factor(),
-            SurfaceOptions::default(),
+            SurfaceOptions { transparent: true, ..SurfaceOptions::default() },
         )) {
             Ok(s) => {
                 let t = s.init_timing();
@@ -1187,6 +1220,9 @@ impl AppHandler for DesktopApp {
                 println!("init: gpu {:.0} ms, fonts {:.0} ms", t.gpu_ms, t.fonts_ms);
                 println!("chrome: {:?}", window.chrome());
                 self.surface = Some(s);
+                if let Some(surface) = self.surface.as_mut() {
+                    surface.set_theme(self.state.theme());
+                }
             }
             Err(e) => {
                 eprintln!("failed to create a GPU surface: {e}");
@@ -1266,6 +1302,14 @@ impl AppHandler for DesktopApp {
                 if let (Some(surface), Some(window)) = (self.surface.as_mut(), self.window.as_ref())
                 {
                     let _ = surface.resize(window.physical_size(), *scale);
+                }
+                self.draw();
+                return;
+            }
+            WindowEvent::ThemeChanged(theme) => {
+                self.state.system_theme.set(*theme);
+                if let Some(surface) = self.surface.as_mut() {
+                    surface.set_theme(self.state.theme());
                 }
                 self.draw();
                 return;
@@ -1372,7 +1416,7 @@ impl DesktopApp {
     fn draw(&mut self) {
         let moving = self.advance_motion();
         let root = self.build();
-        let clear = self.state.theme().colors.background;
+        let clear = Color::TRANSPARENT;
         let Some(surface) = self.surface.as_mut() else { return };
         match surface.render(root, clear) {
             Ok(Some(_)) => self.frames += 1,

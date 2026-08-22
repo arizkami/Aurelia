@@ -374,6 +374,25 @@ pub enum WindowChrome {
     None,
 }
 
+/// System material drawn behind a transparent window by the platform
+/// compositor.
+///
+/// On Windows this maps to the DWM system-backdrop attribute. Other platforms
+/// keep the transparent window and report the capability as unsupported, so an
+/// application can retain its renderer-side fallback without conditional UI
+/// code.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
+#[non_exhaustive]
+pub enum WindowBackdrop {
+    /// Remove a previously applied system material.
+    #[default]
+    None,
+    /// Windows Mica material for a main application window.
+    Mica,
+    /// Windows Desktop Acrylic material for transient surfaces.
+    Acrylic,
+}
+
 /// Which edge or corner a user-initiated resize grabs.
 ///
 /// Named to match the eight resize shapes in [`crate::Cursor`], so the two

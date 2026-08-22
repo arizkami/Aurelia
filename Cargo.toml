@@ -12,6 +12,8 @@ members = [
     "crates/spherekit-ui",
     "crates/spherekit-audio-ui",
     "crates/spherekit",
+    "crates/spherekit-jsengine",
+    "crates/spherekit-react",
 ]
 
 [workspace.package]
@@ -39,6 +41,8 @@ spherekit-audio-ui = { path = "crates/spherekit-audio-ui", version = "0.1.0" }
 bitflags   = "2.13"
 bytemuck   = { version = "1.25", features = ["derive"] }
 thiserror  = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tracing    = "0.1"
 smallvec   = "1.15"
 slotmap    = "1.0"

@@ -247,6 +247,14 @@ impl Element for Label {
         );
     }
 
+    fn paint_filter(&self) -> Option<spherekit_render::Filter> {
+        self.paint.filter
+    }
+
+    fn paint_opacity(&self) -> f32 {
+        self.paint.opacity
+    }
+
     fn semantics(&self) -> Option<crate::semantics::Semantics> {
         Some(crate::semantics::Semantics::new(crate::semantics::Role::Label, self.text.clone()))
     }

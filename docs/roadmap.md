@@ -144,14 +144,16 @@ parsing and `SvgError::Unsupported` is returned rather than handing back a silen
 | Inner shadow | Done |
 | Saturation filter | Done |
 | Multisample antialiasing for paths | Done — 4× by default, on the surface and every layer |
-| Gaussian blur shader | Written and validated, **not yet wired to the layer pipeline** |
-| Backdrop blur | Not started |
+| Gaussian blur | Done — separable two-pass layer filter |
+| Backdrop blur | Done — destination snapshot plus separable two-pass filter |
 | Colour matrix | Type exists, shader path not written |
 | Blend modes beyond fixed-function | Layers open correctly; the shader does not implement them |
 | Glow, bloom, mask, reflection, glass | Not started |
 
-`blur.wgsl` compiles and its pipeline builds — the GPU test covers it — but `SphereKitSurface` does not
-yet run the two-pass blur between a layer's render and its composite.
+`SphereKitSurface` runs the two-pass blur between a filtered layer's render and its composite.
+`BackdropBlur` snapshots the destination behind the layer first, then composites the original
+layer over that blurred backdrop. If the swapchain cannot be copied, the tint still renders and
+the backdrop sample is skipped gracefully.
 
 ## Definition of done for v0.1
 
@@ -190,11 +192,10 @@ yet run the two-pass blur between a layer's render and its composite.
    there is no regression harness.
 5. **More examples.** Two exist — a desktop settings window and a plug-in editor. Small focused
    examples for individual subsystems would still teach the pieces better.
-6. **Blur wiring.** The shader and pipeline exist and are GPU-validated; the pass is not run.
-7. **Remaining widgets.** Menu, tabs, tooltip, modal, list, tree.
-8. **Accessibility bridge.** Every element already reports role, value, state and actions. No
+6. **Remaining widgets.** Menu, tabs, tooltip, modal, list, tree.
+7. **Accessibility bridge.** Every element already reports role, value, state and actions. No
    platform bridge (UI Automation, AT-SPI, NSAccessibility) consumes them yet.
-9. **Golden-image tests.** Visual regressions are currently caught by eye.
+8. **Golden-image tests.** Visual regressions are currently caught by eye.
 
 ## Beyond v0.1
 

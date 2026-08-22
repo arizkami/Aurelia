@@ -33,12 +33,13 @@
 #![cfg(windows)]
 
 use super::nc::{self, FrameMetrics, HitTarget, MenuItemStates, RectI, ScreenEdge};
-use crate::window::{CaptionRegions, WindowChrome};
+use crate::window::{CaptionRegions, WindowBackdrop, WindowChrome};
 use spherekit_core::{Point, Px, Size};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::Shell::{
     ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETSTATE, ABM_GETTASKBARPOS, ABS_AUTOHIDE,
@@ -171,6 +172,66 @@ const fn mode_bits(chrome: WindowChrome) -> u8 {
         WindowChrome::Custom => 1,
         WindowChrome::None => 2,
     }
+}
+
+/// DWM attribute added in Windows 11 22000.
+const DWMWA_SYSTEM_BACKDROP_TYPE: u32 = 38;
+/// Legacy Mica attribute used by early Windows 11 builds.
+const DWMWA_MICA_EFFECT: u32 = 1029;
+const DWMSBT_NONE: u32 = 1;
+const DWMSBT_MAINWINDOW: u32 = 2;
+const DWMSBT_TRANSIENTWINDOW: u32 = 3;
+
+/// Applies the native compositor material behind a transparent client area.
+///
+/// The system-backdrop attribute is the supported Windows 11 path. The legacy
+/// Mica attribute is attempted only for Mica when the newer attribute is not
+/// available, which keeps older Windows 11 builds usable without affecting
+/// Acrylic's semantics.
+pub(crate) fn set_backdrop(hwnd: *mut core::ffi::c_void, backdrop: WindowBackdrop) -> bool {
+    let system_type = match backdrop {
+        WindowBackdrop::None => DWMSBT_NONE,
+        WindowBackdrop::Mica => DWMSBT_MAINWINDOW,
+        WindowBackdrop::Acrylic => DWMSBT_TRANSIENTWINDOW,
+    };
+    let result = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEM_BACKDROP_TYPE,
+            (&system_type as *const u32).cast(),
+            core::mem::size_of::<u32>() as u32,
+        )
+    };
+    if result >= 0 {
+        if backdrop == WindowBackdrop::None {
+            let disabled: i32 = 0;
+            // Clear the legacy flag as well. Some early Windows 11 builds keep
+            // it alive after a newer system-backdrop value is reset.
+            let _ = unsafe {
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_MICA_EFFECT,
+                    (&disabled as *const i32).cast(),
+                    core::mem::size_of::<i32>() as u32,
+                )
+            };
+        }
+        return true;
+    }
+
+    if backdrop == WindowBackdrop::Mica {
+        let enabled: i32 = 1;
+        let legacy = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_MICA_EFFECT,
+                (&enabled as *const i32).cast(),
+                core::mem::size_of::<i32>() as u32,
+            )
+        };
+        return legacy >= 0;
+    }
+    false
 }
 
 /// Frame thickness for a DPI.

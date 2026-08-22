@@ -28,7 +28,7 @@ use crate::keyboard::{
 };
 use crate::monitor::{MonitorInfo, MonitorList, RefreshRate, VideoMode};
 use crate::scheduler::ControlFlow;
-use crate::window::{WindowAttributes, WindowChrome, WindowLevel, WindowPosition};
+use crate::window::{WindowAttributes, WindowBackdrop, WindowChrome, WindowLevel, WindowPosition};
 
 /// How many SphereKit events one platform event can expand into.
 ///
@@ -324,7 +324,13 @@ pub(crate) fn translate_key_input(
     // Synthetic events are winit's reconstruction of keys already held when the
     // window gained focus. They keep a key-state map honest, but turning them
     // into text would insert characters the user typed into another window.
-    if state.is_pressed() && !is_synthetic {
+    // A shortcut such as Ctrl+A produces a logical character in winit too,
+    // but it must not become a second text event after the key event has been
+    // handled. Keep Ctrl+Alt available for AltGr layouts, where the same
+    // modifier chord is how users type characters such as `@`.
+    let shortcut_modifier = modifiers.contains(Modifiers::SUPER)
+        || (modifiers.contains(Modifiers::CTRL) && !modifiers.contains(Modifiers::ALT));
+    if state.is_pressed() && !is_synthetic && !shortcut_modifier {
         if let Some(text) = text.and_then(insertable_text) {
             out.push(WindowEvent::TextInput(text.to_owned()));
         }
@@ -936,6 +942,29 @@ impl Window {
         }
     }
 
+    /// Applies a platform compositor material behind a transparent window.
+    ///
+    /// Windows maps this to DWM Mica or Desktop Acrylic. Other platforms do
+    /// not silently pretend to provide the effect: they return an explicit
+    /// unsupported error and leave the renderer-side transparency intact.
+    pub fn set_backdrop(&self, backdrop: WindowBackdrop) -> Result<(), PlatformError> {
+        #[cfg(windows)]
+        {
+            let Some(hwnd) = self.hwnd() else {
+                return Err(PlatformError::Unsupported("system window backdrop"));
+            };
+            if super::ffi::set_backdrop(hwnd, backdrop) {
+                return Ok(());
+            }
+            return Err(PlatformError::Unsupported("system window backdrop"));
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = backdrop;
+            Err(PlatformError::Unsupported("system window backdrop"))
+        }
+    }
+
     /// Switches the frame at runtime.
     ///
     /// A window created with [`WindowChrome::System`] has no custom-frame
@@ -1295,6 +1324,24 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(out[1], WindowEvent::TextInput("a".into()));
+    }
+
+    #[test]
+    fn shortcut_key_presses_do_not_produce_a_second_text_event() {
+        for modifiers in [Modifiers::CTRL, Modifiers::CTRL | Modifiers::SHIFT, Modifiers::SUPER] {
+            let mut out = buf();
+            press("a", WKeyCode::KeyA, modifiers, &mut out);
+            assert_eq!(out.len(), 1, "shortcut modifiers must suppress text: {modifiers:?}");
+            assert!(matches!(out[0], WindowEvent::KeyboardInput { .. }));
+        }
+    }
+
+    #[test]
+    fn ctrl_alt_keeps_text_for_altgr_layouts() {
+        let mut out = buf();
+        press("@", WKeyCode::KeyQ, Modifiers::CTRL | Modifiers::ALT, &mut out);
+        assert_eq!(out.len(), 2, "AltGr must remain a text-producing chord");
+        assert_eq!(out[1], WindowEvent::TextInput("@".into()));
     }
 
     #[test]

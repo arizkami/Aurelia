@@ -1,0 +1,22 @@
+{
+  "name": "@spherekit/react",
+  "version": "0.1.0",
+  "module": "index.tsx",
+  "type": "module",
+  "private": false,
+  "license": "BSD-3-Clause",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "react": "^19.1.1",
+    "react-reconciler": "^0.33.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/react": "^19.1.8",
+    "@types/react-reconciler": "^0.33.0",
+    "typescript": "^5.9.3"
+  }
+}

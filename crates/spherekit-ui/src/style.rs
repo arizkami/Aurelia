@@ -9,7 +9,7 @@
 use crate::element::InteractionState;
 use smallvec::SmallVec;
 use spherekit_core::{Brush, Color, Corners, Px, Rect, RoundedRect, Shadow};
-use spherekit_render::Canvas;
+use spherekit_render::{Canvas, Filter};
 
 /// The pointer shape shown over an element.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
@@ -64,6 +64,11 @@ pub struct PaintStyle {
     pub shadows: SmallVec<[Shadow; 2]>,
     /// Opacity multiplier for this element and its children.
     pub opacity: f32,
+    /// Optional post-process for this element and its subtree.
+    ///
+    /// The tree turns this into an offscreen layer only when it is present;
+    /// ordinary boxes keep the direct-to-parent fast path.
+    pub filter: Option<Filter>,
     /// Clips children to this element's box.
     pub clip_content: bool,
     /// Cursor while the pointer is over this element.
@@ -89,6 +94,7 @@ impl Default for PaintStyle {
             corner_radii: Corners::ZERO,
             shadows: SmallVec::new(),
             opacity: 1.0,
+            filter: None,
             clip_content: false,
             cursor: None,
             hover_background: None,
@@ -125,6 +131,7 @@ impl PaintStyle {
         self.opacity <= 0.0
             || (self.background.is_none()
                 && self.shadows.is_empty()
+                && self.filter.is_none()
                 && (self.border_width <= Px::ZERO || self.border_color.is_transparent())
                 && self.focus_ring.is_none())
     }

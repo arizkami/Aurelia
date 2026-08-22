@@ -611,10 +611,10 @@ impl ValueControl {
         }
     }
 
-    /// How far a full-travel drag is, in logical pixels.
+    /// How far a full-travel knob drag is, in logical pixels.
     ///
-    /// Roughly the height of a channel strip, which is the distance a hand
-    /// moves comfortably in one gesture.
+    /// Sliders and faders use their actual track length; a knob has no linear
+    /// track, so it keeps a comfortable gesture distance instead.
     const TRAVEL_PX: f32 = 180.0;
 
     /// Gives the control a stable identity, which it needs to keep its drag
@@ -994,7 +994,17 @@ impl Element for ValueControl {
                     _ => origin - e.position.y.get(),
                 };
                 let sensitivity = if e.modifiers.shift { 0.2 } else { 1.0 };
-                let delta = travel / Self::TRAVEL_PX * self.span() * sensitivity;
+                let travel_px = match self.shape {
+                    // Pointer positions and bounds are both logical pixels.
+                    // Using the control's actual travel keeps a 10 px drag on
+                    // a wide slider small instead of scaling it against the
+                    // knob's fixed 180 px gesture distance.
+                    ValueShape::HorizontalSlider => cx.bounds.width().get(),
+                    ValueShape::VerticalFader => cx.bounds.height().get(),
+                    ValueShape::Knob => Self::TRAVEL_PX,
+                }
+                .max(1.0);
+                let delta = travel / travel_px * self.span() * sensitivity;
                 self.emit(start_value + delta);
                 cx.notify();
                 EventFlow::Stop
@@ -1464,6 +1474,20 @@ mod tests {
         // The slider fills the 400 px viewport; a click at x = 100 is a quarter.
         tree.dispatch(&press_at(100.0, 10.0, 1));
         assert!((value.get() - 25.0).abs() < 1.0, "expected about 25, got {}", value.get());
+    }
+
+    #[test]
+    fn a_short_slider_drag_uses_the_actual_track_length() {
+        let value = Rc::new(Cell::new(0.0f32));
+        let v = value.clone();
+        let mut tree =
+            mount(slider(0.0).id("s").range(0.0, 1.0).on_change(move |x| v.set(x)).into_element());
+
+        // The mounted slider is 400 px wide. A 10 px drag from the midpoint
+        // should move by 10/400, not 10/180 as the knob gesture did before.
+        tree.dispatch(&press_at(200.0, 10.0, 1));
+        tree.dispatch(&drag_to(210.0, 10.0, false));
+        assert!((value.get() - 0.525).abs() < 0.001, "got {}", value.get());
     }
 
     #[test]

@@ -52,6 +52,17 @@ struct CompositeUniforms {
     _pad: f32,
 }
 
+/// Uniforms for one separable Gaussian blur pass.
+#[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct BlurUniforms {
+    texel: [f32; 2],
+    direction: [f32; 2],
+    sigma: f32,
+    radius: i32,
+    _pad: [f32; 2],
+}
+
 /// An offscreen render target, pooled across frames.
 struct LayerTarget {
     texture: wgpu::Texture,
@@ -62,6 +73,7 @@ struct LayerTarget {
     /// be sampled, so the layer needs both: render into `msaa`, resolve into
     /// `texture`, sample `texture`.
     msaa: Option<(wgpu::Texture, wgpu::TextureView)>,
+    format: wgpu::TextureFormat,
     size: (u32, u32),
     /// Frame index this target was last used on, so stale sizes can be reaped.
     last_used: u64,
@@ -97,6 +109,7 @@ pub struct WgpuRenderer {
     gradient_buffer: GrowableBuffer,
     pass_uniform_buffer: GrowableBuffer,
     composite_uniform_buffer: GrowableBuffer,
+    blur_uniform_buffer: GrowableBuffer,
 
     frame_bind_group: Option<wgpu::BindGroup>,
     /// Rebuilt whenever a table buffer is reallocated.
@@ -115,6 +128,25 @@ pub struct WgpuRenderer {
     pending_surface: Option<wgpu::SurfaceTexture>,
     last_stats: FrameStats,
     uniform_alignment: u64,
+    /// Whether the acquired surface texture can be copied for backdrop blur.
+    surface_copy_src: bool,
+}
+
+/// Scratch targets and uniforms for one filter operation.
+#[derive(Copy, Clone)]
+struct FilterWork {
+    source: usize,
+    horizontal: usize,
+    vertical: usize,
+    format: wgpu::TextureFormat,
+    h_uniform: usize,
+    v_uniform: usize,
+    /// Whether the filtered target replaces the layer being composited.
+    /// Backdrop blur keeps the original layer and only changes its destination.
+    replace_source: bool,
+    /// Destination texture region for a backdrop copy, in device pixels.
+    /// `None` means the source is already the layer being filtered.
+    region: Option<(u32, u32, u32, u32)>,
 }
 
 impl WgpuRenderer {
@@ -201,10 +233,13 @@ impl WgpuRenderer {
         let format = pick_surface_format(&caps);
         let alpha_mode = pick_alpha_mode(&caps, transparent);
         let present_mode = pick_present_mode(&caps, vsync);
+        let surface_copy_src = caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
+        let surface_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | caps.usages.intersection(wgpu::TextureUsages::COPY_SRC);
 
         let (w, h) = (size.width.as_u32().max(1), size.height.as_u32().max(1));
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: surface_usage,
             format,
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: w,
@@ -329,6 +364,12 @@ impl WgpuRenderer {
                 wgpu::BufferUsages::UNIFORM,
                 4 * 1024,
             ),
+            blur_uniform_buffer: GrowableBuffer::new(
+                &device,
+                "spherekit.blur_uniforms",
+                wgpu::BufferUsages::UNIFORM,
+                4 * 1024,
+            ),
             device,
             queue,
             surface,
@@ -350,6 +391,7 @@ impl WgpuRenderer {
             pending_surface: None,
             last_stats: FrameStats::default(),
             uniform_alignment,
+            surface_copy_src,
         })
     }
 
@@ -563,9 +605,31 @@ impl WgpuRenderer {
 
     /// Acquires an offscreen target of the requested size from the pool.
     fn acquire_layer(&mut self, width: u32, height: u32) -> usize {
+        self.acquire_target(width, height, LAYER_FORMAT, true)
+    }
+
+    /// Acquires a plain, sampleable target used by a post-process pass.
+    fn acquire_filter_target(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> usize {
+        self.acquire_target(width, height, format, false)
+    }
+
+    fn acquire_target(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        multisampled: bool,
+    ) -> usize {
         let (w, h) = (width.max(1), height.max(1));
-        if let Some(i) =
-            self.layer_pool.iter().position(|t| t.size == (w, h) && t.last_used != self.frame_index)
+        if let Some(i) = self
+            .layer_pool
+            .iter()
+            .position(|t| t.size == (w, h) && t.format == format && t.last_used != self.frame_index)
         {
             self.layer_pool[i].last_used = self.frame_index;
             return i;
@@ -576,17 +640,21 @@ impl WgpuRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: LAYER_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let msaa = (self.samples > 1)
-            .then(|| Self::create_msaa(&self.device, LAYER_FORMAT, w, h, self.samples));
+        let msaa = (multisampled && self.samples > 1)
+            .then(|| Self::create_msaa(&self.device, format, w, h, self.samples));
         self.layer_pool.push(LayerTarget {
             texture,
             view,
             msaa,
+            format,
             size: (w, h),
             last_used: self.frame_index,
         });
@@ -754,11 +822,121 @@ impl RendererBackend for WgpuRenderer {
         let surface_format = self.surface_config.format;
         let samples = self.samples;
         self.ensure_surface_msaa();
+        let passes: Vec<&Pass> = compiled.passes.iter().collect();
         let pass_stride =
             align_up(core::mem::size_of::<PassUniforms>() as u64, self.uniform_alignment) as u32;
         let composite_stride =
             align_up(core::mem::size_of::<CompositeUniforms>() as u64, self.uniform_alignment)
                 as u32;
+
+        // Reserve filter targets and pack all blur uniforms before encoding any
+        // passes. A blur target cannot alias its source, and a uniform buffer
+        // write made after a bind group is recorded would otherwise overwrite
+        // the parameters of an earlier pass.
+        let mut filter_work: Vec<Option<FilterWork>> = vec![None; passes.len()];
+        let mut blur_uniforms = Vec::new();
+        for (pass_index, pass) in passes.iter().enumerate() {
+            let Some(composite) = &pass.composite else { continue };
+            let Some(filter) = composite.filter else { continue };
+            let source_slot = layer_slots[composite.source as usize].expect("filter source");
+            match filter {
+                Filter::Blur { sigma } => {
+                    let (w, h) = self.layer_pool[source_slot].size;
+                    let horizontal = self.acquire_filter_target(w, h, LAYER_FORMAT);
+                    let vertical = self.acquire_filter_target(w, h, LAYER_FORMAT);
+                    let h_uniform = blur_uniforms.len();
+                    blur_uniforms.push(make_blur_uniform(
+                        sigma,
+                        compiled.uniforms.scale_factor,
+                        w,
+                        h,
+                        [1.0, 0.0],
+                    ));
+                    let v_uniform = blur_uniforms.len();
+                    blur_uniforms.push(make_blur_uniform(
+                        sigma,
+                        compiled.uniforms.scale_factor,
+                        w,
+                        h,
+                        [0.0, 1.0],
+                    ));
+                    filter_work[pass_index] = Some(FilterWork {
+                        source: source_slot,
+                        horizontal,
+                        vertical,
+                        format: LAYER_FORMAT,
+                        h_uniform,
+                        v_uniform,
+                        replace_source: true,
+                        region: None,
+                    });
+                }
+                Filter::BackdropBlur { sigma } => {
+                    let destination = compiled
+                        .targets
+                        .get(composite.destination as usize)
+                        .expect("backdrop destination");
+                    let destination_is_surface = destination.is_surface;
+                    if destination_is_surface && !self.surface_copy_src {
+                        // Some swapchains do not expose COPY_SRC. Keep the
+                        // translucent Mica tint functional and skip only the
+                        // backdrop sampling on those platforms.
+                        continue;
+                    }
+                    let Some((x, y, w, h)) = target_region(
+                        composite.bounds,
+                        destination,
+                        compiled.uniforms.scale_factor,
+                    ) else {
+                        continue;
+                    };
+                    let format = if destination_is_surface { surface_format } else { LAYER_FORMAT };
+                    let source = self.acquire_filter_target(w, h, format);
+                    let horizontal = self.acquire_filter_target(w, h, format);
+                    let vertical = self.acquire_filter_target(w, h, format);
+                    let h_uniform = blur_uniforms.len();
+                    blur_uniforms.push(make_blur_uniform(
+                        sigma,
+                        compiled.uniforms.scale_factor,
+                        w,
+                        h,
+                        [1.0, 0.0],
+                    ));
+                    let v_uniform = blur_uniforms.len();
+                    blur_uniforms.push(make_blur_uniform(
+                        sigma,
+                        compiled.uniforms.scale_factor,
+                        w,
+                        h,
+                        [0.0, 1.0],
+                    ));
+                    filter_work[pass_index] = Some(FilterWork {
+                        source,
+                        horizontal,
+                        vertical,
+                        format,
+                        h_uniform,
+                        v_uniform,
+                        replace_source: false,
+                        region: Some((x, y, w, h)),
+                    });
+                }
+                Filter::ColorMatrix(_) | Filter::Saturate(_) => {}
+            }
+        }
+
+        if !blur_uniforms.is_empty() {
+            let blur_stride =
+                align_up(core::mem::size_of::<BlurUniforms>() as u64, self.uniform_alignment)
+                    as usize;
+            let mut blur_data = vec![0u8; blur_stride * blur_uniforms.len()];
+            for (index, uniform) in blur_uniforms.iter().enumerate() {
+                let offset = index * blur_stride;
+                blur_data[offset..offset + core::mem::size_of::<BlurUniforms>()]
+                    .copy_from_slice(bytemuck::bytes_of(uniform));
+            }
+            self.blur_uniform_buffer.write_bytes(&self.device, &self.queue, &blur_data);
+        }
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("spherekit.frame"),
@@ -770,7 +948,6 @@ impl RendererBackend for WgpuRenderer {
 
         // If the scene produced no passes at all, still clear the surface so a
         // window does not show uninitialised memory.
-        let passes: Vec<&Pass> = compiled.passes.iter().collect();
         if passes.is_empty() {
             let (attach, resolve) = match self.surface_msaa.as_ref() {
                 Some((_, msaa_view, _)) => (msaa_view, Some(&surface_view)),
@@ -830,6 +1007,9 @@ impl RendererBackend for WgpuRenderer {
                         PipelineKey { kind: PipelineKind::Composite, format, samples },
                     )
                     .map_err(RenderError::Shader)?;
+            }
+            if let Some(work) = filter_work[pass_index] {
+                self.pipelines.blur(&self.device, work.format).map_err(RenderError::Shader)?;
             }
 
             {
@@ -953,6 +1133,106 @@ impl RendererBackend for WgpuRenderer {
                 }
             }
 
+            if let Some(work) = filter_work[pass_index] {
+                if let Some((x, y, w, h)) = work.region {
+                    let destination_index =
+                        pass.composite.as_ref().expect("filter composite").destination as usize;
+                    let destination =
+                        compiled.targets.get(destination_index).expect("backdrop destination");
+                    let destination_slot = if destination.is_surface {
+                        None
+                    } else {
+                        Some(layer_slots[destination_index].expect("backdrop target slot"))
+                    };
+                    let destination_texture = match destination_slot {
+                        Some(slot) => &self.layer_pool[slot].texture,
+                        None => {
+                            &self
+                                .pending_surface
+                                .as_ref()
+                                .expect("surface texture for backdrop")
+                                .texture
+                        }
+                    };
+                    encoder.copy_texture_to_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: destination_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d { x, y, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &self.layer_pool[work.source].texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    );
+                }
+
+                let blur_stride =
+                    align_up(core::mem::size_of::<BlurUniforms>() as u64, self.uniform_alignment);
+                for (source, target, uniform_index) in [
+                    (work.source, work.horizontal, work.h_uniform),
+                    (work.horizontal, work.vertical, work.v_uniform),
+                ] {
+                    let blur_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("spherekit.blur_bind"),
+                        layout: &self.pipelines.layouts().blur,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &self.layer_pool[source].view,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: self.blur_uniform_buffer.raw(),
+                                    offset: uniform_index as u64 * blur_stride,
+                                    size: core::num::NonZeroU64::new(core::mem::size_of::<
+                                        BlurUniforms,
+                                    >(
+                                    )
+                                        as u64),
+                                }),
+                            },
+                        ],
+                    });
+                    let blur_pipeline = self
+                        .pipelines
+                        .blur(&self.device, work.format)
+                        .map_err(RenderError::Shader)?;
+                    let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("spherekit.blur"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &self.layer_pool[target].view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    rp.set_pipeline(blur_pipeline);
+                    rp.set_bind_group(0, &blur_bind, &[]);
+                    rp.draw(0..3, 0..1);
+                    draw_calls += 1;
+                    pipeline_switches += 1;
+                }
+            }
+
             if let Some(c) = &pass.composite {
                 let dest_is_surface = compiled
                     .targets
@@ -960,88 +1240,116 @@ impl RendererBackend for WgpuRenderer {
                     .map(|t| t.is_surface)
                     .unwrap_or(true);
                 let dest_format = if dest_is_surface { surface_format } else { LAYER_FORMAT };
-                let source_slot = layer_slots[c.source as usize].expect("composite source");
+                let original_source = layer_slots[c.source as usize].expect("composite source");
+                let backdrop_source = filter_work[pass_index]
+                    .filter(|work| !work.replace_source)
+                    .map(|work| work.vertical);
+                let source_slot = filter_work[pass_index]
+                    .filter(|work| work.replace_source)
+                    .map(|work| work.vertical)
+                    .unwrap_or(original_source);
 
-                let composite_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("spherekit.composite_bind"),
-                    layout: &self.pipelines.layouts().composite,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(
-                                &self.layer_pool[source_slot].view,
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: self.composite_uniform_buffer.raw(),
-                                offset: 0,
-                                size: core::num::NonZeroU64::new(core::mem::size_of::<
-                                    CompositeUniforms,
-                                >()
-                                    as u64),
-                            }),
-                        },
-                    ],
-                });
+                // Backdrop blur is a destination effect: first replace the
+                // destination region with its blurred snapshot, then place
+                // the layer's own transparent content over it. Reusing the
+                // same composite uniform keeps both passes in one dynamic
+                // slot; only the texture changes.
+                let source_slots = [backdrop_source, Some(source_slot)];
+                for (composite_pass, source_slot) in source_slots.into_iter().flatten().enumerate()
+                {
+                    let composite_bind =
+                        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("spherekit.composite_bind"),
+                            layout: &self.pipelines.layouts().composite,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(
+                                        &self.layer_pool[source_slot].view,
+                                    ),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                        buffer: self.composite_uniform_buffer.raw(),
+                                        offset: 0,
+                                        size: core::num::NonZeroU64::new(core::mem::size_of::<
+                                            CompositeUniforms,
+                                        >(
+                                        )
+                                            as u64),
+                                    }),
+                                },
+                            ],
+                        });
 
-                let pipeline = self
-                    .pipelines
-                    .get(
-                        &self.device,
-                        PipelineKey { kind: PipelineKind::Composite, format: dest_format, samples },
-                    )
-                    .map_err(RenderError::Shader)?;
+                    let pipeline = self
+                        .pipelines
+                        .get(
+                            &self.device,
+                            PipelineKey {
+                                kind: PipelineKind::Composite,
+                                format: dest_format,
+                                samples,
+                            },
+                        )
+                        .map_err(RenderError::Shader)?;
 
-                let (dest_attach, dest_resolve) = if dest_is_surface {
-                    match self.surface_msaa.as_ref() {
-                        Some((_, msaa_view, _)) => (msaa_view, Some(&surface_view)),
-                        None => (&surface_view, None),
-                    }
-                } else {
-                    let slot = layer_slots[c.destination as usize].expect("composite destination");
-                    let target = &self.layer_pool[slot];
-                    match target.msaa.as_ref() {
-                        Some((_, msaa_view)) => (msaa_view, Some(&target.view)),
-                        None => (&target.view, None),
-                    }
-                };
+                    let (dest_attach, dest_resolve) = if dest_is_surface {
+                        match self.surface_msaa.as_ref() {
+                            Some((_, msaa_view, _)) => (msaa_view, Some(&surface_view)),
+                            None => (&surface_view, None),
+                        }
+                    } else {
+                        let slot =
+                            layer_slots[c.destination as usize].expect("composite destination");
+                        let target = &self.layer_pool[slot];
+                        match target.msaa.as_ref() {
+                            Some((_, msaa_view)) => (msaa_view, Some(&target.view)),
+                            None => (&target.view, None),
+                        }
+                    };
 
-                // Find which pass writes the destination next so the dynamic
-                // offset matches that target's uniforms, not this layer's.
-                let dest_pass =
-                    passes.iter().position(|p| p.target == c.destination).unwrap_or(0) as u32;
+                    // Find which pass writes the destination next so the
+                    // dynamic offset matches that target's uniforms, not this
+                    // layer's.
+                    let dest_pass =
+                        passes.iter().position(|p| p.target == c.destination).unwrap_or(0) as u32;
 
-                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("spherekit.composite"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: dest_attach,
-                        depth_slice: None,
-                        resolve_target: dest_resolve,
-                        ops: wgpu::Operations {
-                            // Never clear: the destination already holds the
-                            // content this layer composites on top of.
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                rp.set_pipeline(pipeline);
-                let frame_bind = self.frame_bind_group.as_ref().expect("frame bind group");
-                rp.set_bind_group(0, frame_bind, &[dest_pass * pass_stride]);
-                rp.set_bind_group(1, &composite_bind, &[composite_index * composite_stride]);
-                rp.draw(0..4, 0..1);
-                draw_calls += 1;
-                pipeline_switches += 1;
+                    let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some(if backdrop_source.is_some() && composite_pass == 0 {
+                            "spherekit.backdrop_composite"
+                        } else {
+                            "spherekit.composite"
+                        }),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: dest_attach,
+                            depth_slice: None,
+                            resolve_target: dest_resolve,
+                            ops: wgpu::Operations {
+                                // Never clear: the destination already holds
+                                // the content this layer composites on top of.
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    rp.set_pipeline(pipeline);
+                    let frame_bind = self.frame_bind_group.as_ref().expect("frame bind group");
+                    rp.set_bind_group(0, frame_bind, &[dest_pass * pass_stride]);
+                    rp.set_bind_group(1, &composite_bind, &[composite_index * composite_stride]);
+                    rp.draw(0..4, 0..1);
+                    draw_calls += 1;
+                    pipeline_switches += 1;
+                }
                 composite_index += 1;
             }
         }
@@ -1125,6 +1433,44 @@ impl RendererBackend for WgpuRenderer {
             + self.gradient_buffer.capacity()
             + self.layer_pool.iter().map(|t| (t.size.0 as u64) * (t.size.1 as u64) * 4).sum::<u64>()
     }
+}
+
+fn make_blur_uniform(
+    sigma: spherekit_core::Px,
+    scale: f32,
+    width: u32,
+    height: u32,
+    direction: [f32; 2],
+) -> BlurUniforms {
+    let sigma = (sigma.get().max(0.0) * scale.max(1e-3)).max(1e-3);
+    let radius = (sigma * 3.0).ceil().clamp(1.0, 32.0) as i32;
+    BlurUniforms {
+        texel: [1.0 / width.max(1) as f32, 1.0 / height.max(1) as f32],
+        direction,
+        sigma,
+        radius,
+        _pad: [0.0; 2],
+    }
+}
+
+/// Resolves a scene-space rectangle into a clamped region of a render target.
+fn target_region(
+    bounds: spherekit_core::Rect<spherekit_core::Px>,
+    target: &spherekit_render::RenderTarget,
+    scale: f32,
+) -> Option<(u32, u32, u32, u32)> {
+    let scale = scale.max(1e-3);
+    let origin = target.origin;
+    let x0 = ((bounds.min_x().get() - origin.x.get()) * scale).floor().max(0.0) as u32;
+    let y0 = ((bounds.min_y().get() - origin.y.get()) * scale).floor().max(0.0) as u32;
+    let x1 = ((bounds.max_x().get() - origin.x.get()) * scale).ceil().max(0.0) as u32;
+    let y1 = ((bounds.max_y().get() - origin.y.get()) * scale).ceil().max(0.0) as u32;
+    let x0 = x0.min(target.size.width.as_u32());
+    let y0 = y0.min(target.size.height.as_u32());
+    let x1 = x1.min(target.size.width.as_u32());
+    let y1 = y1.min(target.size.height.as_u32());
+    let (width, height) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+    (width > 0 && height > 0).then_some((x0, y0, width, height))
 }
 
 fn pipeline_kind_for(batch: &Batch) -> PipelineKind {
