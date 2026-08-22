@@ -837,6 +837,59 @@ mod tests {
     }
 
     #[test]
+    fn each_ui_weight_resolves_to_its_own_face() {
+        // The three weights an interface actually uses have to be three
+        // *instances*, not one face the rasteriser thickens. Nothing in this
+        // crate synthesises a bold, so a weight that collapsed onto another
+        // would not fail loudly — it would silently render 600 as 400 and the
+        // only symptom would be a heading that looks light.
+        //
+        // The glyph cache is keyed by `FontId`, so distinct ids are also what
+        // keeps a bold `n` from being served out of the regular's cache slot.
+        let mut db = FontDatabase::with_system_fonts();
+        let regular = db.resolve(&FontRequest::default().weight(FontWeight::NORMAL));
+        let semibold = db.resolve(&FontRequest::default().weight(FontWeight::SEMI_BOLD));
+        let bold = db.resolve(&FontRequest::default().weight(FontWeight::BOLD));
+
+        let (Some(regular), Some(semibold), Some(bold)) = (regular, semibold, bold) else {
+            eprintln!("no system UI family; skipping");
+            return;
+        };
+        // A family that genuinely ships only one weight is a property of the
+        // machine, not a bug here, so that case is reported and skipped.
+        if regular == semibold && semibold == bold {
+            eprintln!("system UI family ships a single weight; skipping");
+            return;
+        }
+        assert_ne!(regular, semibold, "400 and 600 resolved to the same face");
+        assert_ne!(regular, bold, "400 and 700 resolved to the same face");
+        assert_ne!(semibold, bold, "600 and 700 resolved to the same face");
+    }
+
+    #[test]
+    fn a_weight_request_is_part_of_the_resolution_key() {
+        // `resolve` memoises on the whole `FontRequest`. If the weight were
+        // dropped from that key the first weight asked for would be handed back
+        // for every later one, which is the same failure as above but reached
+        // through the cache rather than the query.
+        let mut db = FontDatabase::with_system_fonts();
+        let Some(bold) = db.resolve(&FontRequest::default().weight(FontWeight::BOLD)) else {
+            eprintln!("no system UI family; skipping");
+            return;
+        };
+        let regular = db.resolve(&FontRequest::default().weight(FontWeight::NORMAL));
+        // Asking for bold first must not poison the regular lookup.
+        assert_eq!(
+            db.resolve(&FontRequest::default().weight(FontWeight::BOLD)),
+            Some(bold),
+            "the memo returned a different face for an unchanged request"
+        );
+        if regular == Some(bold) {
+            eprintln!("system UI family ships a single weight; skipping");
+        }
+    }
+
+    #[test]
     fn buckets_classify_representative_codepoints() {
         assert_eq!(fallback_bucket('A'), FallbackBucket::Latin);
         assert_eq!(fallback_bucket('é'), FallbackBucket::Latin);

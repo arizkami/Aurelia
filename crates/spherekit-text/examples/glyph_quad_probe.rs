@@ -317,12 +317,21 @@ fn compare_raster(
     scale: f32,
     ink: Ink,
 ) {
+    // `SPHEREKIT_PROBE_SUBPIXEL=0` models the path a *transparent* window takes.
+    // Every Mica window is one, and `SurfaceOptions::transparent` switches RGB
+    // coverage off outright — so this is not a hypothetical, it is what the
+    // shipping shell renders. Leaving the probe unable to express it is how the
+    // grayscale case went unmeasured.
+    let allow_subpixel = env("SPHEREKIT_PROBE_SUBPIXEL").as_deref() != Some("0");
     let panels = [
         place(text, line, TextRasterMode::Mtsdf, false, scale),
-        place(text, line, TextRasterMode::Auto, true, scale),
+        place(text, line, TextRasterMode::Auto, allow_subpixel, scale),
     ];
     let subpixel_glyphs = panels[1].iter().filter(|(_, p)| p.is_subpixel).count();
-    println!("subpixel:       {subpixel_glyphs} RGB glyphs in the right panel");
+    println!(
+        "subpixel:       {subpixel_glyphs} RGB glyphs in the right panel{}",
+        if allow_subpixel { "" } else { "  (disabled: modelling a transparent window)" }
+    );
     let width = (line.width.get() * scale).ceil() as usize + PAD * 2;
     let height = (baseline * 2.0).ceil() as usize + PAD * 2;
 
