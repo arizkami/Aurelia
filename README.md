@@ -114,6 +114,28 @@ cargo clippy --workspace --all-targets --all-features
 > on-access antivirus scanning, and visible as `did not finalize incremental compilation session
 > directory ... Access is denied (os error 5)`. Set `CARGO_INCREMENTAL=0` for the run.
 
+### SphereKit CLI and React apps
+
+The workspace includes a portable `spherekit` CLI for creating and building a
+React + Rust app. Install it from a checkout or run it through Cargo:
+
+```bash
+cargo install --path crates/spherekit-cli
+spherekit react my-app --target current
+cd my-app
+spherekit build --release
+```
+
+`spherekit react` accepts `windows`, `macos`, `linux`, or an explicit Rust
+target triple. `spherekit build` runs the React typecheck/compile and the native
+Cargo build together; `--dry-run`, `--no-react`, `--no-rust`, and `--out-dir`
+are available for CI and cross-compilation workflows.
+
+The React package and native host communicate through the `spherekit-bridge`
+JSON Lines protocol. It supports committed trees, request/response API calls,
+and native events, while leaving the underlying transport open to WebView, FFI,
+child process, or socket integrations.
+
 ## Status
 
 Measured on an NVIDIA GTX 1060 (Vulkan), running
@@ -167,6 +189,7 @@ measured, which makes them usable as smoke tests.
 | [`docs/audio-ui.md`](docs/audio-ui.md) | The audio-thread boundary and realtime primitives |
 | [`docs/platform.md`](docs/platform.md) | Windowing, HiDPI, plug-in embedding, frame scheduling |
 | [`docs/performance.md`](docs/performance.md) | Targets, what is measured, and how |
+| [`docs/api-bridge.md`](docs/api-bridge.md) | React/native JSON Lines API and event bridge |
 | [`docs/roadmap.md`](docs/roadmap.md) | Phase status and what is not built yet |
 
 ## Licence

@@ -1,13 +1,14 @@
 {
-  "name": "spherekit-app-react",
+  "name": "{{PROJECT_NAME}}",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json"
   },
   "dependencies": {
-    "@spherekit/react": "^0.1.0",
+    "@spherekit/react": {{SPHEREKIT_REACT_NPM_DEP}},
     "react": "^19.2.8"
   },
   "devDependencies": {

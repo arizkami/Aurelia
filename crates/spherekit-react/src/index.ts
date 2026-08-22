@@ -1,5 +1,12 @@
 export { createRoot, type ReactRoot } from "./renderer";
 export {
+  API_BRIDGE_VERSION,
+  ApiBridgeError,
+  createApiBridge,
+  type ApiBridgeTransport,
+  type SphereKitApiBridge,
+} from "./bridge";
+export {
   Button,
   ScrollView,
   Slider,
@@ -14,6 +21,7 @@ export {
 export {
   jsonBridge,
   type NativeBridge,
+  type NativeEvent,
   type NativeNodeSnapshot,
   type NativeProps,
   type NativeTreeSnapshot,

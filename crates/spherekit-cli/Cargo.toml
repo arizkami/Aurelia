@@ -1,0 +1,16 @@
+[package]
+name = "spherekit-cli"
+description = "Project scaffolding and cross-platform build CLI for SphereKit React apps."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "spherekit"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true

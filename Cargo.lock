@@ -1951,6 +1951,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "spherekit-bridge"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "spherekit-react",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "spherekit-cli"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "spherekit-core"
 version = "0.1.0"
 dependencies = [

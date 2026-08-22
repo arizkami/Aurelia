@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { Button, Slider, Text, View, createRoot, jsonBridge } from "../src/index";
-import type { NativeTreeSnapshot } from "../src/types";
+import { Button, Slider, Text, View, createApiBridge, createRoot, jsonBridge } from "../src/index";
+import type { NativeEvent, NativeTreeSnapshot } from "../src/types";
 
 describe("SphereKit React renderer", () => {
   it("commits the React Native-like JSX tree after render", () => {
@@ -38,5 +38,50 @@ describe("SphereKit React renderer", () => {
     const snapshot = JSON.parse(json) as NativeTreeSnapshot;
     expect(snapshot.children[0]?.type).toBe("text");
     expect(snapshot.children[0]?.children[0]?.text).toBe("Rust boundary");
+  });
+
+  it("routes native events back to React callbacks by node id", () => {
+    const listeners: Array<(event: NativeEvent) => void> = [];
+    let pressed = 0;
+    let buttonId = 0;
+    const root = createRoot({
+      commit(snapshot) {
+        buttonId = snapshot.children[0]?.id ?? 0;
+      },
+      onEvent(listener) {
+        listeners.push(listener);
+        return () => {};
+      },
+    });
+
+    root.render(<Button title="Play" onPress={() => pressed++} />);
+    root.dispatch({ event: "press", nodeId: buttonId });
+    listeners[0]?.({ event: "press", nodeId: buttonId });
+
+    expect(pressed).toBe(2);
+  });
+
+  it("supports request/response API calls on the same bridge", async () => {
+    let receive: ((message: string) => void) | undefined;
+    const sent: string[] = [];
+    const bridge = createApiBridge({
+      send(message) {
+        sent.push(message);
+        const request = JSON.parse(message) as { kind: string; id?: string };
+        if (request.kind === "invoke" && request.id) {
+          receive?.(JSON.stringify({ kind: "response", id: request.id, ok: true, result: { ready: true } }));
+        }
+      },
+      subscribe(listener) {
+        receive = listener;
+        return () => {};
+      },
+    });
+
+    const result = await bridge.invoke<{ ready: boolean }>("app.status");
+    expect(result.ready).toBe(true);
+    expect(sent[0]?.endsWith("\n")).toBe(true);
+    expect(JSON.parse(sent[0] ?? "{}").kind).toBe("hello");
+    expect(JSON.parse(sent[1] ?? "{}").kind).toBe("invoke");
   });
 });

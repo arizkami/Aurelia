@@ -1,7 +1,7 @@
-node_modules
-target
-dist
-out
+node_modules/
+dist/
+target/
+out/
 *.tsbuildinfo
 .DS_Store
 .idea

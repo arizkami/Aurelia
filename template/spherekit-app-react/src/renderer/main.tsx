@@ -1,14 +1,12 @@
-import { createRoot, jsonBridge, type ReactRoot } from "@spherekit/react";
+import { createApiBridge, createRoot, type ApiBridgeTransport, type ReactRoot } from "@spherekit/react";
 import { App } from "./App";
 
-/** The Rust object exposed to the renderer by the native bootstrap. */
-export interface RustReactHost {
-  commitJson(snapshot: string): void;
-}
+/** The transport exposed by the Rust/native bootstrap. */
+export type RustReactHost = ApiBridgeTransport;
 
-/** Mounts the renderer into a Rust-owned SphereKit host. */
+/** Mounts the renderer into a Rust-owned SphereKit API Bridge. */
 export function mountSphereKitReact(host: RustReactHost): ReactRoot {
-  const root = createRoot(jsonBridge((snapshot) => host.commitJson(snapshot)));
+  const root = createRoot(createApiBridge(host));
   root.render(<App />);
   return root;
 }

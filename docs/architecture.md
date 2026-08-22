@@ -95,9 +95,14 @@ redesigning anything above it.
 | `spherekit-ui` | Elements, events, focus, widgets | core, render, layout, text, platform |
 | `spherekit-audio-ui` | Meters, waveforms, spectrums, lock-free transfer | core, render, ui |
 | `spherekit` | Facade | all |
+| `spherekit-react` | React host tree and native lowering | ui, core |
+| `spherekit-bridge` | JSON Lines API and event transport | spherekit-react |
+| `spherekit-cli` | React scaffolding and cross-platform builds | — |
 
-Eleven crates, not thirty. Each boundary exists because something on one side must be replaceable or
-testable without the other. A crate that could not justify that was not created.
+The React integration adds three boundary layers: `spherekit-react` owns the
+host-tree adapter, `spherekit-bridge` owns the transport protocol, and
+`spherekit-cli` owns project/build orchestration. They remain outside the GPU
+and widget layers so the native engine stays usable without React.
 
 ## The frame lifecycle
 

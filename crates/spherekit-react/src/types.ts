@@ -25,9 +25,18 @@ export interface NativeTreeSnapshot {
   readonly children: readonly NativeNodeSnapshot[];
 }
 
+/** An input or lifecycle event emitted by the native host. */
+export interface NativeEvent {
+  readonly event: string;
+  readonly nodeId?: number;
+  readonly payload?: NativeValue;
+}
+
 /** The narrow transport contract between the React renderer and Rust. */
 export interface NativeBridge {
   commit(snapshot: NativeTreeSnapshot): void;
+  /** Subscribes to native events when the transport supports them. */
+  onEvent?(listener: (event: NativeEvent) => void): () => void;
 }
 
 /** Adapter for a host exposing a JSON commit method over FFI or IPC. */

@@ -24,7 +24,23 @@ root.render(
 );
 ```
 
+For a native runtime that supports request/response APIs and events, use the
+transport-neutral bridge:
+
+```ts
+import { createApiBridge, createRoot } from "@spherekit/react";
+
+const bridge = createApiBridge(transport);
+const root = createRoot(bridge);
+bridge.on("appReady", () => console.log("native app ready"));
+const tree = await bridge.invoke("spherekit.getTree");
+```
+
+The wire protocol is JSON Lines (`hello`, `ready`, `commit`, `invoke`,
+`response`, `event`, and `shutdown`). The transport can be a WebView callback,
+FFI adapter, child process, or socket; the React package does not assume one.
+
 The authoring syntax intentionally resembles React Native, but the host set is
 small: `View`, `Text`, `Button`, `Slider`, `ScrollView`, and `Native`. `on*`
-React props remain on the TypeScript side for now; the next native event bridge
-can route those callbacks back through the same node IDs.
+React props remain on the TypeScript side and are routed by native node ID when
+the bridge emits `event` messages such as `press` or `valueChange`.

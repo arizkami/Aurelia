@@ -1,0 +1,11 @@
+[project]
+name = "{{PROJECT_NAME}}"
+target = "{{TARGET}}"
+
+[react]
+package = "@spherekit/react"
+bridge_protocol = 1
+
+[build]
+react_dir = "."
+rust_manifest = "src/app/Cargo.toml"

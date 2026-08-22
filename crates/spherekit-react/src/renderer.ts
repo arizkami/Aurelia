@@ -1,6 +1,6 @@
 import { createContext, type ReactNode } from "react";
 import Reconciler from "react-reconciler";
-import type { NativeBridge, NativeNodeSnapshot, NativeProps, NativeTreeSnapshot } from "./types";
+import type { NativeBridge, NativeEvent, NativeNodeSnapshot, NativeProps, NativeTreeSnapshot } from "./types";
 import { serializeProps } from "./types";
 
 interface HostContext {
@@ -33,6 +33,8 @@ interface HostContainer {
 export interface ReactRoot {
   render(element: ReactNode): void;
   unmount(): void;
+  /** Routes a native event into the matching React callback. */
+  dispatch(event: NativeEvent): void;
 }
 
 const hostTransitionContext = createContext<null>(null);
@@ -47,6 +49,7 @@ const hostTransitionContext = createContext<null>(null);
 export function createRoot(bridge: NativeBridge): ReactRoot {
   let nextId = 1;
   const container: HostContainer = { bridge, children: [], revision: 0 };
+  const instances = new Map<number, HostInstance | HostTextInstance>();
 
   const hostConfig = {
     supportsMutation: true,
@@ -56,11 +59,15 @@ export function createRoot(bridge: NativeBridge): ReactRoot {
     warnsIfNotActing: false,
 
     createInstance(type: string, props: NativeProps): HostInstance {
-      return { id: nextId++, type, props, children: [], hidden: false };
+      const instance = { id: nextId++, type, props, children: [], hidden: false };
+      instances.set(instance.id, instance);
+      return instance;
     },
 
     createTextInstance(text: string): HostTextInstance {
-      return { id: nextId++, text, hidden: false };
+      const instance = { id: nextId++, text, hidden: false };
+      instances.set(instance.id, instance);
+      return instance;
     },
 
     appendInitialChild(parent: HostInstance, child: HostChild): void {
@@ -114,7 +121,9 @@ export function createRoot(bridge: NativeBridge): ReactRoot {
     getInstanceFromScope(): null {
       return null;
     },
-    detachDeletedInstance(): void {},
+    detachDeletedInstance(instance: HostInstance): void {
+      instances.delete(instance.id);
+    },
 
     appendChild(parent: HostInstance, child: HostChild): void {
       appendUnique(parent.children, child);
@@ -231,6 +240,21 @@ export function createRoot(bridge: NativeBridge): ReactRoot {
     () => {},
   );
 
+  const dispatch = (event: NativeEvent): void => {
+    if (event.nodeId === undefined) return;
+    const instance = instances.get(event.nodeId);
+    if (!instance || isTextInstance(instance)) return;
+    const callback = eventCallback(instance.props, event.event);
+    if (!callback) return;
+    if (event.event === "press") callback();
+    else if (event.event === "valueChange" && isObject(event.payload) && "value" in event.payload) {
+      callback(event.payload.value);
+    } else {
+      callback(event.payload);
+    }
+  };
+  const unsubscribe = bridge.onEvent?.(dispatch);
+
   return {
     render(element) {
       reconciler.updateContainerSync(element, root, null, null);
@@ -239,8 +263,21 @@ export function createRoot(bridge: NativeBridge): ReactRoot {
     unmount() {
       reconciler.updateContainerSync(null, root, null, null);
       reconciler.flushSyncWork();
+      unsubscribe?.();
+      instances.clear();
     },
+    dispatch,
   };
+}
+
+function eventCallback(props: NativeProps, event: string): ((payload?: unknown) => void) | undefined {
+  const normalized = event.startsWith("on") ? event : `on${event.slice(0, 1).toUpperCase()}${event.slice(1)}`;
+  const callback = props[normalized];
+  return typeof callback === "function" ? callback as (payload?: unknown) => void : undefined;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function appendUnique(children: HostChild[], child: HostChild): void {

@@ -956,7 +956,7 @@ impl Window {
             if super::ffi::set_backdrop(hwnd, backdrop) {
                 return Ok(());
             }
-            return Err(PlatformError::Unsupported("system window backdrop"));
+            Err(PlatformError::Unsupported("system window backdrop"))
         }
         #[cfg(not(windows))]
         {

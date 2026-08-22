@@ -170,7 +170,7 @@ Remove-Item -LiteralPath $archive -Force
         .env("SPHEREKIT_V8_URL", url)
         .env("SPHEREKIT_V8_ARCHIVE", &archive)
         .env("SPHEREKIT_V8_STAGE", &stage)
-        .env("SPHEREKIT_V8_TARGET", &backend_dir)
+        .env("SPHEREKIT_V8_TARGET", backend_dir)
         .output()
         .unwrap_or_else(|error| panic!("failed to start PowerShell for V8 setup: {error}"));
 
