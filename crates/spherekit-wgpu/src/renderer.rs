@@ -749,6 +749,13 @@ fn pick_surface_format(caps: &wgpu::SurfaceCapabilities) -> wgpu::TextureFormat 
 /// `WGPU_BACKEND` override for diagnostics or applications that deliberately
 /// need Vulkan.
 fn create_instance(transparent: bool) -> wgpu::Instance {
+    // Only the Windows path reads this. Every other platform composites a
+    // transparent surface through the ordinary instance, so there is no backend
+    // choice to make and the parameter is genuinely unused there — which
+    // `-D warnings` correctly objects to unless it is said out loud.
+    #[cfg(not(windows))]
+    let _ = transparent;
+
     #[cfg(windows)]
     if transparent {
         let requested_backends = std::env::var("WGPU_BACKEND")

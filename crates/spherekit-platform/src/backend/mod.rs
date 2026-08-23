@@ -24,9 +24,20 @@
 #[cfg_attr(not(feature = "winit-backend"), allow(dead_code))]
 pub(crate) mod nc;
 
-// Every unsafe call the custom frame makes. Needs a backend to have produced a
-// window to subclass, so unlike `nc` it is gated on one.
-#[cfg(all(windows, feature = "winit-backend"))]
+// Every unsafe call the custom frame makes.
+//
+// Compiled on every Windows build, backend or not, for the same reason as `nc`
+// above: it depends on nothing from the backend — only on `nc`, `crate::window`
+// and `spherekit-core` — and `wheel_scroll_lines` reads a system setting that a
+// plug-in host is as entitled to as an application is. Gating it on the backend
+// made `platform::wheel_scroll_lines` fail to compile in the plug-in
+// configuration, since its own `cfg` is `windows` alone.
+//
+// Most of it does need a window to subclass, so without a backend nothing calls
+// those and `dead_code` fires; that is the arrangement rather than a defect,
+// which is why the allow is conditional on the plug-in configuration.
+#[cfg(windows)]
+#[cfg_attr(not(feature = "winit-backend"), allow(dead_code))]
 pub(crate) mod ffi;
 
 #[cfg(feature = "winit-backend")]

@@ -37,6 +37,30 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # The npm package is a published artifact with its own test suite, and until
+  # this job existed nothing in CI looked at it. It is platform-independent, so
+  # one runner does — the same reasoning as `fmt` above.
+  typescript:
+    name: TypeScript
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: |
+          cd crates/spherekit-react && bun run typecheck
+          cd ../../app/reactdemo/renderer && bun run typecheck
+      - name: Test
+        run: cd crates/spherekit-react && bun test
+      # Packing exercises `prepack`, which is what produces `dist/`. A package
+      # that cannot be packed is one that cannot be published, and finding that
+      # out at release time is finding it out too late.
+      - name: Pack the npm package
+        run: cd crates/spherekit-react && npm pack --dry-run
+
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -79,6 +103,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      # `app/reactdemo` bundles its TypeScript renderer in a build script. Bun's
+      # absence is not fatal — the build script falls back to a renderer written
+      # against the wire protocol by hand — but the fallback is not what ships,
+      # so a CI without Bun would only ever compile the degraded path.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
 
       - uses: Swatinem/rust-cache@v2
         with:
