@@ -49,6 +49,12 @@ jobs:
         with:
           bun-version: latest
       - run: bun install --frozen-lockfile
+      # `@spherekit/react` resolves through its `exports`, which point at
+      # `dist/` — build output, so not in the repository. Anything that consumes
+      # the package rather than its sources has to build it first, or tsc
+      # reports the package as simply missing.
+      - name: Build @spherekit/react
+        run: cd crates/spherekit-react && bun run build
       - name: Typecheck
         run: |
           cd crates/spherekit-react && bun run typecheck
