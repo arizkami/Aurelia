@@ -40,6 +40,25 @@ export interface ReactRoot {
 const hostTransitionContext = createContext<null>(null);
 
 /**
+ * React's lane for "no priority was established by an event".
+ *
+ * The reconciler asks the host to resolve a priority for every update, and it
+ * takes lane 0 literally: an update tagged with it is queued against no lane
+ * and never scheduled. A host that answers 0 unconditionally therefore drops
+ * every state update that does not originate inside a synchronous `render()` —
+ * effects, promise callbacks and native events all silently do nothing.
+ */
+const NO_LANE = 0;
+
+/**
+ * `DefaultEventPriority`, the lane React's own DOM host uses for an update
+ * with no ambient event priority. It is the right default here for the same
+ * reason: SphereKit dispatches native events itself, so an update arriving
+ * outside one is ordinary work, not urgent input.
+ */
+const DEFAULT_LANE = 32;
+
+/**
  * Creates a React 19 custom renderer for native SphereKit nodes.
  *
  * React mutates a private host tree during reconciliation. The complete,
@@ -48,6 +67,7 @@ const hostTransitionContext = createContext<null>(null);
  */
 export function createRoot(bridge: NativeBridge): ReactRoot {
   let nextId = 1;
+  let currentUpdatePriority = NO_LANE;
   const container: HostContainer = { bridge, children: [], revision: 0 };
   const instances = new Map<number, HostInstance | HostTextInstance>();
 
@@ -183,12 +203,14 @@ export function createRoot(bridge: NativeBridge): ReactRoot {
 
     NotPendingTransition: null,
     HostTransitionContext: hostTransitionContext,
-    setCurrentUpdatePriority(): void {},
+    setCurrentUpdatePriority(priority: number): void {
+      currentUpdatePriority = priority;
+    },
     getCurrentUpdatePriority(): number {
-      return 0;
+      return currentUpdatePriority;
     },
     resolveUpdatePriority(): number {
-      return 0;
+      return currentUpdatePriority === NO_LANE ? DEFAULT_LANE : currentUpdatePriority;
     },
     resetFormInstance(): void {},
     requestPostPaintCallback(callback: (time: number) => void): void {
@@ -246,12 +268,8 @@ export function createRoot(bridge: NativeBridge): ReactRoot {
     if (!instance || isTextInstance(instance)) return;
     const callback = eventCallback(instance.props, event.event);
     if (!callback) return;
-    if (event.event === "press") callback();
-    else if (event.event === "valueChange" && isObject(event.payload) && "value" in event.payload) {
-      callback(event.payload.value);
-    } else {
-      callback(event.payload);
-    }
+    if (ARGUMENT_LESS_EVENTS.has(event.event)) callback();
+    else callback(unwrapPayload(event.event, event.payload));
   };
   const unsubscribe = bridge.onEvent?.(dispatch);
 
@@ -268,6 +286,48 @@ export function createRoot(bridge: NativeBridge): ReactRoot {
     },
     dispatch,
   };
+}
+
+/**
+ * Events whose React callback is declared to take nothing.
+ *
+ * A press or a menu selection carries no value the caller could use, and
+ * passing the raw frame payload anyway would make `onPress={setOpen}` — a
+ * setter that happens to accept one argument — receive an object nobody meant
+ * to send.
+ */
+const ARGUMENT_LESS_EVENTS: ReadonlySet<string> = new Set(["press", "select"]);
+
+/**
+ * Which key of an event payload each callback actually wants.
+ *
+ * Frames always carry `payload` as a JSON object, because the wire schema has
+ * nowhere else to put the value, but the handlers in this package take the
+ * thing that changed: a toggle's `onChange` takes a boolean, not `{checked}`.
+ *
+ * The three entries here cover every event the built-in widgets emit. Anything
+ * else — an event from a type an embedder registered with
+ * `ReactHost::register_host_type` — receives the payload object whole, because
+ * this table cannot know which of its keys such a handler wanted, and picking
+ * one would silently discard the rest.
+ *
+ * A `Map` rather than an object literal because the event name arrives from
+ * the native host: a frame naming `constructor` would find a match on
+ * `Object.prototype` and hand the loop below something that is not an array.
+ */
+const PAYLOAD_KEYS: ReadonlyMap<string, readonly string[]> = new Map<string, readonly string[]>([
+  ["valueChange", ["value"]],
+  ["change", ["checked", "value", "text"]],
+  ["submit", ["text", "value"]],
+]);
+
+function unwrapPayload(event: string, payload: unknown): unknown {
+  const keys = PAYLOAD_KEYS.get(event);
+  if (!keys || !isObject(payload)) return payload;
+  for (const key of keys) {
+    if (key in payload) return payload[key];
+  }
+  return payload;
 }
 
 function eventCallback(props: NativeProps, event: string): ((payload?: unknown) => void) | undefined {

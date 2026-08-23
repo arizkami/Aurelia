@@ -7,22 +7,31 @@ than against intent.
 
 ## Where v0.1 stands
 
-**50,636 lines** of Rust and WGSL. **1,020 tests**, zero warnings, clippy clean,
-`cargo fmt` clean.
+**81,043 lines** of Rust and WGSL, plus 2,538 of TypeScript and 619 of C++ (the V8 shim).
+**1,571 Rust tests** — 1,556 unit and integration, 15 doc — and **53 TypeScript tests**. Zero
+warnings, clippy clean, `cargo fmt` clean.
+
+Counted from `cargo test --workspace` and `bun test` on Windows. On Linux and macOS the total is 26
+lower: `spherekit-jsengine`'s 19 tests and `spherekit-bridge`'s 7 V8 tests need the Windows prebuilt.
 
 | Crate | Tests | Status |
 |---|---|---|
-| `spherekit-core` | 78 | Done |
-| `spherekit-render` | 77 | Done |
-| `spherekit-wgpu` | 31 (4 on a real GPU) | Done |
-| `spherekit-text` | 232 | Done |
+| `spherekit-core` | 117 | Done |
+| `spherekit-render` | 108 | Done |
+| `spherekit-wgpu` | 42 (4 on a real GPU) | Done |
+| `spherekit-text` | 284 | Done |
 | `spherekit-layout` | 108 | Done |
 | `spherekit-image` | 95 | Done |
-| `spherekit-platform` | 116 | Done |
-| `spherekit-ui` | 147 | Done |
+| `spherekit-platform` | 148 | Done |
+| `spherekit-ui` | 231 | Done |
 | `spherekit-audio-ui` | 86 | Done |
 | `spherekit-svg` | 32 | Done |
-| `spherekit` (facade) | 3 | Done |
+| `spherekit-css` | 161 | Partial — see Phase 8 |
+| `spherekit-react` | 71 Rust + 53 TypeScript | Partial — see Phase 9 |
+| `spherekit-bridge` | 24, and 31 with `v8` | Done — see Phase 10 |
+| `spherekit-jsengine` | 19 (Windows only) | Partial — see Phase 11 |
+| `spherekit-cli` | 6 | Partial |
+| `spherekit` (facade) | 6 | Done |
 
 ## Phases
 
@@ -155,6 +164,135 @@ parsing and `SvgError::Unsupported` is returned rather than handing back a silen
 layer over that blurred backdrop. If the swapchain cannot be copied, the tint still renders and
 the backdrop sample is skipped gracefully.
 
+### Phase 8 — Stylesheet runtime · **PARTIAL**
+
+`spherekit-css` parses a CSS subset, applies selector specificity and `!important`, and produces a
+`ResolvedStyle` that a native `Styled` element and a React node both take. One cascade, two
+producers.
+
+*Success criterion — a native `div()` and a React `<View>` with the same class resolve to the same
+paint style.* Met, and asserted in both crates.
+
+| Feature | Status |
+|---|---|
+| Type, class, id and universal selectors | Done |
+| Descendant, child, `+` and `~` combinators | Done |
+| `:hover`, `:active`, `:focus`, `:disabled`, `:checked`, `:root`, `:first-child`, `:last-child`, `:nth-child()`, `:not()` | Done |
+| Specificity, source order, `!important` | Done |
+| `@media` — `min/max-width`, `min/max-height`, `prefers-color-scheme`, `and`, comma lists | Done |
+| Custom properties and `var()` with fallbacks | Done |
+| `px`, `%`, `em`, `rem`, `vw`, `vh`, `vmin`, `vmax`, unitless zero | Done |
+| Flex box model: display, position, inset, size, margin, padding, border, gap, alignment | Done |
+| Paint: `background`, `border-color`, `border-radius`, `box-shadow`, `opacity`, `cursor`, `visibility` | Done |
+| Typography: `color`, `font-family`, `font-size`, `font-weight`, `font-style`, `line-height`, `letter-spacing`, `text-align`, `text-overflow`, with inheritance | Done |
+| **Gradients** — `background` takes a colour, not a `linear-gradient()` | **Not started** |
+| **`transition`, `animation`, `@keyframes`** | **Not started** — blocked on the retained animation layer in *Known gaps* below |
+| **`@media not`, and every media type but `screen`/`all`** | **Not started** — such a query is false, which is the conservative reading |
+| **`transform`** | **Not started** |
+| **Grid template properties** | **Not started** — Taffy supports grid, the property model does not expose it |
+| **Attribute selectors, pseudo-elements** | **Not started** — dropped from a selector list rather than matched loosely |
+| **`@font-face`, `@supports`, `@import`** | **Not started** — skipped as unknown at-rules |
+
+The rule that governs all of it is that syntax the engine does not model is *ignored, never
+reinterpreted*: `width: 12` does not become `12px`, an unknown media feature makes its query false
+rather than true, and a selector with an attribute test is dropped from its comma list. A stylesheet
+that does nothing is debuggable; one that does something slightly different from what it says is not.
+Rules inside a currently-unmatched `@media` block are retained rather than dropped, so a stylesheet's
+meaning does not depend on the window size at the moment it was installed.
+
+See [`docs/spherekit-css.md`](spherekit-css.md).
+
+### Phase 9 — React frontend · **PARTIAL**
+
+React 19 reconciles against a native host tree. After each commit the whole tree crosses to Rust as
+one serialisable snapshot, is validated and retained, and is lowered to `spherekit-ui` elements
+through the same CSS cascade a native element uses. Events come back by node id.
+
+*Success criterion — an ordinary React application with hooks and JSX drives native widgets with no
+DOM in the process.* Met, and running: `app/reactdemo` is React 19 in SphereKit's own V8 isolate,
+with no browser, no WebView and no Node.
+
+| Feature | Status |
+|---|---|
+| `react-reconciler` host config, React 19 | Done |
+| Whole-tree snapshot at commit, with revision ordering | Done |
+| Commit validation: duplicate ids, missing types, depth and node-count limits | Done |
+| Lowering with cascade, ancestor chain and typography inheritance in one walk | Done |
+| 15 host component types | Done |
+| `register_host_type` plus the `<Native type=… />` escape hatch | Done |
+| Events: `press`, `valueChange`, `change`, `select`, `submit` | Done |
+| `useInvoke`, `useNativeEvent`, `useStylesheet` | Done |
+| `stylesheet()`, `toCssText()`, `cx()` authoring helpers | Done |
+| **`ScrollView`'s `onScroll`** | **Not offered** — nothing lowers a scroll callback, and `spherekit-ui`'s `ScrollView` does not implement `Interactive`, so there is no offset to report; the prop is left out rather than declared and inert |
+| **Focus, keyboard and IME props** | **Not started** — the native widgets have all three; no React prop reaches them |
+| **Portals** | **Not started** — `preparePortalMount` is a no-op, so a context menu cannot escape its parent's box from React |
+| **Suspense and transitions** | Partial — `hidden` is carried through commits; nothing suspends on a native resource |
+| **Dropdown, context menu, panel chrome** | **Not started** as host types, though the native widgets exist |
+
+The snapshot is not a performance decision and is not an interim one. It is what keeps the native
+side from ever observing a half-built tree, what lets each half be tested with none of the other in
+the process, and what makes the boundary transport-agnostic. The cost — re-serialising every node on
+every commit — was accepted. See [`docs/react.md`](react.md).
+
+### Phase 10 — API bridge · **DONE**
+
+A newline-delimited JSON protocol between a JavaScript runtime and the native host, with no opinion
+about the transport underneath it.
+
+*Success criterion — the same protocol works over an in-process call and over a byte stream.* Met:
+`JsBridge` drives it through a synchronous V8 host function, and `JsonLines` reassembles it from
+arbitrary chunks. Every split point of a sample stream, down to one byte at a time, decodes to the
+same messages — that is a test, not a claim.
+
+Delivered: the `hello`/`ready` handshake with version refusal, `commit`, `invoke`/`response`,
+`event`, `shutdown`; eight built-in `spherekit.*` methods; application methods through
+`register_method`; the outbound event queue and `pump_events`; the style context for viewport,
+root font size and colour scheme; a frame-size cap so a renderer that dies mid-frame cannot grow the
+buffer until the process does.
+
+Not built: no batching of consecutive commits, so a burst of React commits crosses as a burst of
+frames; no back-pressure signal, because no transport in use has needed one; no binary encoding, and
+none is planned until a profile asks for it.
+
+See [`docs/api-bridge.md`](api-bridge.md).
+
+### Phase 11 — JavaScript runtime · **PARTIAL**
+
+`spherekit-jsengine` embeds V8 through a hand-written C++ shim. The public Rust surface owns an
+`Engine` and never lets a `v8::Local<T>` out, because isolates are thread-affine and local handles
+are stack-scoped — the shim opens its scopes, does the work, and returns owned UTF-8.
+
+*Success criterion — React's production bundle evaluates and renders in a bare isolate.* Met on
+Windows.
+
+| Feature | Status |
+|---|---|
+| `eval`, `eval_named`, `bind`, `call_global`, `has_global` | Done |
+| Explicit microtask policy; `run_microtasks` and a bounded `pump` | Done |
+| Exceptions with message, stack, line, column and script name as separate fields | Done |
+| Panic containment at the FFI boundary | Done |
+| `runtime/prelude.js`: timers, frame callbacks, `console`, `performance`, `navigator` | Done |
+| `JsBridge`: isolate wired to an `ApiBridge` through two globals | Done |
+| **Targets other than Windows x86_64** | **Not started** — the shim is portable C++20; the *prebuilt* is not. The non-Windows `Engine` is a complete API mirror that returns `UnsupportedPlatform` |
+| **ES modules** | **Not started** — the application must arrive as one IIFE bundle |
+| **`fetch`, `URL`, `TextEncoder`, `structuredClone`** | **Not started** — the prelude supplies only what React's module evaluation reaches for |
+| **A debugger or inspector protocol** | **Not started** — `js_protocol.pdl` ships with the prebuilt; nothing serves it |
+| **Snapshots or code cache** | **Not started** — the bundle is parsed from source on every start |
+
+The `v8` feature is off by default everywhere, and `spherekit-bridge` compiles with no JavaScript
+engine at all, because the protocol is the product. An application wanting React on another platform
+today drives the same bridge from a WebView or a child process.
+
+See [`docs/javascript.md`](javascript.md).
+
+### CLI and templates · **PARTIAL** (not a numbered phase)
+
+`spherekit react <name>` scaffolds a React + Rust application from `template/spherekit-app-react`
+and `spherekit build` runs the TypeScript and Cargo halves together, with `--dry-run`, `--no-react`,
+`--no-rust`, `--out-dir` and cross-compilation targets for CI. It detects Bun, npm, pnpm or Yarn.
+
+Not built: no `spherekit dev` with a watch loop, no packaging or installer step, and one template.
+
 ## Definition of done for v0.1
 
 | Criterion | Status |
@@ -172,9 +310,11 @@ the backdrop sample is skipped gracefully.
 | Basic widgets exist | Partial — see Phase 5 |
 | A realtime meter updates without full relayout | Yes — tested |
 | The public API is not tied to WGPU | Yes — `RendererBackend` is the only seam |
-| No Skia/C++ rendering dependency remains | Yes — pure Rust throughout |
-| Examples and documentation demonstrate the architecture | Yes — two examples, eight documents |
-| Workspace builds and tests cleanly | Yes |
+| No Skia/C++ rendering dependency remains | Yes — pure Rust throughout. The only C++ in the workspace is the V8 shim, which draws nothing |
+| A stylesheet styles native and React elements alike | Yes — one `Stylesheet`, two producers, asserted in both crates |
+| React renders native widgets with no DOM | Yes — `app/reactdemo`, React 19 in an in-process isolate |
+| Examples and documentation demonstrate the architecture | Yes — five runnable applications, three diagnostic examples, twelve documents |
+| Workspace builds and tests cleanly | Yes — and without a JavaScript toolchain, which is why `reactdemo` falls back to a bundler-free renderer |
 
 ## Known gaps, in the order they should be closed
 
@@ -196,6 +336,15 @@ the backdrop sample is skipped gracefully.
 7. **Accessibility bridge.** Every element already reports role, value, state and actions. No
    platform bridge (UI Automation, AT-SPI, NSAccessibility) consumes them yet.
 8. **Golden-image tests.** Visual regressions are currently caught by eye.
+9. **V8 on Linux and macOS.** The shim is portable C++20 against the public V8 API; only the
+   prebuilt is Windows-only. Until a monolith exists for the other two, React on them means a
+   WebView or a child process driving the same bridge. What the port involves is written down in
+   `docs/javascript.md`.
+10. **Scroll, focus and keyboard events in React.** No React prop reaches the focus, keyboard or IME
+    machinery the native widgets already have, and `ScrollView` reports no offset to lower into an
+    `onScroll`. The gap is a lowering and a `spherekit-ui` builder, not a design question.
+11. **CSS transitions.** The property model has no `transition`, which is the CSS-facing half of
+    gap 2 and blocked on the same retained animation layer.
 
 ## Beyond v0.1
 
@@ -206,3 +355,7 @@ the backdrop sample is skipped gracefully.
 - HDR and wide-gamut output. `SurfaceColorSpace` is plumbed through; nothing uses it yet.
 - Virtualised lists for very large sessions.
 - A debug inspector showing the node tree, computed bounds, dirty flags, batches and atlas pages.
+- ES modules and a code cache in the isolate, so a large bundle is not reparsed from source on every
+  start.
+- A V8 inspector endpoint, so a React application can be debugged with the tools its authors expect
+  rather than through `console.log` and `drain_console`.

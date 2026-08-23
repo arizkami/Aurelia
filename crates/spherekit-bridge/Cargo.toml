@@ -8,8 +8,21 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# Compiles the in-process V8 host. Off by default: the protocol is the product,
+# and an embedder driving it from a WebView or a child process should not pay
+# for a JavaScript engine it never starts.
+v8 = ["dep:spherekit-jsengine"]
+
 [dependencies]
+spherekit-core.workspace = true
+spherekit-css.workspace = true
 spherekit-react.workspace = true
+spherekit-jsengine = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+spherekit-ui.workspace = true

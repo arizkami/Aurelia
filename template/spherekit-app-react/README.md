@@ -40,6 +40,32 @@ bun install
 spherekit build --release
 ```
 
+## React must resolve to exactly one instance
+
+`@spherekit/react` is a React *renderer*, so it declares `react` as a peer
+dependency rather than depending on it. That is not tidiness — it is the only
+thing standing between you and the worst error in this stack.
+
+`react-reconciler` installs the hook dispatcher onto `ReactSharedInternals`, and
+your components read it back through their own `react` import. If those are two
+different module instances, the dispatcher your components see is `null`. The
+first state update that originates *outside* a synchronous render — a native
+event, a promise, an effect — then fails with:
+
+```text
+TypeError: Cannot read properties of null (reading 'useState')
+```
+
+Mounting works. The first paint looks right. Nothing names the duplicate
+install. A normal registry install hoists one copy and this cannot happen; it
+becomes possible when `@spherekit/react` is linked from a local path
+(`file:…`) that carries its own `node_modules/react`. If you see that error,
+check for a second `react` before you look anywhere else:
+
+```bash
+bun pm ls --all | grep react
+```
+
 To target another machine, pass a platform or Rust target triple:
 
 ```bash

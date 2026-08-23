@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    // DOM is here because `@spherekit/react` ships its TypeScript source as its
+    // own types, so this project compiles the renderer's implementation under
+    // this config rather than reading a `.d.ts` that `skipLibCheck` would wave
+    // through. That implementation uses `setTimeout`, `queueMicrotask`,
+    // `performance` and `console`, and every one of them is installed on the
+    // isolate by `runtime/prelude.js` before the bundle is evaluated — so the
+    // web library is a description of the real host, not a convenience. It is
+    // still an over-approximation: the prelude provides no `document`, and
+    // reaching for one type checks here and fails in the isolate.
+    "lib": ["ESNext", "DOM"],
+    "target": "ESNext",
+    "module": "Preserve",
+    "moduleDetection": "force",
+    "jsx": "react-jsx",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+
+    "strict": true,
+    "skipLibCheck": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true
+  },
+  "include": ["src"]
+}

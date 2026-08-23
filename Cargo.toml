@@ -18,6 +18,7 @@ members = [
     "crates/spherekit-bridge",
     "crates/spherekit-cli",
     "app/uigallery",
+    "app/reactdemo",
 ]
 
 [workspace.package]
@@ -40,6 +41,7 @@ spherekit-image    = { path = "crates/spherekit-image",    version = "0.1.0" }
 spherekit-platform = { path = "crates/spherekit-platform", version = "0.1.0" }
 spherekit-ui       = { path = "crates/spherekit-ui",       version = "0.1.0" }
 spherekit-audio-ui = { path = "crates/spherekit-audio-ui", version = "0.1.0" }
+spherekit-jsengine = { path = "crates/spherekit-jsengine", version = "0.1.0" }
 spherekit-react    = { path = "crates/spherekit-react",    version = "0.1.0" }
 spherekit-css      = { path = "crates/spherekit-css",      version = "0.1.0" }
 spherekit-bridge   = { path = "crates/spherekit-bridge",   version = "0.1.0" }

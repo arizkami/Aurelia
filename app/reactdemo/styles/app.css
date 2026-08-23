@@ -1,0 +1,167 @@
+/*
+ * The one stylesheet.
+ *
+ * This file is not "the React app's CSS". It is installed into the shared
+ * `spherekit-css` runtime at boot, and *both* sides read it: the React tree is
+ * lowered through it by `ReactHost`, and the native status bar at the bottom of
+ * the window — which no React component knows about — is styled by resolving
+ * the same rules against a native `spherekit-ui` element.
+ *
+ * That is the whole claim this demo exists to make. One cascade, no browser.
+ */
+
+:root {
+  --bg: #202124;
+  --surface: #2b2c2f;
+  --elevated: #333438;
+  --border: #414348;
+  --text: #f0f0f1;
+  --muted: #acadb0;
+  --accent: #78a8e8;
+  --accent-pressed: #6394d4;
+  --danger: #d77880;
+  --radius: 8px;
+  --gutter: 12px;
+}
+
+/* ------------------------------------------------------------------ shell */
+
+.root {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  background-color: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  padding: 16px;
+  gap: var(--gutter);
+}
+
+.header {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 4px;
+}
+
+.title {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.subtitle {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* ------------------------------------------------------------------ cards */
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  background-color: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.card .label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  letter-spacing: 0.4px;
+}
+
+.card > .value {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+}
+
+.grow {
+  flex: 1;
+}
+
+/* -------------------------------------------------------------- controls */
+
+button {
+  border-radius: 6px;
+  padding: 6px 14px;
+  background-color: var(--elevated);
+  border: 1px solid var(--border);
+  cursor: pointer;
+}
+
+button:hover {
+  background-color: #44464a;
+}
+
+button:active {
+  background-color: var(--accent-pressed);
+}
+
+button.primary {
+  background-color: var(--accent);
+  border-color: var(--accent);
+}
+
+button.danger {
+  background-color: var(--danger);
+  border-color: var(--danger);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+slider,
+knob,
+fader {
+  cursor: pointer;
+}
+
+/* The demonstration that combinators actually run: only a meter inside a card
+   marked `.telemetry` gets the accent treatment. */
+.telemetry .meter > .value {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+/* ------------------------------------------------------------- status bar */
+
+/*
+ * Native-only. No React component carries this class — the Rust side builds a
+ * `div()` with it and resolves it through this same stylesheet.
+ */
+.status-bar {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 16px;
+  height: 26px;
+  padding: 0 12px;
+  background-color: var(--elevated);
+  border-radius: 6px;
+}
+
+.status-bar .status-item {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.status-bar .status-item.live {
+  color: var(--accent);
+}

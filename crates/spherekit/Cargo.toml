@@ -8,6 +8,18 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# Compiles the in-process V8 host and re-exports it as `spherekit::js`.
+#
+# Off by default because the V8 monolith is a ~100 MB Windows x86_64 prebuilt
+# that `spherekit-jsengine`'s build script downloads, and CI builds this crate
+# on Linux and macOS where it does not exist. Everything else in the facade —
+# including the React host and the
+# JSON Lines bridge that a WebView or child-process transport drives — works
+# without it, so no one pays for a JavaScript engine they never start.
+v8 = ["dep:spherekit-jsengine", "spherekit-bridge/v8"]
+
 [dependencies]
 spherekit-core.workspace = true
 spherekit-render.workspace = true
@@ -19,6 +31,9 @@ spherekit-image.workspace = true
 spherekit-platform.workspace = true
 spherekit-ui.workspace = true
 spherekit-css.workspace = true
+spherekit-react.workspace = true
+spherekit-bridge.workspace = true
+spherekit-jsengine = { workspace = true, optional = true }
 spherekit-audio-ui.workspace = true
 rustc-hash.workspace = true
 raw-window-handle.workspace = true

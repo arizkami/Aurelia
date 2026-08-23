@@ -12,5 +12,6 @@ authors.workspace = true
 cssparser.workspace = true
 spherekit-core.workspace = true
 spherekit-layout.workspace = true
+spherekit-text.workspace = true
 spherekit-ui.workspace = true
 thiserror.workspace = true

@@ -72,6 +72,35 @@ knob(self.threshold.get())
     .on_change({ let t = self.threshold.clone(); move |v| t.set(v) })
 ```
 
+**One stylesheet, two producers.** `spherekit-css` parses CSS — selectors, combinators, specificity,
+`!important`, `@media`, custom properties and `var()` — and resolves it to the same `Style` and
+`PaintStyle` a hand-written element uses. A native `div()` and a React `<View>` with the same class
+land on the same paint style. Syntax the engine does not model is *ignored, never reinterpreted*:
+`width: 12` does not become `12px`, and an unknown media feature makes its query false rather than
+true. A stylesheet that does nothing is debuggable; one that does something slightly different from
+what it says is not.
+
+**React runs here, without a browser.** React 19 reconciles against a native host tree. Each commit
+crosses to Rust as one serialisable snapshot — never a mutation stream, so the native side never
+observes a half-built tree and each half is testable with none of the other in the process — and is
+lowered to native widgets through that same cascade. Events come back by node id, so `onPress` and
+`onValueChange` fire without a function ever being serialised.
+
+```tsx
+<Panel title="Channel 1" className="strip">
+  <Knob value={threshold} minimumValue={-60} maximumValue={0} onValueChange={setThreshold} />
+  <Toggle checked={monitor} label="Monitor" onChange={setMonitor} />
+</Panel>
+```
+
+**And it runs in SphereKit's own V8.** `spherekit-jsengine` embeds V8 directly: no WebView, no Node,
+no IPC. The isolate lives on the UI thread in the renderer's address space, so a native call from
+JavaScript is synchronous and an `invoke()` from a React effect can settle inside the same commit
+that made it. The isolate's microtask policy is explicit, so queued JavaScript runs at the two points
+in the frame the host picks and nowhere else — never in the middle of a layout pass. The V8 prebuilt
+is Windows x86_64 today; everywhere else the same protocol is driven from a WebView or a child
+process.
+
 ## Widgets
 
 |            |                                                                                         |
@@ -99,8 +128,12 @@ One notch travels as far as the reader's own Windows setting says it should —
 ## Architecture
 
 ```text
-Application
-    ↓
+Application                          React application (TypeScript)
+    ↓                                    ↓
+    │                                spherekit-bridge   JSON Lines: commits, methods, events
+    │                                    ↓
+    │                                spherekit-react    validate → cascade → lower
+    ↓                                    ↓
 spherekit-ui           element tree, events, focus, widgets
     ↓
 spherekit-layout       retained nodes, styles, dirty propagation, hit testing
@@ -111,6 +144,8 @@ spherekit-wgpu         the only crate that knows wgpu exists
     ↓
 D3D12 / Vulkan / Metal / WebGPU
 ```
+
+Both entry paths converge at `spherekit-ui`, and nothing below it can tell which one it came from.
 
 | Crate                | Responsibility                                                      |
 | -------------------- | ------------------------------------------------------------------- |
@@ -125,9 +160,9 @@ D3D12 / Vulkan / Metal / WebGPU
 | `spherekit-ui`       | Element tree, event dispatch, focus, widgets                        |
 | `spherekit-audio-ui` | Meters, waveforms, spectrums, EQ curves, lock-free transfer         |
 | `spherekit-css`      | Stylesheet runtime shared by native and React apps                  |
-| `spherekit-jsengine` | JavaScript runtime host                                             |
+| `spherekit-jsengine` | Embedded V8: isolate, host bindings, microtask and platform pumping |
 | `spherekit-bridge`   | JSON Lines protocol between a React front end and the native host   |
-| `spherekit-react`    | React renderer that drives the native tree through the bridge       |
+| `spherekit-react`    | React renderer, and the Rust host that validates and lowers commits |
 | `spherekit-cli`      | `spherekit` command: scaffolds and builds React + Rust apps         |
 | `spherekit`          | Facade that re-exports the whole engine                             |
 
@@ -158,7 +193,37 @@ cargo clippy --workspace --all-targets --all-features
 > on-access antivirus scanning, and visible as `did not finalize incremental compilation session
 directory ... Access is denied (os error 5)`. Set `CARGO_INCREMENTAL=0` for the run.
 
-### SphereKit CLI and React apps
+### Quickstart: the React example app
+
+`app/reactdemo` is React 19 in SphereKit's own V8 isolate, styled by the shared CSS runtime,
+rendered on the GPU:
+
+```bash
+cargo run -p reactdemo --release
+```
+
+That works with no JavaScript toolchain installed. Without Bun, `build.rs` falls back to a renderer
+written directly against the wire protocol — no React, no bundler — which still runs, still styles
+itself from the same `styles/app.css`, and is worth reading because it shows what React's reconciler
+eventually produces: one `commit` frame. For the React renderer:
+
+```bash
+cd app/reactdemo/renderer && bun install && cd ../../..
+cargo run -p reactdemo --release
+```
+
+The status bar at the bottom of that window is a native `div()` no React component knows exists, and
+it is resolved through the very same stylesheet rules. One cascade, two producers, no browser.
+
+The `v8` feature is off by default everywhere, including on the facade, because the prebuilt is a
+~100 MB Windows x86_64 download. `cargo build -p spherekit --features v8` opts in.
+
+```bash
+cargo run -p spherekit-bridge --features v8 --example js_roundtrip   # the whole path, no bundler
+cargo run -p spherekit-jsengine --example repl -- path/to/script.js  # the smallest embedder
+```
+
+### SphereKit CLI
 
 The workspace includes a portable `spherekit` CLI for creating and building a
 React + Rust app. Install it from a checkout or run it through Cargo:
@@ -184,7 +249,9 @@ child process, or socket integrations.
 apps. Use `Stylesheet`/`ResolvedStyle` in native code, or call
 `bridge.setStylesheet(css)` and use `className`, `id`, and inline `style` props
 from React. See [the CSS design note](docs/spherekit-css.md) for the research
-tradeoffs and supported v1 property boundary.
+tradeoffs and supported v1 property boundary, [`docs/react.md`](docs/react.md)
+for the frontend end to end, and [`docs/javascript.md`](docs/javascript.md) for
+the V8 embedding.
 
 ## Status
 
@@ -193,7 +260,7 @@ Measured on an NVIDIA GTX 1060 (Vulkan), running
 
 |                               |                                                             |
 | ----------------------------- | ----------------------------------------------------------- |
-| Tests                         | 1,297 total, zero warnings, clippy clean, `cargo fmt` clean |
+| Tests                         | 1,571 Rust and 53 TypeScript, zero warnings, clippy clean, `cargo fmt` clean |
 | Quad instances per frame      | 10,018                                                      |
 | Glyph instances per frame     | 178 (Latin, Thai, Japanese, Chinese, Korean, Arabic)        |
 | Mesh triangles per frame      | 1,980                                                       |
@@ -208,6 +275,7 @@ The zero is the point. See [`docs/architecture.md`](docs/architecture.md).
 
 ```bash
 cargo run -p uigallery                          --release  # every widget, live
+cargo run -p reactdemo                          --release  # React 19 in an in-process V8 isolate
 cargo run -p spherekit --example desktop_app    --release  # borderless, custom title bar
 cargo run -p spherekit --example system_window  --release  # the platform draws the title bar
 cargo run -p spherekit --example plugin_ui_demo --release  # a compressor plug-in editor
@@ -251,6 +319,8 @@ measured, which makes them usable as smoke tests.
 | [`docs/performance.md`](docs/performance.md)     | Targets, what is measured, and how                                      |
 | [`docs/api-bridge.md`](docs/api-bridge.md)       | React/native JSON Lines API and event bridge                            |
 | [`docs/spherekit-css.md`](docs/spherekit-css.md) | The stylesheet runtime and its v1 property boundary                     |
+| [`docs/react.md`](docs/react.md)                 | JSX to native widgets, and why a commit crosses as a whole tree         |
+| [`docs/javascript.md`](docs/javascript.md)       | Embedding V8: the engine surface, the prelude, bundling, the frame tick |
 | [`docs/roadmap.md`](docs/roadmap.md)             | Phase status and what is not built yet                                  |
 
 ## Licence

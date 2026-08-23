@@ -1,0 +1,18 @@
+{
+  "name": "spherekit-reactdemo-renderer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "bun build src/main.tsx --target=browser --format=iife --production --outfile dist/app.js"
+  },
+  "dependencies": {
+    "@spherekit/react": "file:../../../crates/spherekit-react",
+    "react": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "typescript": "^5.9.3"
+  }
+}

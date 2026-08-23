@@ -3,20 +3,41 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "@spherekit/react",
+      "name": "spherekit-monorepo",
+    },
+    "app/reactdemo/renderer": {
+      "name": "spherekit-reactdemo-renderer",
+      "version": "0.1.0",
       "dependencies": {
-        "react": "^19.1.1",
+        "@spherekit/react": "file:../../../crates/spherekit-react",
+        "react": "^19.2.8",
+      },
+      "devDependencies": {
+        "@types/react": "^19.2.18",
+        "typescript": "^5.9.3",
+      },
+    },
+    "crates/spherekit-react": {
+      "name": "@spherekit/react",
+      "version": "0.1.0",
+      "dependencies": {
         "react-reconciler": "^0.33.0",
       },
       "devDependencies": {
         "@types/bun": "latest",
         "@types/react": "^19.1.8",
         "@types/react-reconciler": "^0.33.0",
+        "react": "^19.2.8",
         "typescript": "^5.9.3",
+      },
+      "peerDependencies": {
+        "react": "^19.0.0",
       },
     },
   },
   "packages": {
+    "@spherekit/react": ["@spherekit/react@workspace:crates/spherekit-react"],
+
     "@types/bun": ["@types/bun@1.4.0", "", { "dependencies": { "bun-types": "1.4.0" } }, "sha512-K+lZULY23vRgK/CfTjFIV+tyifaNdSMlPh9j+6mQ/cLfpOznLyAuzgV/JQysyECpkBQLVMSyvjlr2fBUSA9wFQ=="],
 
     "@types/node": ["@types/node@26.2.0", "", { "dependencies": { "undici-types": "~8.3.0" } }, "sha512-5IviulTZeRNp2vAJ514cc/HUlY5nZ9fCbq9DMyC52BrhFZACo3nI0R7qBxhQmo/d27NFe96ur/b7Wwxklda+kg=="],
@@ -35,8 +56,12 @@
 
     "scheduler": ["scheduler@0.27.0", "", {}, "sha512-eNv+WrVbKu1f3vbYJT/xtiF5syA5HPIMtf9IgY/nKg0sWqzAUEvqY/xm7OcZc/qafLx/iO9FgOmeSAp4v5ti/Q=="],
 
+    "spherekit-reactdemo-renderer": ["spherekit-reactdemo-renderer@workspace:app/reactdemo/renderer"],
+
     "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
 
     "undici-types": ["undici-types@8.3.0", "", {}, "sha512-j375ScV60dom+YkPFIfTLcOiPxkN/buHz5GobjLhixFuANaNs3C9l4GmrWqejgXWJ7BbJcFYpTEUkS1Ge8bpZQ=="],
+
+    "spherekit-reactdemo-renderer/@spherekit/react": ["@spherekit/react@file:crates/spherekit-react", { "dependencies": { "react-reconciler": "^0.33.0" }, "devDependencies": { "@types/bun": "latest", "@types/react": "^19.1.8", "@types/react-reconciler": "^0.33.0", "react": "^19.2.8", "typescript": "^5.9.3" }, "peerDependencies": { "react": "^19.0.0" } }],
   }
 }

@@ -3,3 +3,5 @@
 *.pdb
 /.spherekit-cache
 /ref
+/node_modules
+**/node_modules

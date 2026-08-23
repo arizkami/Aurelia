@@ -15,16 +15,21 @@
   "license": "BSD-3-Clause",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "build:v8": "bun build index.tsx --target=browser --format=iife --production --outfile dist/app.js"
+  },
+  "//": "`react` is a peer dependency, not a dependency, and that is load-bearing. This package is a React *renderer*: `react-reconciler` installs the hook dispatcher onto `ReactSharedInternals`, and an application's components read it back through their own `react` import. If the two are different module instances the dispatcher an application sees is null, and the first state update originating outside a synchronous render fails with `Cannot read properties of null (reading 'useState')` — an error that names nothing about the duplicate install that caused it. Declaring react as a dependency would let a package manager give this package its own copy and make that the default outcome.",
+  "peerDependencies": {
+    "react": "^19.0.0"
   },
   "dependencies": {
-    "react": "^19.1.1",
     "react-reconciler": "^0.33.0"
   },
   "devDependencies": {
     "@types/bun": "latest",
     "@types/react": "^19.1.8",
     "@types/react-reconciler": "^0.33.0",
+    "react": "^19.2.8",
     "typescript": "^5.9.3"
   }
 }
