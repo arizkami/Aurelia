@@ -1,24 +1,64 @@
 {
   "name": "@spherekit/react",
-  "version": "0.1.0",
-  "module": "src/index.ts",
-  "types": "src/index.ts",
-  "exports": {
-    ".": {
-      "types": "./src/index.ts",
-      "import": "./src/index.ts",
-      "default": "./src/index.ts"
-    }
+  "version": "2026.8.0",
+  "description": "React 19 renderer for SphereKit: native, GPU-rendered UI with no DOM and no WebView.",
+  "keywords": [
+    "spherekit",
+    "react",
+    "react-renderer",
+    "react-reconciler",
+    "gpu",
+    "native-ui",
+    "rust",
+    "v8"
+  ],
+  "license": "BSD-3-Clause",
+  "author": "Futureboard Digital Technologies",
+  "homepage": "https://github.com/futureboard/SphereEngine#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/futureboard/SphereEngine.git",
+    "directory": "crates/spherekit-react"
+  },
+  "bugs": {
+    "url": "https://github.com/futureboard/SphereEngine/issues"
   },
   "type": "module",
   "private": false,
-  "license": "BSD-3-Clause",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./runtime/prelude.js": "./runtime/prelude.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "runtime",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test",
+    "build:types": "tsc -p tsconfig.build.json",
+    "build:js": "bun build src/index.ts --target=node --format=esm --packages=external --outfile dist/index.js",
+    "build": "bun run build:types && bun run build:js",
+    "prepack": "bun run build",
     "build:v8": "bun build index.tsx --target=browser --format=iife --production --outfile dist/app.js"
   },
-  "//": "`react` is a peer dependency, not a dependency, and that is load-bearing. This package is a React *renderer*: `react-reconciler` installs the hook dispatcher onto `ReactSharedInternals`, and an application's components read it back through their own `react` import. If the two are different module instances the dispatcher an application sees is null, and the first state update originating outside a synchronous render fails with `Cannot read properties of null (reading 'useState')` — an error that names nothing about the duplicate install that caused it. Declaring react as a dependency would let a package manager give this package its own copy and make that the default outcome.",
+  "//peerDependencies": "`react` is a peer dependency, not a dependency, and that is load-bearing. This package is a React *renderer*: `react-reconciler` installs the hook dispatcher onto `ReactSharedInternals`, and an application's components read it back through their own `react` import. If the two are different module instances the dispatcher an application sees is null, and the first state update originating outside a synchronous render fails with `Cannot read properties of null (reading 'useState')` — an error that names nothing about the duplicate install that caused it. Declaring react as a dependency would let a package manager give this package its own copy and make that the default outcome.",
   "peerDependencies": {
     "react": "^19.0.0"
   },

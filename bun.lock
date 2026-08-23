@@ -9,7 +9,7 @@
       "name": "spherekit-reactdemo-renderer",
       "version": "0.1.0",
       "dependencies": {
-        "@spherekit/react": "file:../../../crates/spherekit-react",
+        "@spherekit/react": "workspace:*",
         "react": "^19.2.8",
       },
       "devDependencies": {
@@ -19,7 +19,7 @@
     },
     "crates/spherekit-react": {
       "name": "@spherekit/react",
-      "version": "0.1.0",
+      "version": "2026.8.0",
       "dependencies": {
         "react-reconciler": "^0.33.0",
       },
@@ -61,7 +61,5 @@
     "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
 
     "undici-types": ["undici-types@8.3.0", "", {}, "sha512-j375ScV60dom+YkPFIfTLcOiPxkN/buHz5GobjLhixFuANaNs3C9l4GmrWqejgXWJ7BbJcFYpTEUkS1Ge8bpZQ=="],
-
-    "spherekit-reactdemo-renderer/@spherekit/react": ["@spherekit/react@file:crates/spherekit-react", { "dependencies": { "react-reconciler": "^0.33.0" }, "devDependencies": { "@types/bun": "latest", "@types/react": "^19.1.8", "@types/react-reconciler": "^0.33.0", "react": "^19.2.8", "typescript": "^5.9.3" }, "peerDependencies": { "react": "^19.0.0" } }],
   }
 }

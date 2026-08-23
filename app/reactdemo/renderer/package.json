@@ -8,7 +8,7 @@
     "build": "bun build src/main.tsx --target=browser --format=iife --production --outfile dist/app.js"
   },
   "dependencies": {
-    "@spherekit/react": "file:../../../crates/spherekit-react",
+    "@spherekit/react": "workspace:*",
     "react": "^19.2.8"
   },
   "devDependencies": {

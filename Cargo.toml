@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "2026.8.0"
 edition = "2024"
 rust-version = "1.87"
 license = "BSD-3-Clause"
@@ -31,21 +31,21 @@ authors = ["Futureboard Digital Technologies"]
 
 [workspace.dependencies]
 # --- internal ---
-spherekit-core     = { path = "crates/spherekit-core",     version = "0.1.0" }
-spherekit-render   = { path = "crates/spherekit-render",   version = "0.1.0" }
-spherekit-wgpu     = { path = "crates/spherekit-wgpu",     version = "0.1.0" }
-spherekit-text     = { path = "crates/spherekit-text",     version = "0.1.0" }
-spherekit-layout   = { path = "crates/spherekit-layout",   version = "0.1.0" }
-spherekit-svg      = { path = "crates/spherekit-svg",      version = "0.1.0" }
-spherekit-image    = { path = "crates/spherekit-image",    version = "0.1.0" }
-spherekit-platform = { path = "crates/spherekit-platform", version = "0.1.0" }
-spherekit-ui       = { path = "crates/spherekit-ui",       version = "0.1.0" }
-spherekit-audio-ui = { path = "crates/spherekit-audio-ui", version = "0.1.0" }
-spherekit-jsengine = { path = "crates/spherekit-jsengine", version = "0.1.0" }
-spherekit-react    = { path = "crates/spherekit-react",    version = "0.1.0" }
-spherekit-css      = { path = "crates/spherekit-css",      version = "0.1.0" }
-spherekit-bridge   = { path = "crates/spherekit-bridge",   version = "0.1.0" }
-spherekit          = { path = "crates/spherekit",          version = "0.1.0" }
+spherekit-core     = { path = "crates/spherekit-core",     version = "2026.8.0" }
+spherekit-render   = { path = "crates/spherekit-render",   version = "2026.8.0" }
+spherekit-wgpu     = { path = "crates/spherekit-wgpu",     version = "2026.8.0" }
+spherekit-text     = { path = "crates/spherekit-text",     version = "2026.8.0" }
+spherekit-layout   = { path = "crates/spherekit-layout",   version = "2026.8.0" }
+spherekit-svg      = { path = "crates/spherekit-svg",      version = "2026.8.0" }
+spherekit-image    = { path = "crates/spherekit-image",    version = "2026.8.0" }
+spherekit-platform = { path = "crates/spherekit-platform", version = "2026.8.0" }
+spherekit-ui       = { path = "crates/spherekit-ui",       version = "2026.8.0" }
+spherekit-audio-ui = { path = "crates/spherekit-audio-ui", version = "2026.8.0" }
+spherekit-jsengine = { path = "crates/spherekit-jsengine", version = "2026.8.0" }
+spherekit-react    = { path = "crates/spherekit-react",    version = "2026.8.0" }
+spherekit-css      = { path = "crates/spherekit-css",      version = "2026.8.0" }
+spherekit-bridge   = { path = "crates/spherekit-bridge",   version = "2026.8.0" }
+spherekit          = { path = "crates/spherekit",          version = "2026.8.0" }
 
 # --- foundation ---
 bitflags   = "2.13"

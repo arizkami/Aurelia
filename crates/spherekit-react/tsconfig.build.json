@@ -1,0 +1,39 @@
+{
+  // Declarations only, and no declaration maps. The JavaScript is produced by
+  // `bun build`, which bundles `src/index.ts` into one ESM file with every
+  // dependency left external.
+  //
+  // Maps are omitted because they would point at `src/`, and `src/` is not
+  // published — it shares a directory with this crate's Rust sources, so
+  // shipping it would put `host.rs` and `lower.rs` inside an npm tarball. A
+  // map to a file that is not there is worse than no map.
+  //
+  // Emitting the JS with tsc instead would ship extensionless relative imports
+  // (`from "./types"`), which Node's ESM resolver rejects outright. Rewriting
+  // every import to carry a `.js` extension is the usual answer; bundling is
+  // the cheaper one, and it also means a consumer resolves one file rather
+  // than fourteen.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    // `allowImportingTsExtensions` is incompatible with emit, and the sources
+    // do not use extensions anyway.
+    "allowImportingTsExtensions": false,
+    // `@types/bun` is a development dependency. A published declaration that
+    // referenced it would fail to compile in every consumer that does not
+    // happen to have Bun's types installed.
+    "types": [],
+    // Dropping Bun's types also drops the host globals the renderer uses —
+    // console, setTimeout, queueMicrotask, performance, navigator. `DOM`
+    // supplies their types without asking a consumer to install anything.
+    // It describes the *types* only: at runtime a browser and Bun provide
+    // these, and inside a bare V8 isolate `runtime/prelude.js` does.
+    "lib": ["ESNext", "DOM"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx"],
+  "exclude": ["test", "dist"]
+}

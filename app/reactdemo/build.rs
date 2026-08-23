@@ -34,7 +34,8 @@ fn main() {
         println!("cargo:rerun-if-changed={}", entry.display());
     }
 
-    match bundle_with_bun(&renderer, &bundle) {
+    let package = manifest_dir.join("../../crates/spherekit-react");
+    match bundle_with_bun(&renderer, &package, &bundle) {
         Ok(()) => println!("cargo:rustc-env=SPHEREKIT_REACTDEMO_BUNDLE=react"),
         Err(reason) => {
             println!("cargo:warning=reactdemo: {reason}");
@@ -48,11 +49,23 @@ fn main() {
     }
 }
 
-/// Runs Bun's bundler, installing dependencies first if they are missing.
-fn bundle_with_bun(renderer: &Path, bundle: &Path) -> Result<(), String> {
+/// Runs Bun's bundler, installing dependencies and building `@spherekit/react`
+/// first.
+///
+/// The package publishes compiled output — its `exports` point at `dist/`, not
+/// at the TypeScript sources — and `dist/` is build output, so it is not in the
+/// repository. Bundling the renderer before that exists fails with nothing more
+/// helpful than "Could not resolve @spherekit/react", so the build is run here
+/// rather than left as a step someone has to know about.
+fn bundle_with_bun(renderer: &Path, package: &Path, bundle: &Path) -> Result<(), String> {
     if !renderer.join("node_modules").is_dir() {
         run(renderer, "bun", &["install".into()])
             .map_err(|error| format!("`bun install` failed: {error}"))?;
+    }
+
+    if package.is_dir() {
+        run(package, "bun", &["run".into(), "build".into()])
+            .map_err(|error| format!("building @spherekit/react failed: {error}"))?;
     }
 
     run(
