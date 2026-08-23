@@ -29,7 +29,7 @@
 //!
 //! ## Shaders
 //!
-//! WGSL sources live in `shaders/` at the workspace root and are embedded at
+//! WGSL sources live in this crate's `shaders/` directory and are embedded at
 //! compile time. A one-directive include system ([`shader`]) shares the SDF and
 //! clip helpers between them without a preprocessor.
 

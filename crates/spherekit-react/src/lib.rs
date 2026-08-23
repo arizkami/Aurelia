@@ -68,3 +68,17 @@ pub use lower::{LowerContext, NodeBuilder};
 pub use tree::{MAX_NODE_COUNT, MAX_TREE_DEPTH, NativeNode, NativeTree, ReactHostError};
 
 pub use spherekit_ui::AnyElement;
+
+/// The JavaScript prelude a bare V8 context needs before a React bundle runs.
+///
+/// V8's context has no web and no Node globals at all — not `setTimeout`, not
+/// `console`, not `queueMicrotask`. React's modules reach for several of them
+/// during evaluation, before a single component renders, so an isolate without
+/// this throws `ReferenceError` at load and names only the first global it
+/// missed.
+///
+/// It is a `const` here rather than a file an embedder locates for itself
+/// because the alternative is every embedder hard-coding a relative path into
+/// this crate's source directory, which breaks the moment the crate is consumed
+/// from the registry instead of from a path.
+pub const PRELUDE: &str = include_str!("../runtime/prelude.js");

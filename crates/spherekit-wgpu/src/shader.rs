@@ -34,7 +34,7 @@ macro_rules! shader_table {
     ($($path:literal),* $(,)?) => {
         /// Every shader source embedded in the binary, as `(path, source)`.
         pub const SOURCES: &[(&str, &str)] = &[
-            $(($path, include_str!(concat!("../../../shaders/", $path)))),*
+            $(($path, include_str!(concat!("../shaders/", $path)))),*
         ];
     };
 }

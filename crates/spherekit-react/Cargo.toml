@@ -8,6 +8,26 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# This directory holds two packages: this crate, and the `@spherekit/react` npm
+# package that shares the name and the `src/` folder. Without this, `cargo
+# package` ships the TypeScript sources, the bun test suite and two tsconfigs
+# inside the Rust tarball — files no Rust consumer can use and that make the
+# crate look like it contains a JavaScript project.
+#
+# `runtime/prelude.js` is deliberately *not* excluded: `PRELUDE` embeds it, so
+# excluding it would stop the crate compiling.
+exclude = [
+    "src/*.ts",
+    "src/*.tsx",
+    "test",
+    "index.tsx",
+    "package.json",
+    "tsconfig.json",
+    "tsconfig.build.json",
+    "dist",
+    "node_modules",
+]
+
 [dependencies]
 spherekit-core.workspace = true
 spherekit-css.workspace = true

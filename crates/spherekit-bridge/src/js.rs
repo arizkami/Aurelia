@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn the_prelude_timer_queue_is_driven_by_tick() {
         let mut js = bridge();
-        js.install_prelude(include_str!("../../spherekit-react/runtime/prelude.js"))
+        js.install_prelude(spherekit_react::PRELUDE)
             .expect("prelude installs");
         eval(
             &mut js,

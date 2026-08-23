@@ -471,25 +471,25 @@ build options:\n  --path <dir>                 Project directory (default: curre
 type Template = (&'static str, &'static [u8]);
 
 const TEMPLATE_FILES: &[Template] = &[
-    ("package.json", include_bytes!("../../../template/spherekit-app-react/package.json")),
-    ("README.md", include_bytes!("../../../template/spherekit-app-react/README.md")),
-    ("spherekit.toml", include_bytes!("../../../template/spherekit-app-react/spherekit.toml")),
-    ("tsconfig.json", include_bytes!("../../../template/spherekit-app-react/tsconfig.json")),
+    ("package.json", include_bytes!("../template/spherekit-app-react/package.json")),
+    ("README.md", include_bytes!("../template/spherekit-app-react/README.md")),
+    ("spherekit.toml", include_bytes!("../template/spherekit-app-react/spherekit.toml")),
+    ("tsconfig.json", include_bytes!("../template/spherekit-app-react/tsconfig.json")),
     (
         "tsconfig.build.json",
-        include_bytes!("../../../template/spherekit-app-react/tsconfig.build.json"),
+        include_bytes!("../template/spherekit-app-react/tsconfig.build.json"),
     ),
     (
         "src/renderer/App.tsx",
-        include_bytes!("../../../template/spherekit-app-react/src/renderer/App.tsx"),
+        include_bytes!("../template/spherekit-app-react/src/renderer/App.tsx"),
     ),
     (
         "src/renderer/main.tsx",
-        include_bytes!("../../../template/spherekit-app-react/src/renderer/main.tsx"),
+        include_bytes!("../template/spherekit-app-react/src/renderer/main.tsx"),
     ),
     (
         "src/renderer/index.ts",
-        include_bytes!("../../../template/spherekit-app-react/src/renderer/index.ts"),
+        include_bytes!("../template/spherekit-app-react/src/renderer/index.ts"),
     ),
     // `.tmpl` on disk, `Cargo.toml` once written. The name is load-bearing:
     // this file's dependency values are `{{PLACEHOLDER}}`, which is not valid
@@ -499,17 +499,17 @@ const TEMPLATE_FILES: &[Template] = &[
     // project — a template they never asked for breaking a dependency they did.
     (
         "src/app/Cargo.toml",
-        include_bytes!("../../../template/spherekit-app-react/src/app/Cargo.toml.tmpl"),
+        include_bytes!("../template/spherekit-app-react/src/app/Cargo.toml.tmpl"),
     ),
     (
         "src/app/src/main.rs",
-        include_bytes!("../../../template/spherekit-app-react/src/app/src/main.rs"),
+        include_bytes!("../template/spherekit-app-react/src/app/src/main.rs"),
     ),
     (
         "src/app/src/lib.rs",
-        include_bytes!("../../../template/spherekit-app-react/src/app/src/lib.rs"),
+        include_bytes!("../template/spherekit-app-react/src/app/src/lib.rs"),
     ),
-    (".gitignore", include_bytes!("../../../template/spherekit-app-react/.gitignore")),
+    (".gitignore", include_bytes!("../template/spherekit-app-react/.gitignore")),
 ];
 
 #[cfg(test)]
@@ -574,7 +574,7 @@ mod tests {
         // to actually parse. A template that is merely *absent* from Cargo's
         // walk is not the same as one that works.
         let source = String::from_utf8(
-            include_bytes!("../../../template/spherekit-app-react/src/app/Cargo.toml.tmpl")
+            include_bytes!("../template/spherekit-app-react/src/app/Cargo.toml.tmpl")
                 .to_vec(),
         )
         .expect("template is UTF-8");

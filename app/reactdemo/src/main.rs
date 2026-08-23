@@ -65,7 +65,7 @@ use spherekit_react::EventQueue;
 const STYLESHEET: &str = include_str!("../styles/app.css");
 
 /// Web globals the bare V8 context does not have and React's modules expect.
-const PRELUDE: &str = include_str!("../../../crates/spherekit-react/runtime/prelude.js");
+const PRELUDE: &str = spherekit_react::PRELUDE;
 
 /// The bundled renderer, produced by `build.rs`.
 const RENDERER: &str = include_str!(concat!(env!("OUT_DIR"), "/app.js"));
