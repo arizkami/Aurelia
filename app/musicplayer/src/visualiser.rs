@@ -92,7 +92,18 @@ impl VisualPipeline {
     ///
     /// `samples` is interleaved and may be empty, which is what a paused or
     /// finished track looks like from the ring.
-    pub fn update(&mut self, samples: &[f32], channels: usize, sample_rate: f32, dt: f32) {
+    ///
+    /// `gain` is the player's output volume. The tap sits before the fader, so
+    /// everything here scales by it — otherwise the meters stay pinned while
+    /// the volume slider is at a quarter, which is what they did.
+    pub fn update(
+        &mut self,
+        samples: &[f32],
+        channels: usize,
+        sample_rate: f32,
+        gain: f32,
+        dt: f32,
+    ) {
         let mut visuals = self.visuals.borrow_mut();
         visuals.active = !samples.is_empty();
         visuals.nyquist_hz = sample_rate * 0.5;
@@ -104,26 +115,33 @@ impl VisualPipeline {
             visuals.left.advance(MIN_DB, false, dt, &self.ballistics);
             visuals.right.advance(MIN_DB, false, dt, &self.ballistics);
         } else {
-            self.analyzer.analyze(samples, channels);
+            self.analyzer.analyze(samples, channels, gain);
 
             let channels = channels.max(1);
             self.left_channel.clear();
             self.right_channel.clear();
             visuals.waveform.clear();
             for frame in samples.chunks_exact(channels) {
-                let left = frame[0];
+                let left = frame[0] * gain;
                 // Mono sources feed both meters from the one channel rather
                 // than leaving the right one dead.
-                let right = if channels > 1 { frame[1] } else { left };
+                let right = if channels > 1 { frame[1] * gain } else { left };
                 self.left_channel.push(left);
                 self.right_channel.push(right);
-                visuals.waveform.push(frame.iter().sum::<f32>() / channels as f32);
+                visuals.waveform.push(frame.iter().sum::<f32>() / channels as f32 * gain);
             }
 
             let left = ChannelLevel::measure(&self.left_channel);
             let right = ChannelLevel::measure(&self.right_channel);
-            visuals.left.advance(linear_to_db(left.peak), left.clipped, dt, &self.ballistics);
-            visuals.right.advance(linear_to_db(right.peak), right.clipped, dt, &self.ballistics);
+            // RMS drives the bar, peak only the clip indicator.
+            //
+            // A peak-fed bar reads correctly and displays uselessly: a modern
+            // master peaks within a decibel of full scale almost continuously,
+            // so on a -60..0 dB scale the bar sits pinned at the top and red,
+            // and it stops telling you anything about the music. RMS on the
+            // same scale sits around -18..-8 dB and actually moves.
+            visuals.left.advance(linear_to_db(left.rms), left.clipped, dt, &self.ballistics);
+            visuals.right.advance(linear_to_db(right.rms), right.clipped, dt, &self.ballistics);
         }
 
         visuals.spectrum.clear();
@@ -223,15 +241,73 @@ mod tests {
         let (mut pipeline, visuals) = VisualPipeline::new();
         let tone: Vec<f32> =
             (0..FFT_SIZE * 2).map(|i| (i as f32 * 0.05).sin()).flat_map(|s| [s, s]).collect();
-        pipeline.update(&tone, 2, 44_100.0, 1.0 / 60.0);
+        pipeline.update(&tone, 2, 44_100.0, 1.0, 1.0 / 60.0);
         let loud = visuals.borrow().left.level_db;
 
         for _ in 0..240 {
-            pipeline.update(&[], 2, 44_100.0, 1.0 / 60.0);
+            pipeline.update(&[], 2, 44_100.0, 1.0, 1.0 / 60.0);
         }
         let quiet = visuals.borrow().left.level_db;
         assert!(quiet < loud - 20.0, "meter held at {quiet} dB from {loud} dB");
         assert!(!visuals.borrow().active);
+    }
+
+    /// A loud, near-full-scale signal, like any modern master.
+    fn loud(seconds: f32) -> Vec<f32> {
+        let frames = (44_100.0 * seconds) as usize;
+        (0..frames).map(|i| 0.95 * (i as f32 * 0.07).sin()).flat_map(|s| [s, s]).collect()
+    }
+
+    #[test]
+    fn a_loud_master_does_not_pin_the_meter_at_the_top() {
+        // Feeding peak into a -60..0 dB scale is correct and useless: a modern
+        // master peaks within a decibel of full scale almost continuously, so
+        // the bar sits welded to the top in permanent clip red and stops saying
+        // anything about the music. RMS on the same scale has somewhere to go.
+        let (mut pipeline, visuals) = VisualPipeline::new();
+        pipeline.update(&loud(0.1), 2, 44_100.0, 1.0, 1.0 / 60.0);
+
+        let level = visuals.borrow().left.level_db;
+        assert!(level < -2.0, "the meter is pinned at {level} dB on ordinary loud material");
+        assert!(level > -30.0, "the meter is reading far too quiet at {level} dB");
+    }
+
+    #[test]
+    fn the_meters_follow_the_volume_control() {
+        // The tap is before the player's fader, so without applying the gain
+        // here the meters stay wherever the source put them while the speakers
+        // go quiet — which is exactly what turning the volume down looked like.
+        let signal = loud(0.1);
+
+        let (mut full, full_visuals) = VisualPipeline::new();
+        full.update(&signal, 2, 44_100.0, 1.0, 1.0 / 60.0);
+        let at_unity = full_visuals.borrow().left.level_db;
+
+        let (mut quiet, quiet_visuals) = VisualPipeline::new();
+        quiet.update(&signal, 2, 44_100.0, 0.25, 1.0 / 60.0);
+        let at_quarter = quiet_visuals.borrow().left.level_db;
+
+        // A quarter of the amplitude is about 12 dB down.
+        assert!(
+            (at_unity - at_quarter - 12.0).abs() < 2.0,
+            "a quarter volume moved the meter from {at_unity} to {at_quarter} dB"
+        );
+    }
+
+    #[test]
+    fn the_spectrum_follows_the_volume_control_too() {
+        // Otherwise the spectrum and the meters disagree about the same audio.
+        let signal = loud(0.1);
+
+        let (mut full, full_visuals) = VisualPipeline::new();
+        full.update(&signal, 2, 44_100.0, 1.0, 1.0 / 60.0);
+        let loud_peak = full_visuals.borrow().spectrum.iter().copied().fold(0.0f32, f32::max);
+
+        let (mut quiet, quiet_visuals) = VisualPipeline::new();
+        quiet.update(&signal, 2, 44_100.0, 0.25, 1.0 / 60.0);
+        let quiet_peak = quiet_visuals.borrow().spectrum.iter().copied().fold(0.0f32, f32::max);
+
+        assert!(quiet_peak < loud_peak * 0.5, "{quiet_peak} is not below {loud_peak}");
     }
 
     #[test]

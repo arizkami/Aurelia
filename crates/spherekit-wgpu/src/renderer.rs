@@ -162,6 +162,7 @@ impl WgpuRenderer {
         vsync: VsyncMode,
         transparent: bool,
         msaa_samples: u32,
+        backend: Backend,
     ) -> Result<Self, InitError>
     where
         W: wgpu::WasmNotSendSync
@@ -169,7 +170,7 @@ impl WgpuRenderer {
             + raw_window_handle::HasDisplayHandle
             + 'static,
     {
-        let instance = create_instance(transparent);
+        let instance = create_instance(transparent, backend);
         let surface =
             instance.create_surface(window).map_err(|e| InitError::Surface(e.to_string()))?;
 
@@ -740,31 +741,77 @@ fn pick_surface_format(caps: &wgpu::SurfaceCapabilities) -> wgpu::TextureFormat 
         .unwrap_or(caps.formats[0])
 }
 
+/// Which graphics API a surface renders through.
+///
+/// The default lets wgpu choose, which on a Windows machine with a discrete
+/// NVIDIA card usually means Vulkan. That is a reasonable default and a poor
+/// fit for some applications: D3D12 is the better-supported path for tooling,
+/// capture and presentation on Windows, and an application that knows it wants
+/// one should not have to set an environment variable to get it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Backend {
+    /// Let wgpu decide, honouring `WGPU_BACKEND`.
+    #[default]
+    Auto,
+    /// Direct3D 12. Ignored off Windows, where it does not exist.
+    Dx12,
+    /// Vulkan.
+    Vulkan,
+    /// Metal. Ignored off Apple platforms.
+    Metal,
+    /// OpenGL or GLES, as a last resort on hardware the others do not cover.
+    Gl,
+}
+
+impl Backend {
+    /// The wgpu backend set, or `None` for [`Backend::Auto`].
+    fn backends(self) -> Option<wgpu::Backends> {
+        match self {
+            Backend::Auto => None,
+            Backend::Dx12 => Some(wgpu::Backends::DX12),
+            Backend::Vulkan => Some(wgpu::Backends::VULKAN),
+            Backend::Metal => Some(wgpu::Backends::METAL),
+            Backend::Gl => Some(wgpu::Backends::GL),
+        }
+    }
+}
+
 /// Creates the instance used by a surface.
 ///
-/// Windows Vulkan swapchains have historically exposed different WSI
-/// behaviour for transparent windows across GPU drivers. DXGI/D3D12 with a
-/// DirectComposition visual is the stable Windows composition path, so
-/// transparent windows use it by default while still allowing an explicit
-/// `WGPU_BACKEND` override for diagnostics or applications that deliberately
-/// need Vulkan.
-fn create_instance(transparent: bool) -> wgpu::Instance {
-    // Only the Windows path reads this. Every other platform composites a
-    // transparent surface through the ordinary instance, so there is no backend
-    // choice to make and the parameter is genuinely unused there — which
-    // `-D warnings` correctly objects to unless it is said out loud.
+/// Three things decide the backend, in this order: `WGPU_BACKEND`, so a
+/// diagnostic run can always override whatever the application asked for; the
+/// application's own [`Backend`]; and, failing both, DX12 for a transparent
+/// Windows window.
+///
+/// That last default exists because Windows Vulkan swapchains have historically
+/// exposed different WSI behaviour for transparent windows across GPU drivers,
+/// while DXGI/D3D12 with a DirectComposition visual is the stable Windows
+/// composition path.
+fn create_instance(transparent: bool, backend: Backend) -> wgpu::Instance {
+    // Only the Windows path reads these. Every other platform composites a
+    // transparent surface through the ordinary instance, and `Backends` there
+    // is whatever wgpu compiled in.
     #[cfg(not(windows))]
     let _ = transparent;
 
+    // Honoured on every path, not just the transparent one. The doc comment
+    // above has always promised this; before, a non-transparent window ignored
+    // the variable entirely and `WGPU_BACKEND=dx12` silently did nothing.
+    let requested_backends = std::env::var("WGPU_BACKEND")
+        .ok()
+        .map(|value| wgpu::Backends::from_comma_list(&value))
+        .filter(|backends| !backends.is_empty());
+
     #[cfg(windows)]
-    if transparent {
-        let requested_backends = std::env::var("WGPU_BACKEND")
-            .ok()
-            .map(|value| wgpu::Backends::from_comma_list(&value))
-            .filter(|backends| !backends.is_empty());
-        let backend_override = requested_backends.is_some();
+    let fallback = transparent.then_some(wgpu::Backends::DX12);
+    #[cfg(not(windows))]
+    let fallback = None;
+
+    let chosen = requested_backends.or_else(|| backend.backends()).or(fallback);
+
+    if let Some(backends) = chosen {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-        descriptor.backends = requested_backends.unwrap_or(wgpu::Backends::DX12);
+        descriptor.backends = backends;
         descriptor.backend_options = descriptor.backend_options.with_env();
 
         // wgpu 30's `Auto` compiler probes `dxcompiler.dll` from the process
@@ -782,21 +829,22 @@ fn create_instance(transparent: bool) -> wgpu::Instance {
         // `DxgiFromHwnd` is wgpu's default, but it explicitly does not support
         // transparent swapchains. Use the DirectComposition visual path for a
         // transparent window; it is the DX12 presentation mode designed for
-        // alpha-composited surfaces. Keep an explicit presentation-system
-        // override for diagnostics and host applications that manage their own
-        // composition policy.
-        if descriptor.backends.contains(wgpu::Backends::DX12)
+        // alpha-composited surfaces. An opaque window keeps the ordinary HWND
+        // path, which is the one every capture and overlay tool understands.
+        if transparent
+            && descriptor.backends.contains(wgpu::Backends::DX12)
             && std::env::var_os("WGPU_DX12_PRESENTATION_SYSTEM").is_none()
         {
             descriptor.backend_options.dx12.presentation_system =
                 wgpu::Dx12SwapchainKind::DxgiFromVisual;
         }
+
         tracing::info!(
             target: "spherekit_wgpu",
-            forced_dx12 = !backend_override,
-            shader_compiler = ?descriptor.backend_options.dx12.shader_compiler,
-            presentation = ?descriptor.backend_options.dx12.presentation_system,
-            "transparent Windows surface: using the DX12 DirectComposition path"
+            backends = ?descriptor.backends,
+            from_env = requested_backends.is_some(),
+            transparent,
+            "spherekit-wgpu instance backend selected"
         );
         return wgpu::Instance::new(descriptor);
     }

@@ -3,8 +3,9 @@
 use crate::events::EventQueue;
 use crate::lower::{LowerContext, NodeBuilder, lower_tree};
 use crate::tree::{NativeNode, NativeTree, NodePath, ReactHostError, index_tree, node_at};
-use spherekit_css::{StyleContext, Stylesheet};
+use spherekit_css::{InteractiveStyle, StyleContext, Stylesheet, TextProperties};
 use spherekit_ui::AnyElement;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -22,6 +23,25 @@ pub struct ReactHost {
     stylesheet: Stylesheet,
     context: StyleContext,
     builders: HashMap<String, NodeBuilder>,
+    /// Resolved styles from the last lowering pass, keyed by node id.
+    ///
+    /// Lowering runs every frame, and a frame in which nothing committed
+    /// resolves exactly the same cascade for exactly the same nodes. The layout
+    /// tree has always made an unchanged frame free; this is the same promise
+    /// for styling, and on a few thousand nodes it is the difference between
+    /// most of the frame budget and none of it.
+    ///
+    /// Everything that could change an outcome — a commit, a new stylesheet, a
+    /// new context — clears it wholesale. Nothing here is invalidated
+    /// selectively, because a partial invalidation that is wrong shows up as a
+    /// node that will not restyle, which is far harder to see than a slow frame.
+    styles: RefCell<HashMap<u64, CachedStyle>>,
+}
+
+/// One node's resolved style, reused across frames until something invalidates it.
+pub(crate) struct CachedStyle {
+    pub(crate) style: InteractiveStyle,
+    pub(crate) text: TextProperties,
 }
 
 impl ReactHost {
@@ -49,6 +69,7 @@ impl ReactHost {
         let index = index_tree(&tree)?;
         self.tree = tree;
         self.index = index;
+        self.invalidate_styles();
         Ok(())
     }
 
@@ -77,6 +98,7 @@ impl ReactHost {
     pub fn set_stylesheet(&mut self, css: &str) -> Result<(), spherekit_css::CssError> {
         let stylesheet = Stylesheet::parse(css)?;
         self.stylesheet = stylesheet;
+        self.invalidate_styles();
         Ok(())
     }
 
@@ -93,6 +115,9 @@ impl ReactHost {
     /// context produces a correct-looking tree measured against the wrong
     /// viewport.
     pub fn set_style_context(&mut self, context: StyleContext) {
+        if self.context != context {
+            self.invalidate_styles();
+        }
         self.context = context;
     }
 
@@ -113,6 +138,16 @@ impl ReactHost {
     }
 
     /// The application-registered builder for a host type, if there is one.
+    /// Drops every cached style. Called whenever an input to the cascade moves.
+    fn invalidate_styles(&self) {
+        self.styles.borrow_mut().clear();
+    }
+
+    /// The style cache, for the lowering walk.
+    pub(crate) fn style_cache(&self) -> &RefCell<HashMap<u64, CachedStyle>> {
+        &self.styles
+    }
+
     pub(crate) fn builder(&self, name: &str) -> Option<&NodeBuilder> {
         self.builders.get(name)
     }
@@ -571,6 +606,43 @@ mod tests {
         assert_eq!(events[0].event, "press");
         assert_eq!(events[0].node_id, 4);
         assert_eq!(events[0].payload, None);
+    }
+
+    #[test]
+    fn a_view_with_a_handler_reports_a_press_like_a_button_does() {
+        // A list row, a card, a tab: all of them are a container with an
+        // `onPress`, and none of them are a button. The TypeScript `View` sets
+        // `pressable` when it sees a handler, because the handler itself is
+        // stripped before the tree crosses the bridge and the host would
+        // otherwise have no way to tell an interactive container from a layout
+        // one.
+        let json =
+            r#"{"revision":1,"children":[{"id":9,"type":"view","props":{"pressable":true}}]}"#;
+        let host = interactive_host(json);
+        let queue = EventQueue::new();
+        let mut ui = mount(&host, &queue);
+        let at = centre_of(&ui, 9);
+        ui.dispatch(&mouse(at, ElementState::Pressed));
+        ui.dispatch(&mouse(at, ElementState::Released));
+
+        let events = queue.drain();
+        assert_eq!(events.len(), 1, "a pressable view did not report its press");
+        assert_eq!(events[0].event, "press");
+        assert_eq!(events[0].node_id, 9);
+    }
+
+    #[test]
+    fn an_ordinary_view_stays_silent() {
+        // The gate matters: wiring every container would put an event on the
+        // bridge for every click anywhere in the tree, including the dozens of
+        // nested layout views a real screen is built from.
+        let host = interactive_host(r#"{"revision":1,"children":[{"id":9,"type":"view"}]}"#);
+        let queue = EventQueue::new();
+        let mut ui = mount(&host, &queue);
+        let at = centre_of(&ui, 9);
+        ui.dispatch(&mouse(at, ElementState::Pressed));
+        ui.dispatch(&mouse(at, ElementState::Released));
+        assert!(queue.is_empty(), "a plain layout view reported a press");
     }
 
     #[test]

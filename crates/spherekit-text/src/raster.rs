@@ -971,6 +971,24 @@ mod tests {
 
     // -- integration with a real face ---------------------------------------
 
+    /// A face with Thai coverage, or `None` on a machine without one.
+    fn thai_font() -> Option<Vec<u8>> {
+        for path in [
+            "C:/Windows/Fonts/leelawui.ttf",
+            "C:/Windows/Fonts/leelawad.ttf",
+            "C:/Windows/Fonts/tahoma.ttf",
+            "/usr/share/fonts/truetype/tlwg/Loma.ttf",
+            "/System/Library/Fonts/Supplemental/Thonburi.ttc",
+        ] {
+            if let Ok(data) = std::fs::read(path)
+                && ttf_parser::Face::parse(&data, 0).is_ok_and(|f| f.glyph_index('่').is_some())
+            {
+                return Some(data);
+            }
+        }
+        None
+    }
+
     fn system_font() -> Option<Vec<u8>> {
         for path in [
             "C:/Windows/Fonts/segoeui.ttf",
@@ -1027,6 +1045,44 @@ mod tests {
         let full = img.data.len() as u32 * 255;
         assert!(ink > full / 10, "an 'H' should have ink: {ink}/{full}");
         assert!(ink < full * 9 / 10, "an 'H' should not be a solid block: {ink}/{full}");
+    }
+
+    #[test]
+    fn a_thai_tone_mark_keeps_its_negative_bearing_and_stays_above_the_baseline() {
+        // A Thai tone mark carries its whole placement in its outline: the
+        // advance is zero, the left bearing is strongly negative so the mark
+        // pulls back over the consonant it follows, and the ink sits far above
+        // the baseline. The shaper moves it not at all — a zero `y_offset` is
+        // correct — so if rasterisation clamps either of those, the mark lands
+        // to the right of its base sitting on the baseline, which is what
+        // broken Thai tone marks look like.
+        let Some(data) = thai_font() else {
+            eprintln!("skipping: no Thai-capable system font found");
+            return;
+        };
+        let face = ttf_parser::Face::parse(&data, 0).unwrap();
+        let Some(gid) = face.glyph_index('่') else { return };
+        let glyph = GlyphId(gid.0);
+        let Ok(metrics) = glyph_metrics(&face, glyph) else { return };
+
+        assert_eq!(metrics.advance, 0.0, "a tone mark must not advance the pen");
+        assert!(
+            metrics.left_bearing < 0.0,
+            "the bearing is {}, so the mark draws beside its base rather than over it",
+            metrics.left_bearing
+        );
+
+        let img = rasterize_glyph(&face, glyph, 16.0).unwrap();
+        assert!(
+            img.bounds_em.max_y() < 0.0,
+            "the rasterised mark reaches y={} in a y-down box, so it sits on the baseline",
+            img.bounds_em.max_y()
+        );
+        assert!(
+            img.bounds_em.min_x() < 0.0,
+            "the rasterised mark starts at x={}, so its negative bearing was lost",
+            img.bounds_em.min_x()
+        );
     }
 
     #[test]

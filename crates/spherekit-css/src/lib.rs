@@ -70,7 +70,7 @@ pub use selector::{ElementState, MatchPath, Node};
 pub use text::TextProperties;
 
 use parser::{Declaration, Rule, substitute_vars};
-use selector::{BucketKey, Specificity};
+use selector::{BucketKey, Specificity, StateUse};
 use spherekit_core::{Color, Corners, Px, Shadow, Size, px};
 use spherekit_layout::Style;
 use spherekit_ui::{Cursor, FocusRing, Styled};
@@ -179,7 +179,20 @@ pub struct Stylesheet {
     /// changed. Bucketing turns that into "look up my id, my classes and my
     /// element name", which for a typical node visits a handful of rules and,
     /// crucially, never touches a rule for a class the node does not carry.
-    buckets: HashMap<BucketKey, Vec<usize>>,
+    /// Rules whose subject compound names no id, class or element.
+    universal: Vec<usize>,
+    by_id: HashMap<String, Vec<usize>>,
+    by_class: HashMap<String, Vec<usize>>,
+    /// Keyed by lower-cased element name.
+    by_element: HashMap<String, Vec<usize>>,
+    /// Which interaction states any rule in the sheet actually tests.
+    ///
+    /// `resolve_interactive` runs the whole cascade once per state. A sheet
+    /// that never writes `:active` cannot produce an active style that differs
+    /// from the base one, so running that pass is provably wasted work — and it
+    /// is the common case: most sheets style hover and nothing else. On a
+    /// 3500-node tree the difference is the whole frame budget.
+    states: StateUse,
 }
 
 impl Stylesheet {
@@ -194,11 +207,27 @@ impl Stylesheet {
     /// applied with surprising semantics.
     pub fn parse(source: &str) -> Result<Self, CssError> {
         let rules = parser::parse_rules(source)?;
-        let mut buckets: HashMap<BucketKey, Vec<usize>> = HashMap::new();
+        let mut universal = Vec::new();
+        let mut by_id: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut by_class: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut by_element: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut states = StateUse::default();
         for (index, rule) in rules.iter().enumerate() {
-            buckets.entry(rule.selector.bucket_key()).or_default().push(index);
+            // Separate maps rather than one keyed by an enum: a
+            // `HashMap<String, _>` can be looked up with a `&str`, and an
+            // enum-keyed one has to be handed an owned key. That difference is
+            // a `String` allocation per class per node per frame.
+            match rule.selector.bucket_key() {
+                BucketKey::Universal => universal.push(index),
+                BucketKey::Id(id) => by_id.entry(id).or_default().push(index),
+                BucketKey::Class(class) => by_class.entry(class).or_default().push(index),
+                BucketKey::Element(element) => {
+                    by_element.entry(element.to_ascii_lowercase()).or_default().push(index)
+                }
+            }
+            states.merge(rule.selector.state_use());
         }
-        Ok(Self { rules, buckets })
+        Ok(Self { rules, universal, by_id, by_class, by_element, states })
     }
 
     /// Returns the number of selectors retained by the runtime.
@@ -235,7 +264,7 @@ impl Stylesheet {
         context: &StyleContext,
     ) -> ResolvedStyle {
         let variables = self.custom_properties(path, inline_css, context);
-        let mut winners: Vec<Winner> = Vec::new();
+        let mut winners: Vec<Winner<'_>> = Vec::new();
 
         for rule in self.matching_rules(path, context) {
             let specificity = rule.selector.specificity();
@@ -243,32 +272,33 @@ impl Stylesheet {
                 consider(&mut winners, declaration, specificity, rule.order);
             }
         }
-        if let Some(inline_css) = inline_css
-            && let Ok(declarations) = parser::parse_declarations(inline_css)
-        {
-            for declaration in &declarations {
+        // Parsed into a binding rather than a temporary so the winners can
+        // borrow from it for the rest of this function.
+        let inline = inline_css.and_then(|css| parser::parse_declarations(css).ok());
+        if let Some(declarations) = inline.as_deref() {
+            for declaration in declarations {
                 consider(&mut winners, declaration, Specificity::INLINE, usize::MAX);
             }
         }
 
         // `var()` is substituted after the cascade, not before, so that a
         // variable defined by a losing rule cannot leak into a winning value.
-        let mut resolved: Vec<(String, String)> = winners
+        let mut resolved: Vec<(&str, std::borrow::Cow<'_, str>)> = winners
             .into_iter()
             .filter(|winner| !winner.property.starts_with("--"))
             .filter_map(|winner| {
-                substitute_vars(&winner.value, &variables, 0).map(|value| (winner.property, value))
+                substitute_vars(winner.value, &variables, 0).map(|value| (winner.property, value))
             })
             .collect();
         resolved.sort_by(|a, b| {
-            (property::apply_tier(&a.0), &a.0).cmp(&(property::apply_tier(&b.0), &b.0))
+            (property::apply_tier(a.0), a.0).cmp(&(property::apply_tier(b.0), b.0))
         });
 
         // `font-size` has to land before anything that measures in `em`, and it
         // is itself measured against the *parent's* size, so it is applied with
         // the incoming context and everything else with the updated one.
         let mut inner = *context;
-        if let Some((_, value)) = resolved.iter().find(|(property, _)| property == "font-size")
+        if let Some((_, value)) = resolved.iter().find(|(property, _)| *property == "font-size")
             && let Some(size) = text::parse_font_size(value, context)
         {
             inner.font_size = size;
@@ -276,7 +306,7 @@ impl Stylesheet {
 
         let mut style = ResolvedStyle::default();
         for (name, value) in &resolved {
-            let scope = if name == "font-size" { context } else { &inner };
+            let scope = if *name == "font-size" { context } else { &inner };
             property::apply_declaration(&mut style, name, value, scope);
         }
         style
@@ -294,20 +324,28 @@ impl Stylesheet {
         context: &StyleContext,
     ) -> InteractiveStyle {
         let base = self.resolve_in(path, inline_css, context);
-        let variant = |mutate: fn(&mut ElementState)| {
+        // Each variant is a full cascade. Running one for a state no rule in
+        // the sheet mentions cannot produce anything but a copy of the base,
+        // and it costs exactly as much as a pass that could — so the sheet's
+        // precomputed usage decides whether to bother. A sheet with only
+        // `:hover` does two passes here instead of four.
+        let variant = |wanted: bool, mutate: fn(&mut ElementState)| {
+            if !wanted {
+                return None;
+            }
             let mut state = path.subject().state;
             mutate(&mut state);
             let variant = self.resolve_in(&path.with_subject_state(state), inline_css, context);
             (variant != base).then_some(variant)
         };
-        let hover = variant(|state| state.hover = true);
+        let hover = variant(self.states.hover, |state| state.hover = true);
         // A pressed pointer is also a hovering pointer, and a stylesheet that
         // only defines `:hover` should still light up on press.
-        let active = variant(|state| {
+        let active = variant(self.states.hover || self.states.active, |state| {
             state.hover = true;
             state.active = true;
         });
-        let focus = variant(|state| state.focus = true);
+        let focus = variant(self.states.focus, |state| state.focus = true);
         InteractiveStyle { base, hover, active, focus }
     }
 
@@ -324,18 +362,28 @@ impl Stylesheet {
     /// Rule indices that could possibly match this node, in source order.
     fn candidate_rules(&self, node: Node<'_>) -> Vec<usize> {
         let mut indices: Vec<usize> = Vec::new();
-        let mut extend = |key: &BucketKey| {
-            if let Some(bucket) = self.buckets.get(key) {
-                indices.extend_from_slice(bucket);
-            }
-        };
-        extend(&BucketKey::Universal);
-        extend(&BucketKey::Element(node.element.to_ascii_lowercase()));
-        if let Some(id) = node.id {
-            extend(&BucketKey::Id(id.to_string()));
+        indices.extend_from_slice(&self.universal);
+
+        // Element names are almost always written lower-case already, so the
+        // borrowed lookup succeeds without allocating; the owned fallback is
+        // for the sheet that spells one `View`.
+        if let Some(bucket) = self.by_element.get(node.element) {
+            indices.extend_from_slice(bucket);
+        } else if node.element.bytes().any(|byte| byte.is_ascii_uppercase())
+            && let Some(bucket) = self.by_element.get(&node.element.to_ascii_lowercase())
+        {
+            indices.extend_from_slice(bucket);
+        }
+
+        if let Some(id) = node.id
+            && let Some(bucket) = self.by_id.get(id)
+        {
+            indices.extend_from_slice(bucket);
         }
         for class in node.classes.split_whitespace() {
-            extend(&BucketKey::Class(class.to_string()));
+            if let Some(bucket) = self.by_class.get(class) {
+                indices.extend_from_slice(bucket);
+            }
         }
         indices.sort_unstable();
         indices.dedup();
@@ -375,17 +423,21 @@ impl Stylesheet {
                 }
             }
         }
-        if let Some(inline_css) = inline_css
-            && let Ok(declarations) = parser::parse_declarations(inline_css)
-        {
-            for declaration in &declarations {
+        // Bound rather than left a temporary, so the winners can borrow from it
+        // until they are copied into the map below.
+        let inline = inline_css.and_then(|css| parser::parse_declarations(css).ok());
+        if let Some(declarations) = inline.as_deref() {
+            for declaration in declarations {
                 if declaration.property.starts_with("--") {
                     consider(&mut winners, declaration, Specificity::INLINE, usize::MAX);
                 }
             }
         }
+        // Owned here and only here: the variable map outlives the borrow of the
+        // declarations it came from, and there are a handful of custom
+        // properties in a sheet against thousands of ordinary ones.
         for winner in winners {
-            variables.insert(winner.property, winner.value);
+            variables.insert(winner.property.to_owned(), winner.value.to_owned());
         }
     }
 }
@@ -523,24 +575,29 @@ impl InteractiveStyle {
 }
 
 /// One property's current best candidate during the cascade.
-#[derive(Clone, Debug)]
-struct Winner {
-    property: String,
-    value: String,
+///
+/// Borrows from the rule it came from. The cascade visits every declaration of
+/// every matching rule, for every node, on every frame; cloning the property
+/// and value out of each one — before even knowing whether it wins — was the
+/// single largest cost in styling a large tree.
+#[derive(Clone, Copy, Debug)]
+struct Winner<'a> {
+    property: &'a str,
+    value: &'a str,
     important: bool,
     specificity: Specificity,
     order: usize,
 }
 
-fn consider(
-    winners: &mut Vec<Winner>,
-    declaration: &Declaration,
+fn consider<'a>(
+    winners: &mut Vec<Winner<'a>>,
+    declaration: &'a Declaration,
     specificity: Specificity,
     order: usize,
 ) {
     let candidate = Winner {
-        property: declaration.property.clone(),
-        value: declaration.value.clone(),
+        property: &declaration.property,
+        value: &declaration.value,
         important: declaration.important,
         specificity,
         order: order.saturating_mul(10_000).saturating_add(declaration.order),

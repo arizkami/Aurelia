@@ -118,6 +118,14 @@ impl Player {
         }
     }
 
+    /// Output gain, `0.0..=1.0`, or zero with no device.
+    ///
+    /// Read once per frame by the visualisers, which sit before the fader and
+    /// have to apply it themselves.
+    pub fn volume(&self) -> f32 {
+        self.engine.as_ref().map(|engine| engine.volume()).unwrap_or(0.0)
+    }
+
     /// Sets output gain, `0.0..=1.0`.
     pub fn set_volume(&mut self, volume: f64) {
         if let Some(engine) = self.engine.as_mut() {
@@ -136,6 +144,20 @@ impl Player {
         }
         self.skip(1);
         true
+    }
+
+    /// Loads `folder` as the library, then plays the one file inside it.
+    ///
+    /// One call rather than a rescan followed by a select: between the two the
+    /// index the caller computed would refer to the previous library, and the
+    /// wrong track would start.
+    pub fn play_file(&mut self, folder: &Path, file: &Path) {
+        self.rescan(folder);
+        if let Some(index) = self.tracks.iter().position(|track| track.path == file) {
+            self.select(index);
+        } else {
+            self.last_error = Some(format!("{} is not in {}", file.display(), folder.display()));
+        }
     }
 
     /// Everything the React side renders, as one JSON value.

@@ -9,7 +9,7 @@ import {
   cx,
   type SphereKitApiBridge,
 } from "@spherekit/react";
-import { FolderTree } from "./FolderTree";
+import { FolderTree, type FolderEntry } from "./FolderTree";
 import { IDLE_STATE, formatTime, type LibraryTrack, type PlayerState } from "./types";
 
 /** Everything the player needs from the native side. */
@@ -35,11 +35,18 @@ export function App({ bridge }: AppProps) {
   const [pane, setPane] = useState<"tracks" | "folders">("tracks");
   /** The folder the loaded library came from, highlighted in the tree. */
   const [openPath, setOpenPath] = useState<string | null>(null);
+  /** Every drive on the machine, and the one the tree is showing. */
+  const [drives, setDrives] = useState<readonly FolderEntry[]>([]);
+  const [drive, setDrive] = useState<FolderEntry | null>(null);
 
   useEffect(() => bridge.on<PlayerState>("player.state", setState), [bridge]);
 
   useEffect(() => {
     void bridge.invoke<readonly LibraryTrack[]>("player.library").then(setLibrary);
+  }, [bridge]);
+
+  useEffect(() => {
+    void bridge.invoke<readonly FolderEntry[]>("browser.roots").then(setDrives);
   }, [bridge]);
 
   const current = state.index === null ? undefined : library[state.index];
@@ -55,6 +62,19 @@ export function App({ bridge }: AppProps) {
         // what is in it, and leaving the tree up hides the result.
         setPane("tracks");
       });
+    },
+    [bridge],
+  );
+
+  const playFile = useCallback(
+    (folder: string, file: string) => {
+      void bridge
+        .invoke<readonly LibraryTrack[]>("browser.playFile", { folder, file })
+        .then((next) => {
+          setLibrary(next);
+          setOpenPath(folder);
+          setPane("tracks");
+        });
     },
     [bridge],
   );
@@ -94,6 +114,26 @@ export function App({ bridge }: AppProps) {
     <View className="app">
       <View className="body">
         <View className="sidebar">
+          {/*
+            The drive strip is always visible, in both panes. Putting drive
+            switching behind the FOLDERS tab meant the one control for "look
+            somewhere else entirely" was the hardest one to find.
+          */}
+          <View className="drives">
+            {drives.map((entry) => (
+              <View
+                key={entry.path}
+                className={cx("drive", drive?.path === entry.path && "active")}
+                onPress={() => {
+                  setDrive(entry);
+                  setPane("folders");
+                }}
+              >
+                <Text className="drive-label">{entry.name.replace(/[:\/]/g, "")}</Text>
+              </View>
+            ))}
+          </View>
+
           <View className="sidebar-header">
             <View
               className={cx("tab", pane === "tracks" && "active")}
@@ -112,7 +152,13 @@ export function App({ bridge }: AppProps) {
             {pane === "tracks" ? (
               rows
             ) : (
-              <FolderTree bridge={bridge} openPath={openPath} onOpen={openFolder} />
+              <FolderTree
+                bridge={bridge}
+                drive={drive}
+                openPath={openPath}
+                onOpen={openFolder}
+                onPlayFile={playFile}
+              />
             )}
           </ScrollView>
         </View>

@@ -17,9 +17,10 @@ const MAX_ENTRIES: usize = 400;
 
 /// One level of the tree, as JSON.
 ///
-/// Reports the folder itself, its parent (so the UI can offer "up") and its
-/// immediate subfolders. Whether a folder holds playable audio is answered
-/// here too, because the alternative is React asking per row.
+/// Reports the folder itself, its parent, its immediate subfolders, and the
+/// playable files directly inside it. Everything else in the directory is left
+/// out: a music browser that lists `.dll` and `.txt` is a file manager, and the
+/// player cannot open them anyway.
 pub fn list(path: &Path) -> Value {
     let mut folders = Vec::new();
     let mut truncated = false;
@@ -50,6 +51,33 @@ pub fn list(path: &Path) -> Value {
         }
     }
 
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            if files.len() >= MAX_ENTRIES {
+                truncated = true;
+                break;
+            }
+            let Ok(file_type) = entry.file_type() else { continue };
+            if !file_type.is_file() {
+                continue;
+            }
+            let file = entry.path();
+            // Only what the bundled decoders can open. Offering anything else
+            // means a row that fails the moment it is clicked.
+            let Some(track) = crate::library::track_at(&file) else { continue };
+            files.push(json!({
+                "name": track.title,
+                "path": file.to_string_lossy(),
+            }));
+        }
+    }
+    files.sort_by(|a, b| {
+        let left = a["name"].as_str().unwrap_or_default().to_lowercase();
+        let right = b["name"].as_str().unwrap_or_default().to_lowercase();
+        left.cmp(&right)
+    });
+
     folders.sort_by(|a, b| {
         let left = a["name"].as_str().unwrap_or_default().to_lowercase();
         let right = b["name"].as_str().unwrap_or_default().to_lowercase();
@@ -61,37 +89,30 @@ pub fn list(path: &Path) -> Value {
         "name": display_name(path),
         "parent": path.parent().map(|parent| parent.to_string_lossy().into_owned()),
         "folders": folders,
+        "files": files,
         "truncated": truncated,
         "trackCount": crate::library::scan_shallow(path),
     })
 }
 
-/// Where the tree starts when nothing else is known.
+/// Where the tree starts: the drives themselves, and nothing else.
 ///
-/// The music folder first, because that is what a music player should open on;
-/// the drives behind it, because a library that lives anywhere else has to be
-/// reachable without typing a path.
+/// Shortcuts to the music and home folders used to sit above these. They are
+/// gone deliberately — they duplicate paths already reachable by expanding a
+/// drive, and a tree whose first level mixes "a place" with "a device" makes
+/// the same folder appear twice under different names.
 pub fn roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(music) = crate::library::default_music_directory() {
-        roots.push(music);
-    }
-    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
-        let home = PathBuf::from(home);
-        if home.is_dir() && !roots.contains(&home) {
-            roots.push(home);
-        }
-    }
     #[cfg(windows)]
-    for letter in b'A'..=b'Z' {
-        let drive = PathBuf::from(format!("{}:\\", letter as char));
-        if drive.is_dir() {
-            roots.push(drive);
-        }
+    {
+        (b'A'..=b'Z')
+            .map(|letter| PathBuf::from(format!("{}:\\", letter as char)))
+            .filter(|drive| drive.is_dir())
+            .collect()
     }
     #[cfg(not(windows))]
-    roots.push(PathBuf::from("/"));
-    roots
+    {
+        vec![PathBuf::from("/")]
+    }
 }
 
 /// The roots, as JSON, for the tree's top level.
@@ -124,6 +145,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    #[test]
+    fn the_tree_starts_at_the_drives_and_nothing_else() {
+        // Shortcuts to Music and Home used to sit above the drives, which made
+        // the same folder appear twice under two different names.
+        let roots = roots();
+        assert!(!roots.is_empty(), "no roots at all");
+        for root in &roots {
+            assert!(root.parent().is_none(), "{} is not a drive root", root.display());
+        }
+    }
+
+    #[test]
+    fn a_level_lists_playable_files_and_nothing_else() {
+        // The tree is a music browser. Listing `.dll` and `.txt` would make it
+        // a file manager, and the player cannot open them anyway.
+        let root = temp_dir("files");
+        std::fs::write(root.join("song.mp3"), b"").unwrap();
+        std::fs::write(root.join("other.flac"), b"").unwrap();
+        std::fs::write(root.join("readme.txt"), b"").unwrap();
+        std::fs::write(root.join("art.jpg"), b"").unwrap();
+
+        let level = list(&root);
+        let names: Vec<_> = level["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, ["other", "song"], "the tree listed something unplayable");
+    }
+
+    #[test]
+    fn listed_files_carry_the_path_needed_to_play_them() {
+        let root = temp_dir("filepaths");
+        std::fs::write(root.join("song.mp3"), b"").unwrap();
+        let level = list(&root);
+        let path = level["files"][0]["path"].as_str().unwrap();
+        assert!(path.ends_with("song.mp3"), "{path}");
     }
 
     #[test]

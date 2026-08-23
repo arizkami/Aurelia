@@ -1035,6 +1035,52 @@ mod tests {
     }
 
     #[test]
+    fn thai_tone_marks_stay_on_their_base_glyphs_font() {
+        // วรรณยุกต์ — the Thai tone marks. A mark and the consonant it sits on
+        // have to be shaped by the *same* face: GPOS mark attachment is a
+        // within-font lookup, so a run split between the base and its mark
+        // leaves the mark unattached, floating at its own default position.
+        //
+        // The split happens when the primary face has partial Thai coverage:
+        // the base falls back to a Thai font, then the mark is found in the
+        // primary and goes there instead.
+        let Some((mut db, id)) = system() else { return };
+        let text = "วรรณยุกต์";
+        let s = style();
+        let para = ShapedParagraph::shape(&mut db, text, 0, &s, id);
+        let runs = para.line_runs(0..text.len());
+        assert!(!runs.is_empty(), "Thai produced no runs");
+
+        let fonts: Vec<_> =
+            runs.iter().flat_map(|run| run.glyphs.iter()).map(|glyph| glyph.font).collect();
+        let first = fonts[0];
+        assert!(
+            fonts.iter().all(|font| *font == first),
+            "one Thai word was shaped by {} different faces; its marks cannot attach",
+            fonts.iter().collect::<std::collections::HashSet<_>>().len()
+        );
+    }
+
+    #[test]
+    fn a_thai_tone_mark_takes_no_horizontal_space() {
+        // A mark that advances pushes the rest of the word sideways and stacks
+        // beside its base instead of above it.
+        let Some((mut db, id)) = system() else { return };
+        let s = style();
+        // ก alone, then ก with a mai ek above it. The mark adds no width.
+        let bare = ShapedParagraph::shape(&mut db, "ก", 0, &s, id);
+        let bare_width = bare.advance(0.."ก".len());
+        let marked = ShapedParagraph::shape(&mut db, "ก่", 0, &s, id);
+        let marked_width = marked.advance(0.."ก่".len());
+
+        assert!(
+            (marked_width.get() - bare_width.get()).abs() < 0.5,
+            "the tone mark added {} px of advance",
+            marked_width.get() - bare_width.get()
+        );
+    }
+
+    #[test]
     fn japanese_shapes_through_fallback_without_tofu() {
         let Some((mut db, id)) = system() else { return };
         let text = "こんにちは世界";

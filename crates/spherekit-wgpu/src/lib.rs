@@ -42,7 +42,7 @@ pub mod shader;
 pub mod texture;
 
 pub use pipeline::{PipelineCache, PipelineKey, PipelineKind};
-pub use renderer::WgpuRenderer;
+pub use renderer::{Backend, WgpuRenderer};
 pub use texture::TextureStore;
 
 /// Re-exported so callers can name the concrete backend types when they need to

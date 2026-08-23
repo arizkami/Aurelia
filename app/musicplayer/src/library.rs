@@ -27,7 +27,7 @@ pub struct Track {
 
 impl Track {
     /// Builds a track from a path, deriving what it can from the name.
-    fn from_path(path: &Path) -> Option<Self> {
+    pub(crate) fn from_path(path: &Path) -> Option<Self> {
         let extension = path.extension()?.to_str()?.to_ascii_lowercase();
         if !SUPPORTED.contains(&extension.as_str()) {
             return None;
@@ -57,6 +57,11 @@ pub fn scan(root: &Path) -> Vec<Track> {
     // twice running; `read_dir` promises nothing about ordering.
     tracks.sort_by(|a, b| a.album.cmp(&b.album).then_with(|| a.title.cmp(&b.title)));
     tracks
+}
+
+/// The track a path names, or `None` when nothing here can decode it.
+pub fn track_at(path: &Path) -> Option<Track> {
+    Track::from_path(path)
 }
 
 /// How deep a scan will walk before giving up on a directory tree.

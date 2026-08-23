@@ -320,14 +320,30 @@ const MAX_VAR_DEPTH: usize = 16;
 /// when substitution recurses too deeply. CSS calls that "invalid at computed
 /// value time"; here the declaration is simply ignored, which is the same
 /// answer this crate gives to any value it cannot interpret.
-pub(crate) fn substitute_vars(
+pub(crate) fn substitute_vars<'a>(
+    value: &'a str,
+    variables: &HashMap<String, String>,
+    depth: usize,
+) -> Option<std::borrow::Cow<'a, str>> {
+    // Borrowed when there is no `var()` to expand, which is the overwhelming
+    // majority of declarations. Allocating a copy of every value on every node
+    // on every frame is most of what the cascade used to spend its time on.
+    if !contains_var(value) {
+        return Some(std::borrow::Cow::Borrowed(value));
+    }
+    substitute_owned(value, variables, depth).map(std::borrow::Cow::Owned)
+}
+
+/// The expanding half of [`substitute_vars`].
+///
+/// Separate because a substitution splices in text owned by `variables`, whose
+/// lifetime has nothing to do with the input's — so the result cannot borrow
+/// from either and has to be owned.
+fn substitute_owned(
     value: &str,
     variables: &HashMap<String, String>,
     depth: usize,
 ) -> Option<String> {
-    if !contains_var(value) {
-        return Some(value.to_string());
-    }
     if depth >= MAX_VAR_DEPTH {
         return None;
     }
@@ -342,10 +358,10 @@ pub(crate) fn substitute_vars(
         None => (inner.trim(), None),
     };
     let replacement = match variables.get(name) {
-        Some(defined) => substitute_vars(defined, variables, depth + 1)?,
-        None => substitute_vars(fallback?, variables, depth + 1)?,
+        Some(defined) => substitute_owned(defined, variables, depth + 1)?,
+        None => substitute_owned(fallback?, variables, depth + 1)?,
     };
-    let tail = substitute_vars(&value[close + 1..], variables, depth)?;
+    let tail = substitute_owned(&value[close + 1..], variables, depth)?;
     Some(format!("{}{}{}", &value[..start], replacement, tail))
 }
 

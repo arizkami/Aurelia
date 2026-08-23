@@ -31,7 +31,7 @@ use spherekit_render::{
 };
 use spherekit_text::{GlyphFormat, TextSystem};
 use spherekit_ui::{AnyElement, DispatchResult, Theme, UiEvent, UiTree};
-use spherekit_wgpu::WgpuRenderer;
+use spherekit_wgpu::{Backend, WgpuRenderer};
 use std::sync::Arc;
 
 /// How a surface should be created.
@@ -66,6 +66,16 @@ pub struct SurfaceOptions {
     /// Scanning the system font directory takes a noticeable fraction of a
     /// second, so a plug-in that ships its own font should turn this off.
     pub load_system_fonts: bool,
+    /// Which graphics API to render through.
+    ///
+    /// [`Backend::Auto`] lets wgpu decide, which is right for almost every
+    /// application. Naming one is for the cases where the choice is not the
+    /// renderer's to make: a Windows tool that has to be capturable by a
+    /// D3D-only debugger, a host application that already owns a device on a
+    /// particular API, or a machine whose driver is only trustworthy on one of
+    /// them. `WGPU_BACKEND` overrides this, so a diagnostic run never has to
+    /// rebuild.
+    pub backend: Backend,
 }
 
 impl Default for SurfaceOptions {
@@ -78,6 +88,7 @@ impl Default for SurfaceOptions {
             image_budget_bytes: 64 * 1024 * 1024,
             msaa_samples: spherekit_render::DEFAULT_MSAA_SAMPLES,
             load_system_fonts: true,
+            backend: Backend::default(),
         }
     }
 }
@@ -205,6 +216,7 @@ impl SphereKitSurface {
             options.vsync,
             options.transparent,
             options.msaa_samples,
+            options.backend,
         )
         .await?;
         let gpu_ms = gpu_start.elapsed().as_secs_f32() * 1000.0;

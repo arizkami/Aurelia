@@ -67,7 +67,7 @@ use spherekit::platform::{
 use spherekit::ui::{
     AnyElement, InputTranslator, IntoElement, ParentElement, Styled, Theme, div, label,
 };
-use spherekit::{SphereKitSurface, SurfaceOptions};
+use spherekit::{Backend, SphereKitSurface, SurfaceOptions};
 use spherekit_bridge::JsBridge;
 use spherekit_react::EventQueue;
 
@@ -274,6 +274,14 @@ impl MusicPlayer {
             Ok(player.borrow().library())
         });
 
+        let player = Rc::clone(&self.player);
+        bridge.register_method("browser.playFile", move |_host, params| {
+            let folder = params.get("folder").and_then(Value::as_str).unwrap_or_default();
+            let file = params.get("file").and_then(Value::as_str).unwrap_or_default();
+            player.borrow_mut().play_file(std::path::Path::new(folder), std::path::Path::new(file));
+            Ok(player.borrow().library())
+        });
+
         let quit = Rc::clone(&self.quit);
         bridge.register_method("app.quit", move |_host, _params| {
             quit.set(true);
@@ -289,20 +297,19 @@ impl MusicPlayer {
 
         // Audio first: the visualisers read the result during this frame's
         // paint, so analysing after the commit would draw last frame's audio.
-        let (channels, sample_rate) = match self.tap.as_mut() {
+        //
+        // The tap sits before the player's fader, so the volume has to be
+        // applied here or the display ignores the volume control.
+        let gain = self.player.borrow().volume();
+        match self.tap.as_mut() {
             Some(tap) => {
                 let channels = tap.channels();
                 let sample_rate = tap.sample_rate();
                 let samples = tap.drain(DRAIN_SAMPLES);
-                self.pipeline.update(samples, channels, sample_rate, dt);
-                (channels, sample_rate)
+                self.pipeline.update(samples, channels, sample_rate, gain, dt);
             }
-            None => {
-                self.pipeline.update(&[], 2, 44_100.0, dt);
-                (2, 44_100.0)
-            }
-        };
-        let _ = (channels, sample_rate);
+            None => self.pipeline.update(&[], 2, 44_100.0, gain, dt),
+        }
 
         let advanced = self.player.borrow_mut().poll_track_finished();
 
@@ -418,7 +425,10 @@ impl MusicPlayer {
 
         let nodes = self.js.as_ref().map(|js| js.bridge().host().node_count()).unwrap_or(0);
         let tracks = self.player.borrow().tracks().len();
-        let live = self.visuals.borrow().active;
+        // Read from the player, not from `visuals.active`: at high frame rates
+        // the ring is legitimately empty on some frames, and a label driven by
+        // that flickers between "audio live" and "silent" while a track plays.
+        let live = self.player.borrow().state()["playing"] == serde_json::Value::Bool(true);
 
         self.stylesheet
             .resolve_in(&MatchPath::new(bar), None, &context)
@@ -504,7 +514,17 @@ impl AppHandler for MusicPlayer {
             Arc::clone(&window),
             window.physical_size(),
             window.scale_factor(),
-            SurfaceOptions::default(),
+            SurfaceOptions {
+                // D3D12 rather than whatever wgpu picks, which on a Windows
+                // machine with a discrete NVIDIA card is Vulkan. Nothing about
+                // this player needs Vulkan, and D3D12 is the path Windows
+                // capture and profiling tools actually understand.
+                //
+                // `WGPU_BACKEND` still wins, so comparing the two is a matter
+                // of setting a variable rather than editing this.
+                backend: Backend::Dx12,
+                ..SurfaceOptions::default()
+            },
         )) {
             Ok(mut surface) => {
                 println!("adapter: {}", surface.adapter_name());

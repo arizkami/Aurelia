@@ -244,6 +244,25 @@ pub(crate) enum PseudoClass {
     Not(Vec<Compound>),
 }
 
+/// Which interaction states a selector's outcome can depend on.
+///
+/// Used to skip cascade passes that provably cannot differ from the base one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StateUse {
+    pub hover: bool,
+    pub active: bool,
+    pub focus: bool,
+}
+
+impl StateUse {
+    /// Folds another selector's usage into this one.
+    pub(crate) fn merge(&mut self, other: StateUse) {
+        self.hover |= other.hover;
+        self.active |= other.active;
+        self.focus |= other.focus;
+    }
+}
+
 /// One compound selector: everything between two combinators.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Compound {
@@ -296,6 +315,27 @@ impl Compound {
     }
 }
 
+impl Compound {
+    /// The interaction states this compound's match depends on.
+    fn state_use(&self) -> StateUse {
+        let mut used = StateUse::default();
+        for pseudo in &self.pseudos {
+            match pseudo {
+                PseudoClass::Hover => used.hover = true,
+                PseudoClass::Active => used.active = true,
+                PseudoClass::Focus => used.focus = true,
+                PseudoClass::Not(inner) => {
+                    for compound in inner {
+                        used.merge(compound.state_use());
+                    }
+                }
+                _ => {}
+            }
+        }
+        used
+    }
+}
+
 fn matches_pseudo(pseudo: &PseudoClass, node: Node<'_>, is_root: bool) -> bool {
     let (position, total) = node.position();
     match pseudo {
@@ -345,6 +385,19 @@ pub(crate) struct Selector {
 }
 
 impl Selector {
+    /// The interaction states any compound in this selector depends on.
+    ///
+    /// Every compound counts, not just the subject: `.card:hover .title` styles
+    /// the title according to the card's hover state, so a hover pass is needed
+    /// for the title too.
+    pub(crate) fn state_use(&self) -> StateUse {
+        let mut used = StateUse::default();
+        for compound in &self.parts {
+            used.merge(compound.state_use());
+        }
+        used
+    }
+
     /// Matches the subject of `path`.
     pub(crate) fn matches(&self, path: &MatchPath<'_>) -> bool {
         let subject = self.parts.last().expect("a selector always has one compound");

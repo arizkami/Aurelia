@@ -6,17 +6,34 @@
  * where they go and how big they are; every rule that positions them is here.
  */
 
+/*
+ * The UI Gallery's palette, verbatim.
+ *
+ * Taken from `app/uigallery`'s `spherekit_dark_theme` rather than invented
+ * again: two SphereKit applications side by side that share no colours look
+ * like two different toolkits. The neutral graphite and the desaturated blue
+ * are the gallery's own choices — see the comment there about not letting the
+ * whole UI read as blue-tinted.
+ */
 :root {
-  --bg: #0f1115;
-  --panel: #171a21;
-  --panel-raised: #1e222b;
-  --border: #262b36;
-  --text: #e8eaef;
-  --muted: #8b93a5;
-  --accent: #6ee7b7;
-  --accent-dim: #3f8f74;
-  --danger: #f87171;
-  --radius: 10px;
+  --bg: #2b2c2f;
+  --panel: #333438;
+  --panel-raised: #3b3d41;
+  --hover: #44464a;
+  --pressed: #4d4f54;
+  --border: #414348;
+  --border-strong: #5a5d63;
+  --text: #f0f0f1;
+  --muted: #acadb0;
+  --accent: #78a8e8;
+  --accent-hover: #8bb5ed;
+  --on-accent: #202124;
+  --success: #79b88a;
+  --danger: #d77880;
+  /* The gallery's radii: sm 4, md 6, lg 8. */
+  --radius: 8px;
+  --radius-md: 6px;
+  --radius-sm: 4px;
 }
 
 .app {
@@ -29,7 +46,7 @@
   width: 100%;
   background-color: var(--bg);
   color: var(--text);
-  font-size: 13px;
+  font-size: 14px;
 }
 
 /* ------------------------------------------------------------------- body */
@@ -82,15 +99,22 @@
 }
 
 .track:hover {
-  background-color: var(--panel-raised);
+  background-color: var(--hover);
 }
 
 .track.playing {
-  background-color: var(--accent-dim);
+  background-color: var(--accent);
+}
+
+.track.playing .track-title,
+.track.playing .track-album,
+.track.playing .track-index {
+  color: var(--on-accent);
 }
 
 .track-index {
   width: 22px;
+  flex-shrink: 0;
   font-size: 11px;
   color: var(--muted);
 }
@@ -101,7 +125,7 @@
 
 .track-title {
   flex: 1;
-  font-size: 13px;
+  font-size: 14px;
   white-space: nowrap;
   text-overflow: ellipsis;
 }
@@ -110,6 +134,7 @@
   font-size: 11px;
   color: var(--muted);
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 /* ------------------------------------------------------------------ stage */
@@ -131,12 +156,12 @@
 }
 
 .now-title {
-  font-size: 24px;
+  font-size: 22px;
   font-weight: 600;
 }
 
 .now-album {
-  font-size: 13px;
+  font-size: 12px;
   color: var(--muted);
 }
 
@@ -149,7 +174,7 @@
 
 .spectrum {
   flex: 1;
-  background-color: var(--panel);
+  background-color: var(--bg);
   border-radius: var(--radius);
   border: 1px solid var(--border);
 }
@@ -160,7 +185,7 @@
   gap: 6px;
   width: 34px;
   padding: 8px;
-  background-color: var(--panel);
+  background-color: var(--bg);
   border-radius: var(--radius);
   border: 1px solid var(--border);
 }
@@ -172,7 +197,7 @@
 
 .wave {
   height: 64px;
-  background-color: var(--panel);
+  background-color: var(--bg);
   border-radius: var(--radius);
   border: 1px solid var(--border);
 }
@@ -196,6 +221,7 @@
 
 .time {
   width: 46px;
+  flex-shrink: 0;
   font-size: 11px;
   color: var(--muted);
 }
@@ -217,21 +243,30 @@
 
 button {
   padding: 7px 16px;
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   background-color: var(--panel-raised);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   cursor: pointer;
 }
 
 button:hover {
-  background-color: #2a3040;
+  background-color: var(--hover);
+}
+
+button:active {
+  background-color: var(--pressed);
 }
 
 button.primary {
   background-color: var(--accent);
   border-color: var(--accent);
-  color: #0f1115;
+  color: var(--on-accent);
   font-weight: 600;
+}
+
+button.primary:hover {
+  background-color: var(--accent-hover);
+  border-color: var(--accent-hover);
 }
 
 button:disabled {
@@ -246,6 +281,8 @@ button:disabled {
 .volume-label {
   font-size: 11px;
   color: var(--muted);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 /* ------------------------------------------------------------ empty state */
@@ -261,7 +298,7 @@ button:disabled {
 }
 
 .empty-title {
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 600;
 }
 
@@ -286,6 +323,10 @@ button:disabled {
   font-size: 10px;
   color: var(--muted);
   white-space: nowrap;
+  /* Flex items shrink by default. These are `nowrap`, so a shrunken box does
+     not shorten the text — it paints at full width over the next item, which
+     is why the status line ran its labels together. */
+  flex-shrink: 0;
 }
 
 .status-bar .status-item.live {
@@ -301,7 +342,7 @@ button:disabled {
 }
 
 .tab:hover {
-  background-color: var(--panel-raised);
+  background-color: var(--hover);
 }
 
 .tab.active {
@@ -349,11 +390,16 @@ button:disabled {
 }
 
 .tree-row:hover {
-  background-color: var(--panel-raised);
+  background-color: var(--hover);
 }
 
 .tree-row.open {
-  background-color: var(--accent-dim);
+  background-color: var(--accent);
+}
+
+.tree-row.open .tree-name,
+.tree-row.open .tree-caret {
+  color: var(--on-accent);
 }
 
 .tree-row.action .tree-name {
@@ -378,9 +424,54 @@ button:disabled {
   color: var(--muted);
 }
 
+.tree-row.file .tree-caret {
+  color: var(--accent);
+}
+
 .tree-note {
   font-size: 10px;
   color: var(--muted);
   padding-top: 4px;
   padding-bottom: 4px;
+}
+
+/* ------------------------------------------------------------ drive strip */
+
+.drives {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 10px 12px 4px 12px;
+}
+
+.drive {
+  width: 28px;
+  height: 24px;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  background-color: var(--panel-raised);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.drive:hover {
+  background-color: var(--hover);
+}
+
+.drive.active {
+  background-color: var(--accent);
+  border-color: var(--accent);
+}
+
+.drive-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.drive.active .drive-label {
+  color: var(--on-accent);
 }

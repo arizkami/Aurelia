@@ -145,13 +145,38 @@ impl<'a> Frame<'a> {
     /// Resolves one node and hands it to whichever builder claims its type.
     fn lower(&self, node: &'a NativeNode, index: usize, siblings: usize) -> AnyElement {
         let subject = css_node(node, index, siblings);
+
+        // Checked before the inline style is serialised and before the match
+        // path is built, because a hit needs neither.
+        // Reuse the previous frame's answer when nothing that feeds the cascade
+        // has moved. The cache is cleared wholesale by a commit, a new
+        // stylesheet or a new style context, so a hit is only ever possible when
+        // the inputs really are identical.
+        //
+        // Keyed on the node id alone, which is sound precisely because those
+        // three events are the only things that can change an outcome, and each
+        // of them empties the cache.
+        if let Some(cached) = self.host.style_cache().borrow().get(&node.id) {
+            let context = LowerContext {
+                frame: *self,
+                subject,
+                style: cached.style.clone(),
+                text: cached.text.clone(),
+                hidden: node.hidden,
+            };
+            return match self.host.builder(&node.node_type) {
+                Some(builder) => builder(&context, node),
+                None => built_in(&context, node),
+            };
+        }
+
         let inline = inline_css(node);
         let path = MatchPath::with_ancestors(self.ancestors, subject);
         let sheet = self.host.stylesheet();
         // An application with no stylesheet at all is the common case for a
         // host embedded in native code, and `resolve_interactive` runs the
-        // cascade four times. Skipping it when there is provably nothing to
-        // cascade is behaviour-identical and turns four walks into none.
+        // cascade once per interaction state. Skipping it when there is
+        // provably nothing to cascade is behaviour-identical.
         let style = if sheet.rule_count() == 0 && inline.is_none() {
             InteractiveStyle {
                 base: ResolvedStyle::default(),
@@ -165,6 +190,10 @@ impl<'a> Frame<'a> {
 
         let mut text = style.base.text.clone();
         text.inherit_from(self.inherited);
+        self.host
+            .style_cache()
+            .borrow_mut()
+            .insert(node.id, crate::host::CachedStyle { style: style.clone(), text: text.clone() });
         let context = LowerContext { frame: *self, subject, style, text, hidden: node.hidden };
 
         match self.host.builder(&node.node_type) {
@@ -665,6 +694,94 @@ fn restore_widget_defaults(style: &mut Style, widget: &Style) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds and lays a commit out, returning the width node `id` ended up with.
+    ///
+    /// Geometry rather than a re-resolved style: the point is to observe what
+    /// the *lowering walk* produced, and anything that asks the stylesheet again
+    /// bypasses the cache under test and would pass no matter how stale it was.
+    fn laid_out_width(tree: &mut spherekit_ui::UiTree, host: &ReactHost, id: u64) -> f32 {
+        tree.build(host.ui_element());
+        tree.compute_layout(spherekit_core::size(px(1000.0), px(800.0))).expect("layout");
+        let width = tree.bounds_of(id).expect("node was laid out").width().get();
+        tree.end_frame();
+        width
+    }
+
+    #[test]
+    fn a_new_commit_restyles_rather_than_reusing_the_last_frame() {
+        // The whole risk of caching resolved styles: a node whose class changed
+        // keeps its previous appearance, and nothing about the frame looks
+        // wrong except that it is the last frame's answer.
+        let mut host = ReactHost::new();
+        host.set_stylesheet(".a { width: 100px; } .b { width: 250px; }").expect("stylesheet");
+        let commit = |class: &str, revision: u32| {
+            format!(
+                r#"{{"revision":{revision},"children":[{{"id":1,"type":"view","props":{{"className":"{class}"}},"children":[]}}]}}"#
+            )
+        };
+
+        let mut tree = spherekit_ui::UiTree::new();
+        host.commit_json(&commit("a", 1)).expect("commit");
+        assert_eq!(laid_out_width(&mut tree, &host, 1), 100.0);
+
+        host.commit_json(&commit("b", 2)).expect("commit");
+        assert_eq!(
+            laid_out_width(&mut tree, &host, 1),
+            250.0,
+            "the node kept its previous style across a commit"
+        );
+    }
+
+    #[test]
+    fn a_new_stylesheet_restyles_the_same_commit() {
+        let mut host = ReactHost::new();
+        host.set_stylesheet(".a { width: 100px; }").expect("stylesheet");
+        host.commit_json(
+            r#"{"revision":1,"children":[{"id":1,"type":"view","props":{"className":"a"},"children":[]}]}"#,
+        )
+        .expect("commit");
+
+        let mut tree = spherekit_ui::UiTree::new();
+        assert_eq!(laid_out_width(&mut tree, &host, 1), 100.0);
+
+        host.set_stylesheet(".a { width: 300px; }").expect("stylesheet");
+        assert_eq!(
+            laid_out_width(&mut tree, &host, 1),
+            300.0,
+            "a restyle did not survive the style cache"
+        );
+    }
+
+    #[test]
+    fn a_new_style_context_restyles_media_dependent_rules() {
+        // A resize changes which media queries hold. A cache that outlived it
+        // would leave the layout stuck at the previous breakpoint.
+        let mut host = ReactHost::new();
+        host.set_stylesheet(
+            ".a { width: 100px; } @media (min-width: 900px) { .a { width: 400px; } }",
+        )
+        .expect("stylesheet");
+        host.set_style_context(
+            StyleContext::default().with_viewport(spherekit_core::size(px(600.0), px(400.0))),
+        );
+        host.commit_json(
+            r#"{"revision":1,"children":[{"id":1,"type":"view","props":{"className":"a"},"children":[]}]}"#,
+        )
+        .expect("commit");
+
+        let mut tree = spherekit_ui::UiTree::new();
+        assert_eq!(laid_out_width(&mut tree, &host, 1), 100.0);
+
+        host.set_style_context(
+            StyleContext::default().with_viewport(spherekit_core::size(px(1200.0), px(800.0))),
+        );
+        assert_eq!(
+            laid_out_width(&mut tree, &host, 1),
+            400.0,
+            "the breakpoint did not take effect; the style cache outlived the resize"
+        );
+    }
 
     #[test]
     fn the_root_fills_its_parent_so_a_full_window_layout_works() {

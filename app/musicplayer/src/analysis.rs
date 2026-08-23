@@ -63,7 +63,11 @@ impl Analyzer {
     /// Fewer than [`FFT_SIZE`] frames of audio is not an error — the remainder
     /// is zero-padded, which is what happens at the very start of a track and
     /// for the last partial buffer before silence.
-    pub fn analyze(&mut self, interleaved: &[f32], channels: usize) {
+    ///
+    /// `gain` is the output volume. The tap sits before the player's fader, so
+    /// without it the display would ignore the volume control entirely and keep
+    /// showing a full-scale signal while the speakers are near silent.
+    pub fn analyze(&mut self, interleaved: &[f32], channels: usize, gain: f32) {
         let channels = channels.max(1);
         let frames = interleaved.len() / channels;
         let take = frames.min(FFT_SIZE);
@@ -80,7 +84,7 @@ impl Analyzer {
             for channel in 0..channels {
                 sum += interleaved[frame * channels + channel];
             }
-            self.real[index] = (sum / channels as f32) * self.window[index];
+            self.real[index] = (sum / channels as f32) * gain * self.window[index];
         }
 
         fft(&mut self.real, &mut self.imaginary);
@@ -197,7 +201,7 @@ mod tests {
         let sample_rate = 44_100.0;
         let mut analyzer = Analyzer::new();
         for hz in [110.0, 440.0, 1000.0, 5000.0] {
-            analyzer.analyze(&tone(hz, sample_rate, 0.5), 1);
+            analyzer.analyze(&tone(hz, sample_rate, 0.5), 1, 1.0);
             let expected = (hz / (sample_rate / FFT_SIZE as f32)).round() as usize;
             let found = peak_bin(analyzer.magnitudes());
             assert!(
@@ -220,7 +224,7 @@ mod tests {
         let sample_rate = 44_100.0;
         let bin_centred = 46.0 * sample_rate / FFT_SIZE as f32;
         let mut analyzer = Analyzer::new();
-        analyzer.analyze(&tone(bin_centred, sample_rate, 1.0), 1);
+        analyzer.analyze(&tone(bin_centred, sample_rate, 1.0), 1, 1.0);
         let peak = analyzer.magnitudes()[peak_bin(analyzer.magnitudes())];
         assert!((peak - 1.0).abs() < 0.05, "full-scale tone read back as {peak}");
     }
@@ -235,7 +239,7 @@ mod tests {
         let bin_width = sample_rate / FFT_SIZE as f32;
         let worst_case = (46.5) * bin_width;
         let mut analyzer = Analyzer::new();
-        analyzer.analyze(&tone(worst_case, sample_rate, 1.0), 1);
+        analyzer.analyze(&tone(worst_case, sample_rate, 1.0), 1, 1.0);
         let peak = analyzer.magnitudes()[peak_bin(analyzer.magnitudes())];
         assert!(peak > 0.8, "a tone between bins read back as {peak}, below Hann's -1.4 dB");
     }
@@ -243,7 +247,7 @@ mod tests {
     #[test]
     fn silence_produces_no_spectrum() {
         let mut analyzer = Analyzer::new();
-        analyzer.analyze(&vec![0.0; FFT_SIZE], 1);
+        analyzer.analyze(&vec![0.0; FFT_SIZE], 1, 1.0);
         assert!(analyzer.magnitudes().iter().all(|m| *m < 1e-6));
     }
 
@@ -257,9 +261,9 @@ mod tests {
         let stereo: Vec<f32> = mono.iter().flat_map(|s| [*s, *s]).collect();
 
         let mut from_mono = Analyzer::new();
-        from_mono.analyze(&mono, 1);
+        from_mono.analyze(&mono, 1, 1.0);
         let mut from_stereo = Analyzer::new();
-        from_stereo.analyze(&stereo, 2);
+        from_stereo.analyze(&stereo, 2, 1.0);
 
         assert_eq!(peak_bin(from_mono.magnitudes()), peak_bin(from_stereo.magnitudes()));
     }
@@ -269,14 +273,14 @@ mod tests {
         // The first frames of a track, and the last before silence, are always
         // short. This used to be the obvious place for an index panic.
         let mut analyzer = Analyzer::new();
-        analyzer.analyze(&[0.1, -0.1, 0.2, -0.2], 2);
+        analyzer.analyze(&[0.1, -0.1, 0.2, -0.2], 2, 1.0);
         assert_eq!(analyzer.magnitudes().len(), BIN_COUNT);
     }
 
     #[test]
     fn the_display_decays_toward_silence_when_audio_stops() {
         let mut analyzer = Analyzer::new();
-        analyzer.analyze(&tone(1000.0, 44_100.0, 1.0), 1);
+        analyzer.analyze(&tone(1000.0, 44_100.0, 1.0), 1, 1.0);
         let before = analyzer.magnitudes()[peak_bin(analyzer.magnitudes())];
         for _ in 0..60 {
             analyzer.decay();

@@ -85,6 +85,9 @@ pub mod surface;
 
 pub use surface::{InitTiming, SphereKitSurface, SurfaceOptions, SurfaceStats};
 
+/// Which graphics API a surface renders through.
+pub use spherekit_wgpu::Backend;
+
 /// Realtime audio visualisation and the lock-free audio-thread boundary.
 pub use spherekit_audio_ui as audio;
 /// The JSON Lines protocol that connects a JavaScript runtime to the host.
