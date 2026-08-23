@@ -19,6 +19,7 @@ members = [
     "crates/spherekit-cli",
     "app/uigallery",
     "app/reactdemo",
+    "app/musicplayer",
 ]
 
 [workspace.package]

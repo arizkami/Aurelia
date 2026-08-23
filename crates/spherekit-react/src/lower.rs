@@ -24,7 +24,7 @@ use spherekit_css::{
 };
 use spherekit_layout::Style;
 use spherekit_ui::{
-    AnyElement, IntoElement, Label, ParentElement, Presence, Styled, TextEdit, Toggle,
+    AnyElement, Interactive, IntoElement, Label, ParentElement, Presence, Styled, TextEdit, Toggle,
     ValueControl, avatar, button, checkbox, div, fader, knob, label, menu_item, panel, progress,
     progress_indeterminate, scroll_view, separator, slider, text_field, toggle,
 };
@@ -186,6 +186,24 @@ pub(crate) fn lower_tree(host: &ReactHost, events: Option<&EventQueue>) -> AnyEl
     let siblings = roots.len();
     div()
         .flex_col()
+        // Fills the box the embedder gave it, rather than shrinking to its
+        // content. A React root that sizes to content cannot host a full-window
+        // application at all: `height: 100%` on the top-level component resolves
+        // against an indefinite parent and is dropped, `flex: 1` on anything
+        // inside it resolves to zero, and the result is a window where the last
+        // child sits at the top and everything above it is blank. It is not
+        // obvious from a short, top-aligned tree, which is exactly why it
+        // survived this long.
+        //
+        // `full` rather than `flex_1`: when this element *is* the tree root
+        // there is no flex parent to grow into, so a grow factor alone leaves
+        // it content-sized — which is the very case that broke. A relative size
+        // is definite in both positions, at the tree root and nested inside a
+        // native layout.
+        .full()
+        // Grow as well, so a definite-height parent that hands out space by
+        // flex rather than by percentage also fills this in.
+        .flex_1()
         .children_iter(
             roots.iter().enumerate().map(|(index, node)| frame.lower(node, index, siblings)),
         )
@@ -218,7 +236,26 @@ fn built_in(cx: &LowerContext<'_>, node: &NativeNode) -> AnyElement {
 }
 
 fn container(cx: &LowerContext<'_>, node: &NativeNode) -> AnyElement {
-    cx.apply(div().id(node.id)).children_iter(cx.children(node)).into_element()
+    let view = cx.apply(div().id(node.id)).children_iter(cx.children(node));
+
+    // A list row, a card, a clickable tile: all of them are a container with a
+    // handler, and none of them are a button. The `pressable` marker is set by
+    // the TypeScript `View` when it sees an `onPress`, because the handler
+    // itself is stripped before the tree crosses the bridge and the host would
+    // otherwise have no way to tell an interactive container from a layout one.
+    //
+    // Gated rather than always on: wiring every container would put a press
+    // event on the bridge for every click anywhere in the tree, including the
+    // dozens of nested layout views a real screen is built from.
+    if node.prop_bool("pressable").unwrap_or(false)
+        && let Some(queue) = cx.events()
+    {
+        let queue = queue.clone();
+        let id = node.id;
+        return view.on_click(move |_| queue.push(HostEvent::new(PRESS, id))).into_element();
+    }
+
+    view.into_element()
 }
 
 /// A `text` node collapses its subtree into one string rather than laying its
@@ -628,6 +665,47 @@ fn restore_widget_defaults(style: &mut Style, widget: &Style) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_root_fills_its_parent_so_a_full_window_layout_works() {
+        // The property a full-window application depends on. With a
+        // content-sized root, `height: 100%` on the top-level component
+        // resolves against an indefinite parent and is dropped, every `flex: 1`
+        // under it collapses to zero, and the window renders its last child at
+        // the top with blank space above it. A short, top-aligned tree looks
+        // perfectly fine either way, which is why only an assertion catches it.
+        let mut host = ReactHost::new();
+        host.set_stylesheet(
+            ".app { display: flex; flex-direction: column; flex: 1; }
+             .grow { flex: 1; } .footer { height: 40px; }",
+        )
+        .expect("stylesheet parses");
+        host.commit_json(
+            r#"{"revision":1,"children":[{"id":1,"type":"view","props":{"className":"app"},
+               "children":[{"id":2,"type":"view","props":{"className":"grow"},"children":[]},
+                           {"id":3,"type":"view","props":{"className":"footer"},"children":[]}]}]}"#,
+        )
+        .expect("valid commit");
+
+        let mut tree = spherekit_ui::UiTree::new();
+        tree.build(host.ui_element());
+        let viewport = spherekit_core::size(px(800.0), px(600.0));
+        tree.compute_layout(viewport).expect("layout");
+
+        let footer = tree.bounds_of(3u64).expect("the footer was laid out");
+        let grow = tree.bounds_of(2u64).expect("the growing pane was laid out");
+
+        assert!(
+            grow.height() > px(400.0),
+            "the flex pane got {:?}, so the root is still sizing to its content",
+            grow.height()
+        );
+        assert!(
+            footer.min_y() > grow.min_y(),
+            "the footer is above the content, which is what a collapsed root looks like"
+        );
+    }
+
     use serde_json::Value;
     use std::collections::BTreeMap;
 

@@ -1,0 +1,386 @@
+/*
+ * One stylesheet for the whole player.
+ *
+ * The React tree is lowered through it, and so is the native transport bar the
+ * shell draws itself. The visualisers are native elements too — React only says
+ * where they go and how big they are; every rule that positions them is here.
+ */
+
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel-raised: #1e222b;
+  --border: #262b36;
+  --text: #e8eaef;
+  --muted: #8b93a5;
+  --accent: #6ee7b7;
+  --accent-dim: #3f8f74;
+  --danger: #f87171;
+  --radius: 10px;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  /* `flex: 1` rather than `height: 100%`: the host root is a flex column, so
+     growing into it works whether or not its height is definite, and a
+     percentage against an auto-height ancestor is silently dropped. */
+  flex: 1;
+  width: 100%;
+  background-color: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+}
+
+/* ------------------------------------------------------------------- body */
+
+.body {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  gap: 1px;
+  overflow: hidden;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  width: 300px;
+  background-color: var(--panel);
+  overflow: hidden;
+}
+
+.sidebar-header {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px 10px 16px;
+}
+
+.sidebar-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 1.2px;
+  color: var(--muted);
+}
+
+.tracks {
+  flex: 1;
+  overflow-y: scroll;
+  padding: 0 8px 8px 8px;
+}
+
+.track {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.track:hover {
+  background-color: var(--panel-raised);
+}
+
+.track.playing {
+  background-color: var(--accent-dim);
+}
+
+.track-index {
+  width: 22px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.track.playing .track-index {
+  color: var(--text);
+}
+
+.track-title {
+  flex: 1;
+  font-size: 13px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.track-album {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------ stage */
+
+.stage {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  padding: 20px;
+  gap: 16px;
+  background-color: var(--bg);
+  overflow: hidden;
+}
+
+.now-playing {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.now-title {
+  font-size: 24px;
+  font-weight: 600;
+}
+
+.now-album {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.viz-row {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  gap: 12px;
+}
+
+.spectrum {
+  flex: 1;
+  background-color: var(--panel);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+
+.meters {
+  display: flex;
+  flex-direction: row;
+  gap: 6px;
+  width: 34px;
+  padding: 8px;
+  background-color: var(--panel);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+
+.meter {
+  flex: 1;
+  height: 100%;
+}
+
+.wave {
+  height: 64px;
+  background-color: var(--panel);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+
+/* -------------------------------------------------------------- transport */
+
+.transport {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 20px 18px 20px;
+  background-color: var(--panel);
+}
+
+.scrubber-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+}
+
+.time {
+  width: 46px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.scrubber {
+  flex: 1;
+}
+
+.controls {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+}
+
+.spacer {
+  flex: 1;
+}
+
+button {
+  padding: 7px 16px;
+  border-radius: 6px;
+  background-color: var(--panel-raised);
+  border: 1px solid var(--border);
+  cursor: pointer;
+}
+
+button:hover {
+  background-color: #2a3040;
+}
+
+button.primary {
+  background-color: var(--accent);
+  border-color: var(--accent);
+  color: #0f1115;
+  font-weight: 600;
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.volume {
+  width: 120px;
+}
+
+.volume-label {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* ------------------------------------------------------------ empty state */
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 32px;
+}
+
+.empty-title {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.empty-hint {
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+
+/* Native-only. The shell builds this; no React component knows it exists. */
+.status-bar {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 16px;
+  height: 24px;
+  padding: 0 20px;
+  background-color: var(--panel-raised);
+}
+
+.status-bar .status-item {
+  font-size: 10px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.status-bar .status-item.live {
+  color: var(--accent);
+}
+
+/* ------------------------------------------------------------ sidebar tabs */
+
+.tab {
+  padding: 4px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.tab:hover {
+  background-color: var(--panel-raised);
+}
+
+.tab.active {
+  background-color: var(--panel-raised);
+}
+
+.tab-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: var(--muted);
+}
+
+.tab.active .tab-label {
+  color: var(--accent);
+}
+
+/* ----------------------------------------------------------- folder tree */
+
+.tree {
+  display: flex;
+  flex-direction: column;
+}
+
+.tree-node {
+  display: flex;
+  flex-direction: column;
+}
+
+.tree-children {
+  display: flex;
+  flex-direction: column;
+}
+
+.tree-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  padding-top: 5px;
+  padding-bottom: 5px;
+  padding-right: 8px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.tree-row:hover {
+  background-color: var(--panel-raised);
+}
+
+.tree-row.open {
+  background-color: var(--accent-dim);
+}
+
+.tree-row.action .tree-name {
+  color: var(--accent);
+}
+
+.tree-caret {
+  width: 12px;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.tree-name {
+  flex: 1;
+  font-size: 12px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.tree-count {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.tree-note {
+  font-size: 10px;
+  color: var(--muted);
+  padding-top: 4px;
+  padding-bottom: 4px;
+}

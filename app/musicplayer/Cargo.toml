@@ -1,0 +1,29 @@
+[package]
+name = "musicplayer"
+description = "SphereKit music player: a React 19 frontend in V8 driving native GPU rendering and realtime audio visualisation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+build = "build.rs"
+
+[[bin]]
+name = "musicplayer"
+path = "src/main.rs"
+
+[dependencies]
+spherekit = { workspace = true, features = ["v8"] }
+spherekit-bridge = { workspace = true, features = ["v8"] }
+spherekit-react.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+pollster.workspace = true
+
+# Decoding and output. `rodio` pulls `symphonia` for the codecs and `cpal` for
+# the device, which is the whole reason this is an application crate and not
+# something the engine grew: SphereKit visualises audio and deliberately does
+# not play it.
+rodio = "0.22"

@@ -34,7 +34,23 @@ export type ViewProps = NativeProps & {
 
 /** A flex/layout container. */
 export function View({ children, ...props }: ViewProps) {
-  return createElement("view", props, children);
+  return createElement("view", withPressable(props), children);
+}
+
+/**
+ * Marks a node as wanting press events when it has an `onPress` handler.
+ *
+ * `serializeProps` strips every `on*` prop before the tree crosses the bridge —
+ * a function is not JSON — so the native side has no way of knowing a container
+ * is interactive. Rather than make every view emit a press event on every click
+ * and rely on the renderer to drop the unhandled ones, the component that knows
+ * a handler exists says so with a plain boolean the host can read.
+ *
+ * Set here rather than asked of the caller because a `pressable` the caller can
+ * forget is a control that silently does nothing.
+ */
+function withPressable(props: NativeProps): NativeProps {
+  return typeof props.onPress === "function" ? { ...props, pressable: true } : props;
 }
 
 /** A text leaf. */
@@ -265,5 +281,5 @@ export type NativePropsWithType = ViewProps & {
 
 /** Escape hatch for adding a registered SphereKit host component. */
 export function Native({ type, children, ...props }: NativePropsWithType) {
-  return createElement(type, props, children);
+  return createElement(type, withPressable(props), children);
 }

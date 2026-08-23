@@ -5,7 +5,8 @@
   "//": "A Bun workspace exists for exactly one reason: React must be a single instance. `@spherekit/react` is a React *renderer*, so its `react-reconciler` and an application's `react` have to be the same module object — the reconciler installs the hook dispatcher on `ReactSharedInternals`, and a second copy of React reads a null one. Two node_modules trees produce `Cannot read properties of null (reading 'useState')` on the first update that originates outside a synchronous render, which is a long way from the install that caused it. Hoisting here makes that impossible.",
   "workspaces": [
     "crates/spherekit-react",
-    "app/reactdemo/renderer"
+    "app/reactdemo/renderer",
+    "app/musicplayer/renderer"
   ],
   "scripts": {
     "typecheck": "bun run --filter '*' typecheck",
