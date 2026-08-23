@@ -27,6 +27,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SPHEREKIT_V8_URL");
     println!("cargo:rerun-if-env-changed=SPHEREKIT_V8_OFFLINE");
+    println!("cargo:rerun-if-env-changed=SPHEREKIT_V8_DIR");
     // Declared so `unexpected_cfgs` keeps working on the gate below rather than
     // treating every use of it as a typo.
     println!("cargo::rustc-check-cfg=cfg(v8_backend)");
@@ -60,7 +61,34 @@ fn locate_backend() -> Option<PathBuf> {
     }
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
-    let backend_dir = manifest_dir.join("v8backend");
+
+    // An explicitly supplied prebuilt wins, then a checkout-local one. Both are
+    // read-only here: nothing below ever writes into the manifest directory.
+    for candidate in
+        [env::var_os("SPHEREKIT_V8_DIR").map(PathBuf::from), Some(manifest_dir.join("v8backend"))]
+            .into_iter()
+            .flatten()
+    {
+        if has_complete_backend(&candidate) {
+            return Some(candidate);
+        }
+    }
+
+    // The download target is a user-level cache, never the crate directory.
+    // Cargo forbids a build script from modifying its own package during
+    // `cargo package`, and rightly: a 74 MB extraction inside the source tree
+    // is not something a publish should be carrying, and `OUT_DIR` alone would
+    // re-download it for every profile and every target directory.
+    let backend_dir = match cache_dir() {
+        Some(dir) => dir,
+        None => {
+            println!(
+                "cargo:warning=spherekit-jsengine: no cache directory available; \
+                 building the unsupported-platform stub"
+            );
+            return None;
+        }
+    };
     if has_complete_backend(&backend_dir) {
         return Some(backend_dir);
     }
@@ -73,7 +101,7 @@ fn locate_backend() -> Option<PathBuf> {
         return None;
     }
 
-    let lock = match acquire_lock(&manifest_dir.join(".v8backend.lock")) {
+    let lock = match acquire_lock(&backend_dir.with_extension("lock")) {
         Ok(lock) => lock,
         Err(error) => {
             println!("cargo:warning=spherekit-jsengine: cannot lock V8 setup: {error}");
@@ -150,6 +178,26 @@ fn link_v8(backend_dir: &Path) {
     // Only now, once the shim has compiled and V8 is actually linked, does the
     // real implementation get switched on.
     println!("cargo::rustc-cfg=v8_backend");
+}
+
+/// Where a downloaded prebuilt is cached, keyed by the archive it came from.
+///
+/// Keyed rather than fixed because changing `SPHEREKIT_V8_URL` has to produce a
+/// different directory; sharing one would silently link the previous archive's
+/// V8 against the new headers.
+fn cache_dir() -> Option<PathBuf> {
+    let url = env::var("SPHEREKIT_V8_URL").unwrap_or_else(|_| DEFAULT_V8_URL.into());
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in url.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    let root = env::var_os("LOCALAPPDATA")
+        .or_else(|| env::var_os("XDG_CACHE_HOME"))
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    Some(root.join("spherekit").join(format!("v8-{hash:016x}")))
 }
 
 fn has_complete_backend(backend_dir: &Path) -> bool {

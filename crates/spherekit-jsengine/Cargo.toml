@@ -11,6 +11,10 @@ keywords = ["v8", "javascript", "embedding", "engine", "ffi"]
 categories = ["api-bindings", "development-tools::ffi"]
 build = "build.rs"
 
+# The prebuilt is 74 MB of V8 and is fetched, not committed. Excluded so that a
+# checkout which happens to have one cannot smuggle it into a published tarball.
+exclude = ["v8backend", "*.lock"]
+
 [dependencies]
 
 [build-dependencies]
