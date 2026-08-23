@@ -145,7 +145,7 @@ impl ChromeState {
         self.backdrop.store(backdrop_bits(backdrop), Ordering::Relaxed);
     }
 
-    fn backdrop(&self) -> WindowBackdrop {
+    pub(crate) fn backdrop(&self) -> WindowBackdrop {
         backdrop_from_bits(self.backdrop.load(Ordering::Relaxed))
     }
 

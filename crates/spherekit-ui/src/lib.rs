@@ -60,12 +60,15 @@
 
 #![deny(missing_docs)]
 
+pub mod color;
+pub mod date;
 pub mod edit;
 pub mod element;
 pub mod event;
 pub mod field;
 pub mod focus;
 pub mod input;
+pub mod overlay;
 pub mod semantics;
 pub mod style;
 pub mod text;
@@ -73,6 +76,11 @@ pub mod theme;
 pub mod tree;
 pub mod widgets;
 
+pub use color::{
+    ColorArea, ColorChannel, ColorPicker, ColorSlider, ColorSwatch, Hsva, alpha_slider, color_area,
+    color_picker, color_swatch, hex_string, hsva, hue_slider, parse_hex,
+};
+pub use date::{Calendar, Date, Weekday, calendar};
 pub use edit::{Motion, Preedit, TextEdit};
 pub use element::{
     AnyElement, Div, Element, Empty, EventContext, HandlerKind, Handlers, ImeArea,
@@ -87,26 +95,34 @@ pub use event::{
 pub use field::{TextField, text_field};
 pub use focus::{FocusDirection, FocusHandle, FocusRegistry, Focusable, Scope, ScopeId};
 pub use input::InputTranslator;
+pub use overlay::{
+    OVERLAY_Z, Overlay, Popover, PopoverAlign, PopoverSide, TOAST_Z, Toast, ToastVariant, overlay,
+    popover, toast, toast_layer,
+};
 pub use semantics::{Action, Live, Role, SemanticNode, Semantics, ValueRange};
 pub use style::{Cursor, FocusRing, PaintStyle, StyledInteraction};
 pub use text::{Label, draw_layout, label};
-pub use theme::{Palette, Radii, Shadows, Spacing, Theme, Typography};
+pub use theme::{Palette, Radii, Shadows, Spacing, TextRole, Theme, TypeScale, Typography};
 pub use tree::{DispatchResult, TreeStats, UiTree};
 pub use widgets::{
-    Avatar, Button, ButtonVariant, ContextMenu, Dropdown, DropdownSide, MenuItem, Presence,
-    Progress, ScrollView, Scrollbar, ScrollbarPolicy, Toggle, ValueControl, ValueShape, avatar,
-    button, checkbox, context_menu, dropdown, fader, knob, menu_item, panel, progress,
-    progress_indeterminate, scroll_area, scroll_view, separator, slider, toggle,
+    Avatar, Badge, BadgeVariant, Button, ButtonVariant, ContextMenu, Dropdown, DropdownSide,
+    MenuItem, Presence, Progress, Radio, ScrollView, Scrollbar, ScrollbarPolicy, SegmentedControl,
+    Spinner, Stepper, Toggle, Tooltip, ValueControl, ValueShape, avatar, badge, button, checkbox,
+    context_menu, dropdown, fader, knob, menu_item, panel, progress, progress_indeterminate, radio,
+    scroll_area, scroll_view, segmented, separator, slider, spinner, stepper, toggle, tooltip,
 };
 
 /// Everything a typical consumer needs, in one import.
 pub mod prelude {
+    pub use crate::color::{Hsva, color_area, color_picker, color_swatch, hue_slider};
+    pub use crate::date::{Calendar, Date, Weekday, calendar};
     pub use crate::element::{
         Element, EventContext, Interactive, IntoElement, PaintContext, ParentElement, Styled, div,
     };
     pub use crate::event::{EventFlow, Key, Modifiers, MouseButton, UiEvent};
     pub use crate::focus::FocusDirection;
     pub use crate::input::InputTranslator;
+    pub use crate::overlay::{overlay, popover, toast, toast_layer};
     pub use crate::semantics::{Role, Semantics};
     pub use crate::style::{Cursor, PaintStyle, StyledInteraction};
     pub use crate::text::label;

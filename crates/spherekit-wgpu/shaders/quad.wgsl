@@ -8,6 +8,7 @@
 //
 //!include common/math.wgsl
 //!include common/frame.wgsl
+//!include common/shadow.wgsl
 
 // Keep in sync with `spherekit_render::primitives::quad_flags`.
 const FILL_SOLID: u32 = 1u;
@@ -100,7 +101,7 @@ fn fs_main(in: QuadOut) -> @location(0) vec4<f32> {
     var coverage: f32;
 
     if ((flags & SHADOW) != 0u) {
-        let blur = blurred_rounded_box(half_extent, in.radii, p, max(in.params.y, 1e-3));
+        let blur = shadow_coverage(half_extent, in.radii, p, max(in.params.y, 1e-3));
         if ((flags & SHADOW_INSET) != 0u) {
             // An inset shadow is the complement of the blur, confined to the
             // shape itself.

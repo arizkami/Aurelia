@@ -105,13 +105,42 @@ process.
 
 |            |                                                                                         |
 | ---------- | --------------------------------------------------------------------------------------- |
-| Buttons    | `button` — primary, secondary, ghost, danger; any width or height; icon-font glyphs     |
-| Selection  | `toggle`, `checkbox`                                                                    |
-| Values     | `slider`, `fader`, `knob` — stepped, bipolar, formatted, keyboard-adjustable            |
+| Buttons    | `button` — primary, secondary, outline, ghost, danger; any width, height or glyph       |
+| Selection  | `toggle`, `checkbox`, `radio`, `segmented` — one answer, or many                        |
+| Values     | `slider`, `fader`, `knob`, `stepper` — stepped, bipolar, formatted, keyboard-adjustable |
 | Text       | `label`, `text_field` — selection, masking, input-method composition, clipboard         |
+| Colour     | `color_picker`, `color_area`, `hue_slider`, `alpha_slider`, `color_swatch`, `Hsva`      |
+| Dates      | `calendar` over a dependency-free `Date` — bounds, ranges, week start, keyboard paging  |
 | Identity   | `avatar` — initials, a tint derived from the name, presence dot                         |
 | Menus      | `dropdown` anchored to a control, `context_menu` at a point, `menu_item` with shortcuts |
-| Containers | `scroll_view`, `scroll_area`, `panel`, `separator`, `progress` (determinate or not)     |
+| Overlays   | `overlay` scrim, `popover` on any side with a beak, `toast` plus a `toast_layer`        |
+| Feedback   | `progress` (determinate or not), `spinner`, `badge`, `tooltip`                          |
+| Containers | `scroll_view`, `scroll_area`, `panel`, `separator`                                      |
+
+Nothing in the overlay family owns a timer, an open flag or a queue: each takes a number in `0..=1`
+saying how far it has arrived, so one `Motion` in the application drives it and a test can pass `0.5`
+and assert on a half-open panel without running a clock. That also settles the question a toast
+library usually gets wrong — when a toast appears, how long it stays and how many are on screen are
+product decisions with no defensible default, so the widget draws one toast and the application owns
+the list. An `overlay` does the half of its job that is easy to forget: it swallows every event that
+reaches it, because a dialog over a page whose buttons still work is a picture of a modal.
+
+`button`'s default is filled, not outlined. An outline reads as *lighter* than a fill on a dark
+surface and *heavier* on a light one, so a toolkit whose default were outlined would change the
+hierarchy of every screen the moment the theme flipped; `ButtonVariant::Outline` is there for the
+case that wants it — a button with no surface of its own to sit on.
+
+The colour picker samples its square and its hue ramp from `Hsva::to_color` rather than compositing
+the usual white and black overlays over a hue. SphereKit blends in linear light, where a 50 % white
+quad over red lands on `#FFBBBB` and HSV says `#FF8080`; a picker built the usual way would show one
+colour at every point and report another. It carries `Hsva` rather than `Color` for the same reason
+of not lying: every hue produces the same black, so a control that stored the result would forget
+which hue a drag into the bottom of the square came from.
+
+`Date` is a civil date and nothing else — no clock, no zone, no dependency. The conversion is
+Howard Hinnant's `days_from_civil`, so it is exact across the whole proleptic Gregorian range, and
+`Calendar` paints its forty-two cells itself: a hover is one repaint of one node rather than a
+reconcile of ninety.
 
 Cut, copy, paste and select-all live on `TextEdit`, so a keyboard shortcut and a menu item cannot
 disagree about what Copy means — including the rule that a masked field never hands its contents to
@@ -288,9 +317,11 @@ SPHEREKIT_PROBE_SIZE=13 SPHEREKIT_PROBE_ZOOM=4 cargo run -p spherekit-text --exa
 SPHEREKIT_PROBE_SUBPIXEL=0 SPHEREKIT_PROBE_SIZE=10 cargo run -p spherekit-text --example glyph_quad_probe --release
 ```
 
-**`app/uigallery`** is the reference application: seven pages under a custom Windows frame over DWM
-Mica, one per widget family, with a note on each specimen saying what that variant is _for_ — the
-part an API listing cannot tell you. Nothing in it is a mock-up; the toggles toggle and the sliders
+**`app/uigallery`** is the reference application: a home page and ten catalogue pages under a custom
+Windows frame over DWM Mica, one per widget family, with a note on each specimen saying what that
+variant is _for_ — the part an API listing cannot tell you. Its header carries a System/Light/Dark
+switch that moves the window's own Mica with it and a control that collapses the sidebar to its
+icons, both on springs; `SPHEREKIT_GALLERY_PAGE=Colour` opens straight onto one page. Nothing in it is a mock-up; the toggles toggle and the sliders
 drag, because a gallery that showed pictures would be a worse document than the source it
 documents.
 

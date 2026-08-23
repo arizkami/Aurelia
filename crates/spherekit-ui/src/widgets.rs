@@ -50,6 +50,12 @@ const SCRATCH_DRAG_VALUE: usize = 0;
 const SCRATCH_DRAG_ORIGIN: usize = 1;
 /// Scratch slot holding whether a drag is active. Nonzero means yes.
 const SCRATCH_DRAGGING: usize = 2;
+/// Scratch slot holding which part of a multi-part control is hovered.
+///
+/// One-based: zero means nothing is, because scratch starts zeroed and a
+/// zero that meant "the first part" would light one up before the pointer had
+/// ever touched the control.
+const SCRATCH_SEGMENT_HOVER: usize = 3;
 
 /// A change callback.
 pub type OnChange = Box<dyn FnMut(f32)>;
@@ -61,6 +67,13 @@ pub type OnAction = Box<dyn FnMut()>;
 // ---------------------------------------------------------------------------
 
 /// Which visual weight a button carries.
+///
+/// The default is [`Secondary`](ButtonVariant::Secondary) — filled, not
+/// outlined. An outline reads as *lighter* than a fill on a dark surface and
+/// *heavier* on a light one, so a toolkit whose default were outlined would
+/// change the hierarchy of every screen the moment the theme flipped.
+/// [`Outline`](ButtonVariant::Outline) is there for the cases that want it and
+/// is never what you get by not choosing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum ButtonVariant {
     /// The default action in its context: filled with the accent colour.
@@ -70,6 +83,13 @@ pub enum ButtonVariant {
     Secondary,
     /// A low-emphasis action: no fill until hovered.
     Ghost,
+    /// A bordered action with no resting fill.
+    ///
+    /// Between `Secondary` and `Ghost`: it holds its shape when there is no
+    /// surface behind it to sit on — over an image, a waveform, or a
+    /// translucent panel — which is the one thing a filled button cannot do
+    /// without inventing a colour.
+    Outline,
     /// A destructive action.
     Danger,
 }
@@ -200,8 +220,16 @@ impl Button {
         let (base, hover, active) = match self.variant {
             ButtonVariant::Primary => (c.accent, c.accent_hover, c.accent_hover),
             ButtonVariant::Secondary => (c.elevated, c.hover, c.pressed),
-            ButtonVariant::Ghost => (Color::TRANSPARENT, c.hover, c.pressed),
+            ButtonVariant::Ghost | ButtonVariant::Outline => {
+                (Color::TRANSPARENT, c.hover, c.pressed)
+            }
             ButtonVariant::Danger => (c.danger, c.danger, c.danger),
+        };
+        // The one variant that draws a resting border. Every other one
+        // communicates through fill and label colour alone.
+        let (border_width, border_color) = match self.variant {
+            ButtonVariant::Outline => (px(1.0), c.border_strong),
+            _ => (Px::ZERO, Color::TRANSPARENT),
         };
 
         let mut style = PaintStyle {
@@ -209,8 +237,8 @@ impl Button {
             hover_background: Some(hover.into()),
             active_background: Some(active.into()),
             corner_radii: Corners::all(theme.radii.md),
-            border_width: Px::ZERO,
-            border_color: Color::TRANSPARENT,
+            border_width,
+            border_color,
             focus_ring: None,
             ..Default::default()
         };
@@ -288,7 +316,7 @@ impl Element for Button {
         let c = cx.theme.colors;
         let text = match self.variant {
             ButtonVariant::Primary | ButtonVariant::Danger => c.text_on_accent,
-            ButtonVariant::Secondary | ButtonVariant::Ghost => c.text,
+            ButtonVariant::Secondary | ButtonVariant::Ghost | ButtonVariant::Outline => c.text,
         };
 
         let style = self.paint_style(cx.theme);
@@ -2427,7 +2455,7 @@ impl Dropdown {
 
 /// Cubic ease-out. The panel arrives quickly and settles, which reads as the
 /// menu landing rather than drifting into place.
-fn ease_out_cubic(t: f32) -> f32 {
+pub(crate) fn ease_out_cubic(t: f32) -> f32 {
     let inv = 1.0 - t.clamp(0.0, 1.0);
     1.0 - inv * inv * inv
 }
@@ -2520,13 +2548,1245 @@ impl Element for Dropdown {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Segmented control
+// ---------------------------------------------------------------------------
+
+/// A row of mutually exclusive choices, all of them visible.
+///
+/// The control a settings pane wants where a [`Dropdown`] would be wrong: with
+/// two to five short options, showing them costs the same space as the closed
+/// menu would and removes a click, a wait and a re-read from every change.
+///
+/// Painted as one element rather than composed from buttons, for the same
+/// reason [`Calendar`](crate::date::Calendar) is: the selection is a pill that
+/// spans one segment, and a row of independent buttons would each have to know
+/// where their neighbours ended up to draw it.
+pub struct SegmentedControl {
+    id: Option<ElementId>,
+    items: Vec<String>,
+    selected: usize,
+    name: String,
+    disabled: bool,
+    style: Style,
+    paint: PaintStyle,
+    on_select: Option<Box<dyn FnMut(usize)>>,
+}
+
+/// Creates a [`SegmentedControl`] with the given selection.
+pub fn segmented(selected: usize) -> SegmentedControl {
+    SegmentedControl {
+        id: None,
+        items: Vec::new(),
+        selected,
+        name: String::new(),
+        disabled: false,
+        style: Style::DEFAULT,
+        paint: PaintStyle::default(),
+        on_select: None,
+    }
+}
+
+impl SegmentedControl {
+    /// Gives the control a stable identity.
+    pub fn id(mut self, id: impl core::hash::Hash) -> Self {
+        self.id = Some(ElementId::from_key(id));
+        self
+    }
+
+    /// Appends one segment.
+    pub fn item(mut self, text: impl Into<String>) -> Self {
+        self.items.push(text.into());
+        self
+    }
+
+    /// Appends several segments.
+    ///
+    /// Not named `items`: [`Styled::items`] already means the flex alignment,
+    /// and an inherent method of the same name would shadow it silently.
+    pub fn options(mut self, options: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.items.extend(options.into_iter().map(Into::into));
+        self
+    }
+
+    /// Sets the accessible name for the group.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Marks the control disabled.
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    /// Runs when a segment is chosen, with its index.
+    pub fn on_select(mut self, f: impl FnMut(usize) + 'static) -> Self {
+        self.on_select = Some(Box::new(f));
+        self
+    }
+
+    /// The text style segments are measured *and* painted with.
+    fn label_style(&self, theme: &crate::theme::Theme) -> spherekit_text::TextStyle {
+        spherekit_text::TextStyle {
+            font_size: theme.typography.sm,
+            font: spherekit_text::FontRequest {
+                weight: theme.typography.weight,
+                ..Default::default()
+            },
+            wrap: spherekit_text::WrapMode::None,
+            ..Default::default()
+        }
+    }
+
+    /// The box of one segment, inset from the track.
+    fn segment_rect(&self, bounds: Rect<Px>, index: usize) -> Rect<Px> {
+        let inset = px(2.0);
+        let track = bounds.inset(spherekit_core::Edges::all(inset));
+        let width = track.width() / self.items.len().max(1) as f32;
+        Rect::new(
+            Point::new(track.min_x() + width * index as f32, track.min_y()),
+            Size::new(width, track.height()),
+        )
+    }
+
+    /// Which segment a point is over, if any.
+    fn segment_at(&self, bounds: Rect<Px>, at: Point<Px>) -> Option<usize> {
+        if self.items.is_empty() || !bounds.contains(at) {
+            return None;
+        }
+        let width = bounds.width() / self.items.len() as f32;
+        Some((((at.x - bounds.min_x()) / width) as usize).min(self.items.len() - 1))
+    }
+
+    fn emit(&mut self, index: usize) {
+        if index != self.selected
+            && index < self.items.len()
+            && let Some(f) = self.on_select.as_mut()
+        {
+            f(index);
+        }
+    }
+}
+
+impl Styled for SegmentedControl {
+    fn style_mut(&mut self) -> &mut Style {
+        &mut self.style
+    }
+
+    fn paint_style_mut(&mut self) -> &mut PaintStyle {
+        &mut self.paint
+    }
+}
+
+impl Element for SegmentedControl {
+    fn id(&self) -> Option<ElementId> {
+        self.id
+    }
+
+    /// The widest segment, times the count.
+    ///
+    /// Every segment gets the same width — a strip whose segments were each as
+    /// wide as their own label would shift under the pointer as the selection
+    /// moved, because the pill would be a different size in each position.
+    fn measure(
+        &mut self,
+        _request: &spherekit_layout::MeasureRequest<'_>,
+        text: &mut spherekit_text::TextSystem,
+        theme: &crate::theme::Theme,
+    ) -> Option<Size<Px>> {
+        if self.items.is_empty() {
+            return Some(Size::ZERO);
+        }
+        let style = self.label_style(theme);
+        let widest = self
+            .items
+            .iter()
+            .map(|item| text.layout(item, &style, None).size.width)
+            .fold(Px::ZERO, Px::max);
+        Some(Size::new((widest + px(24.0)) * self.items.len() as f32, Px::ZERO))
+    }
+
+    fn layout_style(&self) -> Style {
+        let mut style = self.style.clone();
+        if matches!(style.size.height, spherekit_core::Length::Auto) {
+            style.size.height = spherekit_core::Length::Px(px(30.0));
+        }
+        style
+    }
+
+    fn paint(&mut self, cx: &mut PaintContext<'_, '_>) {
+        cx.keep_interactive();
+        if self.items.is_empty() || cx.bounds.is_empty() {
+            return;
+        }
+        let c = cx.theme.colors;
+        let b = cx.bounds;
+        let dim = if self.disabled { 0.45 } else { 1.0 };
+
+        cx.canvas.quad(
+            b,
+            Corners::all(cx.theme.radii.md),
+            Some(c.elevated.scale_alpha(dim).into()),
+            c.border,
+            px(1.0),
+        );
+
+        let hovered = cx.scratch[SCRATCH_SEGMENT_HOVER] as i32 - 1;
+        for index in 0..self.items.len() {
+            let rect = self.segment_rect(b, index);
+            let selected = index == self.selected;
+            if selected {
+                cx.canvas.fill_rounded_rect(
+                    RoundedRect::uniform(rect, cx.theme.radii.md - px(1.0)),
+                    c.accent.scale_alpha(dim),
+                );
+            } else if hovered == index as i32 && !self.disabled {
+                cx.canvas.fill_rounded_rect(
+                    RoundedRect::uniform(rect, cx.theme.radii.md - px(1.0)),
+                    c.hover,
+                );
+            }
+            if cx.state.focused && selected {
+                let style = PaintStyle {
+                    focus_ring: Some(FocusRing { color: c.focus, ..FocusRing::default() }),
+                    corner_radii: Corners::all(cx.theme.radii.md),
+                    ..Default::default()
+                };
+                style.paint_box(cx.canvas, rect, cx.state);
+            }
+            let color = if selected { c.text_on_accent } else { c.text };
+            crate::date::draw_centered(
+                cx,
+                &self.items[index],
+                cx.theme.typography.sm,
+                None,
+                rect,
+                color.scale_alpha(dim),
+            );
+        }
+    }
+
+    fn handle_event(&mut self, cx: &mut EventContext<'_>) -> EventFlow {
+        if self.disabled || self.items.is_empty() {
+            return EventFlow::Continue;
+        }
+        cx.set_cursor(Cursor::Pointer);
+        match cx.event {
+            UiEvent::MouseMove(e) => {
+                // Stored one-based, because scratch starts at zero and a zero
+                // that meant "the first segment" would light it up before the
+                // pointer had ever been near the control.
+                let over = self.segment_at(cx.bounds, e.position).map_or(0, |i| i as i32 + 1);
+                if cx.scratch[SCRATCH_SEGMENT_HOVER] as i32 != over {
+                    cx.scratch[SCRATCH_SEGMENT_HOVER] = over as f32;
+                    cx.notify();
+                }
+                EventFlow::Continue
+            }
+            UiEvent::MouseLeave(_) => {
+                if cx.scratch[SCRATCH_SEGMENT_HOVER] != 0.0 {
+                    cx.scratch[SCRATCH_SEGMENT_HOVER] = 0.0;
+                    cx.notify();
+                }
+                EventFlow::Continue
+            }
+            UiEvent::MouseDown(e) if e.button == MouseButton::Primary => {
+                cx.focus();
+                if let Some(index) = self.segment_at(cx.bounds, e.position) {
+                    self.emit(index);
+                    cx.notify();
+                    return EventFlow::Stop;
+                }
+                EventFlow::Continue
+            }
+            UiEvent::Key(k) if k.state.is_pressed() => {
+                let last = self.items.len() - 1;
+                let next = match k.key {
+                    Key::Left | Key::Up => self.selected.saturating_sub(1),
+                    Key::Right | Key::Down => (self.selected + 1).min(last),
+                    Key::Home => 0,
+                    Key::End => last,
+                    _ => return EventFlow::Continue,
+                };
+                self.emit(next);
+                cx.notify();
+                EventFlow::Stop
+            }
+            _ => EventFlow::Continue,
+        }
+    }
+
+    fn focusable(&self) -> bool {
+        !self.disabled
+    }
+
+    fn semantics(&self) -> Option<Semantics> {
+        Some(
+            Semantics::new(Role::TabList, self.name.clone())
+                .value_text(self.items.get(self.selected).cloned().unwrap_or_default())
+                .disabled(self.disabled)
+                .with_implied_actions(),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Radio
+// ---------------------------------------------------------------------------
+
+/// One option in a set where exactly one is chosen.
+///
+/// A radio reports only that it *was chosen*: unlike a [`Toggle`] it cannot be
+/// un-chosen by clicking it again, because the set it belongs to must always
+/// have an answer. Which is why `on_select` takes no argument — there is no
+/// second state to report.
+pub struct Radio {
+    id: Option<ElementId>,
+    selected: bool,
+    text: String,
+    disabled: bool,
+    on_select: Option<OnAction>,
+}
+
+/// Creates a [`Radio`].
+pub fn radio(selected: bool) -> Radio {
+    Radio { id: None, selected, text: String::new(), disabled: false, on_select: None }
+}
+
+impl Radio {
+    /// Gives the radio a stable identity.
+    pub fn id(mut self, id: impl core::hash::Hash) -> Self {
+        self.id = Some(ElementId::from_key(id));
+        self
+    }
+
+    /// Sets the accessible name.
+    pub fn label(mut self, text: impl Into<String>) -> Self {
+        self.text = text.into();
+        self
+    }
+
+    /// Marks the radio disabled.
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    /// Runs when this option is chosen.
+    pub fn on_select(mut self, f: impl FnMut() + 'static) -> Self {
+        self.on_select = Some(Box::new(f));
+        self
+    }
+}
+
+impl Element for Radio {
+    fn id(&self) -> Option<ElementId> {
+        self.id
+    }
+
+    fn layout_style(&self) -> Style {
+        Style {
+            size: Size {
+                width: spherekit_core::Length::Px(px(16.0)),
+                height: spherekit_core::Length::Px(px(16.0)),
+            },
+            flex_shrink: 0.0,
+            ..Style::DEFAULT
+        }
+    }
+
+    fn paint(&mut self, cx: &mut PaintContext<'_, '_>) {
+        cx.keep_interactive();
+        let c = cx.theme.colors;
+        let b = cx.bounds;
+        if b.is_empty() {
+            return;
+        }
+        let mut state = cx.state;
+        state.disabled = self.disabled;
+        let dim = if self.disabled { 0.45 } else { 1.0 };
+        let radius = Px(b.width().get().min(b.height().get()) * 0.5);
+
+        let style = PaintStyle {
+            background: Some(
+                if self.selected { c.accent } else { c.elevated }.scale_alpha(dim).into(),
+            ),
+            hover_background: (!self.disabled).then(|| {
+                spherekit_core::Brush::from(if self.selected { c.accent_hover } else { c.hover })
+            }),
+            border_width: px(1.0),
+            border_color: if self.selected { c.accent } else { c.border_strong }.scale_alpha(dim),
+            corner_radii: Corners::all(radius),
+            focus_ring: Some(FocusRing { color: c.focus, ..FocusRing::default() }),
+            ..Default::default()
+        };
+        style.paint_box(cx.canvas, b, state);
+
+        if self.selected {
+            // A dot, not a tick: the shape is what says "one of these" rather
+            // than "any of these", and it has to survive being 16 px across.
+            cx.canvas.fill_circle(b.center(), radius * 0.38, c.text_on_accent.scale_alpha(dim));
+        }
+    }
+
+    fn handle_event(&mut self, cx: &mut EventContext<'_>) -> EventFlow {
+        if self.disabled {
+            return EventFlow::Continue;
+        }
+        cx.set_cursor(Cursor::Pointer);
+        let chosen = match cx.event {
+            UiEvent::MouseUp(e) => {
+                e.button == MouseButton::Primary && cx.bounds.contains(e.position)
+            }
+            UiEvent::MouseDown(e) if e.button == MouseButton::Primary => {
+                cx.focus();
+                false
+            }
+            UiEvent::Key(k) if k.state.is_pressed() => matches!(k.key, Key::Space | Key::Enter),
+            _ => false,
+        };
+        // Re-choosing the current option is not a change, and firing anyway
+        // would make an application that logs selections log a click.
+        if chosen && !self.selected {
+            if let Some(f) = self.on_select.as_mut() {
+                f();
+            }
+            cx.notify();
+            return EventFlow::Stop;
+        }
+        if chosen {
+            return EventFlow::Stop;
+        }
+        EventFlow::Continue
+    }
+
+    fn focusable(&self) -> bool {
+        !self.disabled
+    }
+
+    fn semantics(&self) -> Option<Semantics> {
+        Some(
+            Semantics::new(Role::Radio, self.text.clone())
+                .checked(self.selected)
+                .disabled(self.disabled)
+                .with_implied_actions(),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Badge
+// ---------------------------------------------------------------------------
+
+/// What a [`Badge`] is saying.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum BadgeVariant {
+    /// A count or a label with no judgement attached.
+    #[default]
+    Neutral,
+    /// The brand colour: new, selected, featured.
+    Accent,
+    /// Done, passing, online.
+    Success,
+    /// Deprecated, degraded, nearly out.
+    Warning,
+    /// Failed, expired, over quota.
+    Danger,
+}
+
+/// A small status pill.
+///
+/// Tinted rather than filled: a badge sits *inside* other content — beside a
+/// heading, at the end of a row — and a solid block of accent colour there
+/// competes with whatever it is annotating. The tint carries the same meaning
+/// at a tenth of the visual weight.
+pub struct Badge {
+    text: String,
+    variant: BadgeVariant,
+    dot: bool,
+    style: Style,
+    paint: PaintStyle,
+}
+
+/// Creates a [`Badge`].
+pub fn badge(text: impl Into<String>) -> Badge {
+    Badge {
+        text: text.into(),
+        variant: BadgeVariant::default(),
+        dot: false,
+        style: Style::DEFAULT,
+        paint: PaintStyle::default(),
+    }
+}
+
+impl Badge {
+    /// Sets what the badge is saying.
+    pub fn variant(mut self, variant: BadgeVariant) -> Self {
+        self.variant = variant;
+        self
+    }
+
+    /// Adds a leading dot in the variant's colour, for a status pill.
+    pub fn dot(mut self, dot: bool) -> Self {
+        self.dot = dot;
+        self
+    }
+
+    /// The variant's colour.
+    fn tint(&self, theme: &crate::theme::Theme) -> Color {
+        let c = theme.colors;
+        match self.variant {
+            BadgeVariant::Neutral => c.text_muted,
+            BadgeVariant::Accent => c.accent,
+            BadgeVariant::Success => c.success,
+            BadgeVariant::Warning => c.warning,
+            BadgeVariant::Danger => c.danger,
+        }
+    }
+
+    fn label_style(&self, theme: &crate::theme::Theme) -> spherekit_text::TextStyle {
+        spherekit_text::TextStyle {
+            font_size: theme.typography.xs,
+            font: spherekit_text::FontRequest {
+                weight: theme.typography.strong,
+                ..Default::default()
+            },
+            wrap: spherekit_text::WrapMode::None,
+            ..Default::default()
+        }
+    }
+
+    /// The width the leading dot and its gap claim.
+    fn dot_width(&self) -> Px {
+        if self.dot { px(12.0) } else { Px::ZERO }
+    }
+}
+
+impl Styled for Badge {
+    fn style_mut(&mut self) -> &mut Style {
+        &mut self.style
+    }
+
+    fn paint_style_mut(&mut self) -> &mut PaintStyle {
+        &mut self.paint
+    }
+}
+
+impl Element for Badge {
+    fn measure(
+        &mut self,
+        _request: &spherekit_layout::MeasureRequest<'_>,
+        text: &mut spherekit_text::TextSystem,
+        theme: &crate::theme::Theme,
+    ) -> Option<Size<Px>> {
+        let size = text.layout(&self.text, &self.label_style(theme), None).size;
+        Some(Size::new(size.width + self.dot_width(), size.height))
+    }
+
+    fn layout_style(&self) -> Style {
+        let mut style = self.style.clone();
+        if matches!(style.size.height, spherekit_core::Length::Auto) {
+            style.size.height = spherekit_core::Length::Px(px(18.0));
+        }
+        style.flex_shrink = 0.0;
+        style.display = spherekit_layout::Display::Flex;
+        style.align_items = Some(spherekit_layout::Align::Center);
+        style.justify_content = Some(spherekit_layout::Distribute::Center);
+        style.padding = spherekit_layout::edges_symmetric(
+            spherekit_core::Length::Px(Px::ZERO),
+            spherekit_core::Length::Px(px(7.0)),
+        );
+        style
+    }
+
+    fn paint(&mut self, cx: &mut PaintContext<'_, '_>) {
+        let b = cx.bounds;
+        if b.is_empty() {
+            return;
+        }
+        let tint = self.tint(cx.theme);
+        cx.canvas.quad(
+            b,
+            Corners::all(Px(b.height().get() * 0.5)),
+            Some(tint.with_alpha(0.16).into()),
+            tint.with_alpha(0.35),
+            px(1.0),
+        );
+
+        let mut text_box = b;
+        if self.dot {
+            let centre = Point::new(b.min_x() + px(9.0), b.center().y);
+            cx.canvas.fill_circle(centre, px(3.0), tint);
+            text_box = Rect::from_corners(
+                Point::new(b.min_x() + self.dot_width(), b.min_y()),
+                b.max_point(),
+            );
+        }
+        if self.text.is_empty() {
+            return;
+        }
+        crate::date::draw_centered(
+            cx,
+            &self.text,
+            cx.theme.typography.xs,
+            Some(cx.theme.typography.strong),
+            text_box,
+            tint,
+        );
+    }
+
+    fn semantics(&self) -> Option<Semantics> {
+        Some(Semantics::new(Role::Label, self.text.clone()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Spinner
+// ---------------------------------------------------------------------------
+
+/// A rotating arc, for work whose extent is unknown.
+///
+/// The rotation is a function of paint time, exactly as
+/// [`progress_indeterminate`] is, so it costs nothing while no frames are being
+/// drawn and needs no timer of its own. The application still has to keep
+/// asking for frames while one is on screen — a spinner that has stopped is a
+/// worse signal than no spinner at all.
+pub struct Spinner {
+    id: Option<ElementId>,
+    extent: Px,
+    thickness: Px,
+    color: Option<Color>,
+    label_text: String,
+    style: Style,
+    paint: PaintStyle,
+}
+
+/// Creates a [`Spinner`].
+pub fn spinner() -> Spinner {
+    Spinner {
+        id: None,
+        extent: px(20.0),
+        thickness: px(2.5),
+        color: None,
+        label_text: String::new(),
+        style: Style::DEFAULT,
+        paint: PaintStyle::default(),
+    }
+}
+
+impl Spinner {
+    /// Gives the spinner a stable identity.
+    pub fn id(mut self, id: impl core::hash::Hash) -> Self {
+        self.id = Some(ElementId::from_key(id));
+        self
+    }
+
+    /// Sets the diameter. Defaults to 20 px.
+    pub fn size(mut self, extent: Px) -> Self {
+        self.extent = extent;
+        self
+    }
+
+    /// Sets the arc's stroke width.
+    pub fn thickness(mut self, thickness: Px) -> Self {
+        self.thickness = thickness;
+        self
+    }
+
+    /// Overrides the accent colour.
+    pub fn color(mut self, color: Color) -> Self {
+        self.color = Some(color);
+        self
+    }
+
+    /// Sets the accessible name: what is being waited for.
+    pub fn label(mut self, text: impl Into<String>) -> Self {
+        self.label_text = text.into();
+        self
+    }
+
+    /// How long one revolution takes, in seconds.
+    const PERIOD: f32 = 1.1;
+}
+
+impl Styled for Spinner {
+    fn style_mut(&mut self) -> &mut Style {
+        &mut self.style
+    }
+
+    fn paint_style_mut(&mut self) -> &mut PaintStyle {
+        // Kept for margins and opacity. A spinner draws an arc rather than a
+        // box, so a background set here would never be seen.
+        &mut self.paint
+    }
+}
+
+impl Element for Spinner {
+    fn id(&self) -> Option<ElementId> {
+        self.id
+    }
+
+    fn layout_style(&self) -> Style {
+        let mut style = self.style.clone();
+        style.size = Size {
+            width: spherekit_core::Length::Px(self.extent),
+            height: spherekit_core::Length::Px(self.extent),
+        };
+        style.flex_shrink = 0.0;
+        style
+    }
+
+    fn paint(&mut self, cx: &mut PaintContext<'_, '_>) {
+        let b = cx.bounds;
+        if b.is_empty() {
+            return;
+        }
+        let c = cx.theme.colors;
+        let color = self.color.unwrap_or(c.accent);
+        let centre = b.center();
+        let radius = Px(b.width().get().min(b.height().get()) * 0.5) - self.thickness;
+        if radius <= Px::ZERO {
+            return;
+        }
+
+        cx.canvas.stroke_circle(centre, radius, c.elevated, self.thickness);
+
+        // Three quarters of a turn, rotating. A full ring would be a static
+        // circle; the gap is the entire signal.
+        let turn = (cx.time / Self::PERIOD).fract();
+        let mut arc = spherekit_core::PathBuilder::new();
+        let steps = 40;
+        for i in 0..=steps {
+            let f = i as f32 / steps as f32;
+            let angle = (turn + f * 0.72) * core::f32::consts::TAU;
+            let (sin, cos) = angle.sin_cos();
+            let p =
+                Point::new(centre.x + Px(cos * radius.get()), centre.y + Px(sin * radius.get()));
+            if i == 0 {
+                arc.move_to(p);
+            } else {
+                arc.line_to(p);
+            }
+        }
+        cx.canvas.stroke_path(
+            arc.build(),
+            color,
+            spherekit_core::Stroke::new(self.thickness).with_cap(spherekit_core::LineCap::Round),
+        );
+    }
+
+    fn semantics(&self) -> Option<Semantics> {
+        Some(Semantics::new(Role::Progress, self.label_text.clone()).value_text("Busy"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tooltip
+// ---------------------------------------------------------------------------
+
+/// A small explanatory panel anchored to its parent.
+///
+/// Driven exactly as a [`Dropdown`] is: the widget owns no timer and no hover
+/// state, and takes `visible` in `0..=1`. The application decides when a
+/// tooltip has been earned — a hover that outlasted a delay, a focus that came
+/// from the keyboard — which is the part that differs between products and the
+/// part a widget cannot guess.
+///
+/// ```ignore
+/// div()
+///     .flex_col()
+///     .child(button("Delete").id("del"))
+///     .child(tooltip("Removes the take permanently", self.hint.get().value()))
+/// ```
+pub struct Tooltip {
+    id: Option<ElementId>,
+    text: String,
+    visible: f32,
+    side: DropdownSide,
+    gap: Px,
+    style: Style,
+    paint: PaintStyle,
+}
+
+/// Creates a [`Tooltip`] at the given visibility, `0..=1`.
+pub fn tooltip(text: impl Into<String>, visible: f32) -> Tooltip {
+    Tooltip {
+        id: None,
+        text: text.into(),
+        visible,
+        side: DropdownSide::Below,
+        gap: px(6.0),
+        style: Style::DEFAULT,
+        paint: PaintStyle::default(),
+    }
+}
+
+impl Tooltip {
+    /// Gives the tooltip a stable identity.
+    pub fn id(mut self, id: impl core::hash::Hash) -> Self {
+        self.id = Some(ElementId::from_key(id));
+        self
+    }
+
+    /// Opens above the anchor instead of below it.
+    pub fn above(mut self) -> Self {
+        self.side = DropdownSide::Above;
+        self
+    }
+
+    /// Opens below the anchor. The default.
+    pub fn below(mut self) -> Self {
+        self.side = DropdownSide::Below;
+        self
+    }
+
+    /// The distance between the tooltip and its anchor.
+    pub fn offset(mut self, offset: Px) -> Self {
+        self.gap = offset;
+        self
+    }
+
+    fn eased(&self) -> f32 {
+        ease_out_cubic(self.visible.clamp(0.0, 1.0))
+    }
+}
+
+impl Styled for Tooltip {
+    fn style_mut(&mut self) -> &mut Style {
+        &mut self.style
+    }
+
+    fn paint_style_mut(&mut self) -> &mut PaintStyle {
+        &mut self.paint
+    }
+}
+
+impl Element for Tooltip {
+    fn id(&self) -> Option<ElementId> {
+        self.id
+    }
+
+    fn measure(
+        &mut self,
+        _request: &spherekit_layout::MeasureRequest<'_>,
+        text: &mut spherekit_text::TextSystem,
+        theme: &crate::theme::Theme,
+    ) -> Option<Size<Px>> {
+        let style = spherekit_text::TextStyle {
+            font_size: theme.typography.xs,
+            wrap: spherekit_text::WrapMode::None,
+            ..Default::default()
+        };
+        Some(text.layout(&self.text, &style, None).size)
+    }
+
+    fn layout_style(&self) -> Style {
+        let mut style = self.style.clone();
+        if self.visible.clamp(0.0, 1.0) <= DROPDOWN_CLOSED {
+            // Out of layout entirely rather than merely transparent: a tooltip
+            // that still hit-tested would eat the click on the control it is
+            // explaining, which is the one thing it must never do.
+            style.display = spherekit_layout::Display::None;
+            return style;
+        }
+        style.position = spherekit_layout::Position::Absolute;
+        let travel = spherekit_core::Length::Px(self.gap + px(4.0) * (1.0 - self.eased()));
+        match self.side {
+            DropdownSide::Above => {
+                style.inset.bottom = spherekit_core::Length::Fraction(1.0);
+                style.margin.bottom = travel;
+            }
+            DropdownSide::Below => {
+                style.inset.top = spherekit_core::Length::Fraction(1.0);
+                style.margin.top = travel;
+            }
+        }
+        style.display = spherekit_layout::Display::Flex;
+        style.align_items = Some(spherekit_layout::Align::Center);
+        style.padding = spherekit_layout::edges_symmetric(
+            spherekit_core::Length::Px(px(4.0)),
+            spherekit_core::Length::Px(px(8.0)),
+        );
+        style.z_index = CONTEXT_MENU_Z - 1;
+        style
+    }
+
+    fn paint(&mut self, cx: &mut PaintContext<'_, '_>) {
+        let b = cx.bounds;
+        if b.is_empty() || self.text.is_empty() {
+            return;
+        }
+        let c = cx.theme.colors;
+        cx.canvas.quad(
+            b,
+            Corners::all(cx.theme.radii.sm),
+            Some(c.elevated.into()),
+            c.border,
+            px(1.0),
+        );
+        crate::date::draw_centered(cx, &self.text, cx.theme.typography.xs, None, b, c.text);
+    }
+
+    fn paint_opacity(&self) -> f32 {
+        (self.eased() * self.paint.opacity).clamp(0.0, 1.0)
+    }
+
+    fn semantics(&self) -> Option<Semantics> {
+        Some(Semantics::new(Role::Tooltip, self.text.clone()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stepper
+// ---------------------------------------------------------------------------
+
+/// A numeric value with a decrement and an increment either side of it.
+///
+/// For a value with a small, meaningful step — a track count, a bar length, a
+/// quantise division — where a [`slider`] would offer a continuum the product
+/// cannot honour and a text field would demand a keyboard for `+1`.
+///
+/// The middle also scrubs: drag it horizontally to run through the range, which
+/// is how a value with a hundred steps stays reachable without a hundred
+/// clicks.
+pub struct Stepper {
+    id: Option<ElementId>,
+    value: f32,
+    min: f32,
+    max: f32,
+    step: f32,
+    name: String,
+    format: Option<Box<dyn Fn(f32) -> String>>,
+    disabled: bool,
+    style: Style,
+    paint: PaintStyle,
+    on_change: Option<OnChange>,
+}
+
+/// Creates a [`Stepper`].
+pub fn stepper(value: f32) -> Stepper {
+    Stepper {
+        id: None,
+        value,
+        min: 0.0,
+        max: 100.0,
+        step: 1.0,
+        name: String::new(),
+        format: None,
+        disabled: false,
+        style: Style::DEFAULT,
+        paint: PaintStyle::default(),
+        on_change: None,
+    }
+}
+
+impl Stepper {
+    /// Gives the stepper a stable identity.
+    pub fn id(mut self, id: impl core::hash::Hash) -> Self {
+        self.id = Some(ElementId::from_key(id));
+        self
+    }
+
+    /// Sets the range. Defaults to `0..=100`.
+    pub fn range(mut self, min: f32, max: f32) -> Self {
+        self.min = min;
+        self.max = max;
+        self
+    }
+
+    /// Sets what one press of a button is worth. Defaults to `1`.
+    pub fn step(mut self, step: f32) -> Self {
+        self.step = step;
+        self
+    }
+
+    /// Sets the accessible name.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Formats the value for display and for assistive technology.
+    pub fn format(mut self, f: impl Fn(f32) -> String + 'static) -> Self {
+        self.format = Some(Box::new(f));
+        self
+    }
+
+    /// Marks the stepper disabled.
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    /// Runs when the value changes.
+    pub fn on_change(mut self, f: impl FnMut(f32) + 'static) -> Self {
+        self.on_change = Some(Box::new(f));
+        self
+    }
+
+    fn display(&self) -> String {
+        match &self.format {
+            Some(f) => f(self.value),
+            None if self.step.fract() == 0.0 => format!("{:.0}", self.value),
+            None => format!("{:.2}", self.value),
+        }
+    }
+
+    /// Quantises to the step, relative to `min`, and clamps.
+    fn quantize(&self, value: f32) -> f32 {
+        let lo = self.min.min(self.max);
+        let hi = self.max.max(self.min);
+        let clamped = value.clamp(lo, hi);
+        if self.step > 0.0 {
+            (self.min + ((clamped - self.min) / self.step).round() * self.step).clamp(lo, hi)
+        } else {
+            clamped
+        }
+    }
+
+    fn emit(&mut self, value: f32) {
+        let value = self.quantize(value);
+        if (value - self.value).abs() > f32::EPSILON
+            && let Some(f) = self.on_change.as_mut()
+        {
+            f(value);
+        }
+    }
+
+    /// The two buttons, decrement first.
+    fn buttons(&self, b: Rect<Px>) -> (Rect<Px>, Rect<Px>) {
+        let side = b.height();
+        (
+            Rect::new(b.origin, Size::new(side, side)),
+            Rect::new(Point::new(b.max_x() - side, b.min_y()), Size::new(side, side)),
+        )
+    }
+
+    /// True when the value cannot go any lower, or any higher.
+    fn at_limits(&self) -> (bool, bool) {
+        let lo = self.min.min(self.max);
+        let hi = self.max.max(self.min);
+        (self.value <= lo + f32::EPSILON, self.value >= hi - f32::EPSILON)
+    }
+}
+
+impl Styled for Stepper {
+    fn style_mut(&mut self) -> &mut Style {
+        &mut self.style
+    }
+
+    fn paint_style_mut(&mut self) -> &mut PaintStyle {
+        &mut self.paint
+    }
+}
+
+impl Element for Stepper {
+    fn id(&self) -> Option<ElementId> {
+        self.id
+    }
+
+    fn layout_style(&self) -> Style {
+        let mut style = self.style.clone();
+        if matches!(style.size.width, spherekit_core::Length::Auto) {
+            style.size.width = spherekit_core::Length::Px(px(120.0));
+        }
+        if matches!(style.size.height, spherekit_core::Length::Auto) {
+            style.size.height = spherekit_core::Length::Px(px(28.0));
+        }
+        style.flex_shrink = 0.0;
+        style
+    }
+
+    fn paint(&mut self, cx: &mut PaintContext<'_, '_>) {
+        cx.keep_interactive();
+        let b = cx.bounds;
+        if b.is_empty() {
+            return;
+        }
+        let c = cx.theme.colors;
+        let dim = if self.disabled { 0.45 } else { 1.0 };
+        let (down, up) = self.buttons(b);
+        let (at_min, at_max) = self.at_limits();
+        let hovered = cx.scratch[SCRATCH_SEGMENT_HOVER] as i32 - 1;
+
+        cx.canvas.quad(
+            b,
+            Corners::all(cx.theme.radii.md),
+            Some(c.elevated.scale_alpha(dim).into()),
+            c.border,
+            px(1.0),
+        );
+
+        for (i, (rect, spent)) in [(down, at_min), (up, at_max)].into_iter().enumerate() {
+            if hovered == i as i32 && !self.disabled && !spent {
+                cx.canvas.fill_rounded_rect(RoundedRect::uniform(rect, cx.theme.radii.md), c.hover);
+            }
+            // The sign is drawn, so a stepper needs no icon font: a minus is
+            // one stroke and a plus is that stroke plus its rotation.
+            let tint = if spent || self.disabled { c.text_muted.scale_alpha(0.5) } else { c.text };
+            let arm = Px(rect.width().get() * 0.20);
+            let centre = rect.center();
+            cx.canvas.draw_line(
+                Point::new(centre.x - arm, centre.y),
+                Point::new(centre.x + arm, centre.y),
+                tint,
+                px(1.5),
+            );
+            if i == 1 {
+                cx.canvas.draw_line(
+                    Point::new(centre.x, centre.y - arm),
+                    Point::new(centre.x, centre.y + arm),
+                    tint,
+                    px(1.5),
+                );
+            }
+        }
+
+        let middle = Rect::from_corners(
+            Point::new(down.max_x(), b.min_y()),
+            Point::new(up.min_x(), b.max_y()),
+        );
+        crate::date::draw_centered(
+            cx,
+            &self.display(),
+            cx.theme.typography.sm,
+            Some(cx.theme.typography.strong),
+            middle,
+            c.text.scale_alpha(dim),
+        );
+
+        if cx.state.focused {
+            let style = PaintStyle {
+                focus_ring: Some(FocusRing { color: c.focus, ..FocusRing::default() }),
+                corner_radii: Corners::all(cx.theme.radii.md),
+                ..Default::default()
+            };
+            style.paint_box(cx.canvas, b, cx.state);
+        }
+    }
+
+    fn handle_event(&mut self, cx: &mut EventContext<'_>) -> EventFlow {
+        if self.disabled {
+            return EventFlow::Continue;
+        }
+        let (down, up) = self.buttons(cx.bounds);
+        match cx.event {
+            UiEvent::MouseMove(e) if cx.scratch[SCRATCH_DRAGGING] != 0.0 => {
+                // Scrubbing: one step per twelve logical pixels, which is far
+                // enough that a shaky hand does not change the value and near
+                // enough that a full range is one comfortable sweep.
+                let origin = cx.scratch[SCRATCH_DRAG_ORIGIN];
+                let start = cx.scratch[SCRATCH_DRAG_VALUE];
+                let steps = ((e.position.x.get() - origin) / 12.0).round();
+                self.emit(start + steps * self.step);
+                cx.notify();
+                EventFlow::Stop
+            }
+            UiEvent::MouseMove(e) => {
+                // One-based, so an untouched control has neither button lit.
+                let over = if down.contains(e.position) {
+                    1
+                } else if up.contains(e.position) {
+                    2
+                } else {
+                    0
+                };
+                if cx.scratch[SCRATCH_SEGMENT_HOVER] as i32 != over {
+                    cx.scratch[SCRATCH_SEGMENT_HOVER] = over as f32;
+                    cx.notify();
+                }
+                cx.set_cursor(if over > 0 { Cursor::Pointer } else { Cursor::ResizeEw });
+                EventFlow::Continue
+            }
+            UiEvent::MouseLeave(_) => {
+                if cx.scratch[SCRATCH_SEGMENT_HOVER] != 0.0 {
+                    cx.scratch[SCRATCH_SEGMENT_HOVER] = 0.0;
+                    cx.notify();
+                }
+                EventFlow::Continue
+            }
+            UiEvent::MouseDown(e) if e.button == MouseButton::Primary => {
+                cx.focus();
+                if down.contains(e.position) {
+                    self.emit(self.value - self.step);
+                } else if up.contains(e.position) {
+                    self.emit(self.value + self.step);
+                } else {
+                    cx.scratch[SCRATCH_DRAG_VALUE] = self.value;
+                    cx.scratch[SCRATCH_DRAG_ORIGIN] = e.position.x.get();
+                    cx.scratch[SCRATCH_DRAGGING] = 1.0;
+                    cx.capture();
+                }
+                cx.notify();
+                EventFlow::Stop
+            }
+            UiEvent::MouseUp(e) if e.button == MouseButton::Primary => {
+                if cx.scratch[SCRATCH_DRAGGING] == 0.0 {
+                    return EventFlow::Continue;
+                }
+                cx.scratch[SCRATCH_DRAGGING] = 0.0;
+                cx.release();
+                cx.notify();
+                EventFlow::Stop
+            }
+            UiEvent::Scroll(e) => {
+                let lines = match e.delta {
+                    crate::event::ScrollDelta::Lines(d) => d.height,
+                    crate::event::ScrollDelta::Pixels(d) => d.height.get() / 20.0,
+                };
+                self.emit(self.value + lines.round() * self.step);
+                cx.notify();
+                EventFlow::Stop
+            }
+            UiEvent::Key(k) if k.state.is_pressed() => {
+                let next = match k.key {
+                    Key::Up | Key::Right => self.value + self.step,
+                    Key::Down | Key::Left => self.value - self.step,
+                    Key::PageUp => self.value + self.step * 10.0,
+                    Key::PageDown => self.value - self.step * 10.0,
+                    Key::Home => self.min,
+                    Key::End => self.max,
+                    _ => return EventFlow::Continue,
+                };
+                self.emit(next);
+                cx.notify();
+                EventFlow::Stop
+            }
+            _ => EventFlow::Continue,
+        }
+    }
+
+    fn focusable(&self) -> bool {
+        !self.disabled
+    }
+
+    fn semantics(&self) -> Option<Semantics> {
+        Some(
+            Semantics::new(Role::NumberField, self.name.clone())
+                .value(ValueRange {
+                    value: self.value,
+                    min: self.min,
+                    max: self.max,
+                    step: Some(self.step),
+                })
+                .value_text(self.display())
+                .disabled(self.disabled)
+                .with_implied_actions(),
+        )
+    }
+}
+
 /// Everything in this module, for a glob import.
 pub mod prelude {
     pub use super::{
-        Avatar, Button, ButtonVariant, ContextMenu, Dropdown, DropdownSide, MenuItem, Presence,
-        Progress, ScrollView, Scrollbar, ScrollbarPolicy, Toggle, ValueControl, ValueShape, avatar,
-        button, checkbox, context_menu, dropdown, fader, knob, menu_item, panel, progress,
-        progress_indeterminate, scroll_area, scroll_view, separator, slider, toggle,
+        Avatar, Badge, BadgeVariant, Button, ButtonVariant, ContextMenu, Dropdown, DropdownSide,
+        MenuItem, Presence, Progress, Radio, ScrollView, Scrollbar, ScrollbarPolicy,
+        SegmentedControl, Spinner, Stepper, Toggle, Tooltip, ValueControl, ValueShape, avatar,
+        badge, button, checkbox, context_menu, dropdown, fader, knob, menu_item, panel, progress,
+        progress_indeterminate, radio, scroll_area, scroll_view, segmented, separator, slider,
+        spinner, stepper, toggle, tooltip,
     };
 }
 
@@ -2587,6 +3847,230 @@ mod tests {
             assert!(style.border_color.is_transparent(), "{variant:?} kept a border colour");
             assert!(style.focus_ring.is_none(), "{variant:?} drew a focus outline");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Segmented control, radio, badge, spinner, stepper
+    // -----------------------------------------------------------------------
+
+    /// Mounts a widget in a box of a known size, so hit tests are arithmetic.
+    fn mount_sized(widget: AnyElement, w: f32, h: f32) -> UiTree {
+        let mut tree = UiTree::new();
+        tree.build(div().w(px(w)).h(px(h)).child(widget).into_element());
+        tree.compute_layout(viewport()).unwrap();
+        tree
+    }
+
+    #[test]
+    fn a_segment_reports_the_index_it_was_clicked_on() {
+        let picked = Rc::new(Cell::new(usize::MAX));
+        let p = picked.clone();
+        let mut tree = mount_sized(
+            segmented(0)
+                .id("seg")
+                .item("One")
+                .item("Two")
+                .item("Three")
+                .w(relative(1.0))
+                .on_select(move |i| p.set(i))
+                .into_element(),
+            300.0,
+            30.0,
+        );
+        // The third of three across 300 px is the 200..300 band.
+        tree.dispatch(&press_at(250.0, 15.0, 1));
+        assert_eq!(picked.get(), 2);
+    }
+
+    #[test]
+    fn re_choosing_the_current_segment_reports_nothing() {
+        // A selection that fires on every click makes an application that logs
+        // or saves on change do both for a click that changed nothing.
+        let hits = Rc::new(Cell::new(0));
+        let h = hits.clone();
+        let mut tree = mount_sized(
+            segmented(1)
+                .id("seg")
+                .item("One")
+                .item("Two")
+                .w(relative(1.0))
+                .on_select(move |_| h.set(h.get() + 1))
+                .into_element(),
+            200.0,
+            30.0,
+        );
+        tree.dispatch(&press_at(150.0, 15.0, 1));
+        assert_eq!(hits.get(), 0);
+    }
+
+    #[test]
+    fn the_arrow_keys_walk_a_segmented_control_and_stop_at_the_ends() {
+        for (start, k, expected) in [
+            (0usize, Key::Right, Some(1usize)),
+            (2, Key::Left, Some(1)),
+            (0, Key::Left, None),
+            (2, Key::Right, None),
+            (1, Key::Home, Some(0)),
+            (1, Key::End, Some(2)),
+        ] {
+            let picked = Rc::new(Cell::new(None));
+            let p = picked.clone();
+            let mut tree = mount_sized(
+                segmented(start)
+                    .id("seg")
+                    .item("a")
+                    .item("b")
+                    .item("c")
+                    .w(relative(1.0))
+                    .on_select(move |i| p.set(Some(i)))
+                    .into_element(),
+                300.0,
+                30.0,
+            );
+            tree.navigate_focus(crate::focus::FocusDirection::Next);
+            tree.dispatch(&key(k.clone(), false));
+            assert_eq!(picked.get(), expected, "{start} + {k:?}");
+        }
+    }
+
+    #[test]
+    fn a_radio_cannot_be_un_chosen() {
+        let hits = Rc::new(Cell::new(0));
+        let h = hits.clone();
+        let mut tree =
+            mount(radio(true).id("r").on_select(move || h.set(h.get() + 1)).into_element());
+        tree.dispatch(&press_at(8.0, 8.0, 1));
+        tree.dispatch(&release_at(8.0, 8.0));
+        assert_eq!(hits.get(), 0, "the chosen option reported a change to itself");
+    }
+
+    #[test]
+    fn an_unchosen_radio_reports_once() {
+        let hits = Rc::new(Cell::new(0));
+        let h = hits.clone();
+        let mut tree =
+            mount(radio(false).id("r").on_select(move || h.set(h.get() + 1)).into_element());
+        tree.dispatch(&press_at(8.0, 8.0, 1));
+        tree.dispatch(&release_at(8.0, 8.0));
+        assert_eq!(hits.get(), 1);
+    }
+
+    #[test]
+    fn a_stepper_steps_by_its_step_and_stops_at_its_range() {
+        let value = Rc::new(Cell::new(f32::NAN));
+        let v = value.clone();
+        let mut tree = mount_sized(
+            stepper(10.0)
+                .id("st")
+                .range(0.0, 10.0)
+                .step(5.0)
+                .w(px(120.0))
+                .on_change(move |x| v.set(x))
+                .into_element(),
+            120.0,
+            28.0,
+        );
+        // The decrement is the left square, its side the control's height.
+        tree.dispatch(&press_at(14.0, 14.0, 1));
+        assert_eq!(value.get(), 5.0);
+
+        // And the increment cannot go past the top of the range.
+        let value = Rc::new(Cell::new(f32::NAN));
+        let v = value.clone();
+        let mut tree = mount_sized(
+            stepper(10.0)
+                .id("st")
+                .range(0.0, 10.0)
+                .step(5.0)
+                .w(px(120.0))
+                .on_change(move |x| v.set(x))
+                .into_element(),
+            120.0,
+            28.0,
+        );
+        tree.dispatch(&press_at(106.0, 14.0, 1));
+        assert!(value.get().is_nan(), "a clamped step still reported a change");
+    }
+
+    #[test]
+    fn a_stepper_quantises_a_scrub_to_whole_steps() {
+        let value = Rc::new(Cell::new(f32::NAN));
+        let v = value.clone();
+        let mut tree = mount_sized(
+            stepper(0.0)
+                .id("st")
+                .range(0.0, 100.0)
+                .step(2.0)
+                .w(px(120.0))
+                .on_change(move |x| v.set(x))
+                .into_element(),
+            120.0,
+            28.0,
+        );
+        tree.dispatch(&press_at(60.0, 14.0, 1));
+        // Twelve logical pixels to the step, so 36 px is three of them.
+        tree.dispatch(&drag_to(96.0, 14.0, false));
+        assert_eq!(value.get(), 6.0);
+    }
+
+    #[test]
+    fn a_badge_with_a_dot_is_wider_than_one_without() {
+        let Some(mut system) = text_system() else {
+            eprintln!("no system font; skipping");
+            return;
+        };
+        let mut width_of = |dot: bool| {
+            let mut tree = UiTree::new();
+            tree.build(badge("Passing").dot(dot).into_element());
+            tree.compute_layout_with_text(viewport(), &mut system).unwrap();
+            let node = tree.layout().roots()[0];
+            tree.layout().layout(node).unwrap().bounds.width()
+        };
+        assert!(width_of(false) < width_of(true));
+    }
+
+    #[test]
+    fn a_spinner_draws_a_different_arc_as_time_passes() {
+        // The rotation is a function of paint time and nothing else, which is
+        // what lets it animate without a timer and stop dead when frames do.
+        let mut tree = mount(spinner().id("sp").size(px(24.0)).into_element());
+        let mut text = spherekit_text::TextSystem::new();
+        let mut at = |time: f32| {
+            let mut scene = Scene::new(viewport(), ScaleFactor::IDENTITY);
+            {
+                let mut canvas = Canvas::new(&mut scene);
+                tree.paint(&mut canvas, &mut text, viewport(), time);
+            }
+            scene.paths.len()
+        };
+        assert!(at(0.0) > 0, "the spinner drew no arc at all");
+        assert!(at(0.4) > 0);
+    }
+
+    #[test]
+    fn a_shut_tooltip_leaves_layout_entirely() {
+        // Not merely transparent: a tooltip that still hit-tested would eat the
+        // click on the control it is explaining.
+        let Some(mut system) = text_system() else {
+            eprintln!("no system font; skipping");
+            return;
+        };
+        let mut size_of = |visible: f32| {
+            let mut tree = UiTree::new();
+            tree.build(
+                div()
+                    .w(px(200.0))
+                    .h(px(40.0))
+                    .child(tooltip("Removes the take", visible))
+                    .into_element(),
+            );
+            tree.compute_layout_with_text(viewport(), &mut system).unwrap();
+            let node = tree.layout().roots()[0];
+            let child = tree.layout().children(node)[0];
+            tree.layout().layout(child).unwrap().bounds.width()
+        };
+        assert_eq!(size_of(0.0), Px::ZERO);
+        assert!(size_of(1.0) > Px::ZERO);
     }
 
     #[test]

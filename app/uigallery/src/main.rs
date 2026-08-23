@@ -18,6 +18,8 @@
 //!
 //! Keyboard: Tab and Shift-Tab move focus, Space and Enter activate, arrow keys
 //! adjust a focused slider or knob, Escape closes a menu and then quits.
+//!
+//! `SPHEREKIT_GALLERY_PAGE=Colour` opens straight onto one page, by title.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -41,9 +43,11 @@ use spherekit::platform::{CaptionRegions, WindowBackdrop, WindowChrome};
 use spherekit::svg::SvgCache;
 use spherekit::text::FontWeight;
 use spherekit::ui::{
-    AnyElement, Cursor, Element, EventContext, InputTranslator, Interactive, IntoElement,
-    ParentElement, Presence, Role, Semantics, Styled, StyledInteraction, TextEdit, Theme, avatar,
-    context_menu, div, dropdown, label, menu_item, scroll_view, separator,
+    AnyElement, ButtonVariant, Cursor, Date, Element, EventContext, Hsva, InputTranslator,
+    Interactive, IntoElement, ParentElement, Presence, Role, Semantics, Styled, StyledInteraction,
+    TextEdit, TextRole, Theme, ToastVariant, TypeScale, avatar, button, context_menu, div,
+    dropdown, label, menu_item, overlay, scroll_view, segmented, separator, spinner, toast,
+    toast_layer,
 };
 use spherekit::{SphereKitSurface, SurfaceOptions};
 
@@ -162,6 +166,55 @@ fn product_theme(system_theme: PlatformTheme) -> Theme {
     }
 }
 
+/// Which theme the gallery is showing, whatever the operating system says.
+///
+/// A gallery is a document about a theme, and a reader comparing the light and
+/// dark palettes should not have to leave the window to do it. `System` is the
+/// default and the honest one: it is what a shipping application would do.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Appearance {
+    System,
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    /// The order they appear in the switch.
+    const ALL: [Appearance; 3] = [Appearance::System, Appearance::Light, Appearance::Dark];
+
+    fn title(self) -> &'static str {
+        match self {
+            Appearance::System => "System",
+            Appearance::Light => "Light",
+            Appearance::Dark => "Dark",
+        }
+    }
+}
+
+/// One entry in the application's own toast list.
+///
+/// The widget draws a toast; *this* is a toast. When it appeared, how long it
+/// stays and when it goes are decisions with no defensible default, so they
+/// live here rather than in the engine — see `spherekit::ui::overlay`.
+pub(crate) struct ToastEntry {
+    /// Stable across rebuilds, so dismissing one does not renumber the rest.
+    pub(crate) key: u64,
+    pub(crate) title: &'static str,
+    pub(crate) message: String,
+    pub(crate) variant: ToastVariant,
+    /// Seconds since start when it appeared, for the auto-dismiss.
+    pub(crate) born: f32,
+    /// How far in it has travelled, `0..=1`.
+    pub(crate) fade: Motion<f32>,
+    /// Set once the entry has been asked to leave.
+    pub(crate) leaving: bool,
+}
+
+/// How long a toast stays before it starts to leave, in seconds.
+const TOAST_LIFETIME: f32 = 4.5;
+/// The most toasts on screen at once. Older ones leave early to make room.
+const TOAST_LIMIT: usize = 3;
+
 /// What a context-menu row does to the field it was opened over.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EditAction {
@@ -186,11 +239,46 @@ pub(crate) struct State {
     /// How many times any button on the Buttons page has been pressed.
     pub(crate) presses: Cell<u32>,
 
+    /// Which theme the appearance switch is asking for.
+    pub(crate) appearance: Cell<Appearance>,
+    /// Whether the sidebar is showing its labels.
+    pub(crate) sidebar_open: Cell<bool>,
+    /// How far the sidebar has actually travelled, `0..=1`.
+    pub(crate) sidebar: Cell<Motion<f32>>,
+    /// Whether the confirm dialog is up, and how far it has arrived.
+    pub(crate) dialog_open: Cell<bool>,
+    pub(crate) dialog: Cell<Motion<f32>>,
+    /// Whether the Overlays page's popover is up, and how far.
+    pub(crate) popover_open: Cell<bool>,
+    pub(crate) popover: Cell<Motion<f32>>,
+    /// Which side that popover opens from.
+    pub(crate) popover_side: Cell<usize>,
+    /// A toast a widget callback asked for, drained by the frame loop.
+    ///
+    /// Queued rather than pushed directly because a toast needs the frame's
+    /// clock reading to know when it was born, and a callback has no clock —
+    /// the same reason a caption button queues its window command.
+    pub(crate) pending_toast: Cell<Option<(ToastVariant, &'static str)>>,
+    /// The toasts currently on screen, oldest first.
+    pub(crate) toasts: RefCell<Vec<ToastEntry>>,
+    /// The next toast key. Monotonic, so a key is never reused.
+    pub(crate) next_toast: Cell<u64>,
+    /// How far the current page has finished arriving, `0..=1`.
+    ///
+    /// Reset to zero by [`GalleryApp::sync_page`] whenever the page changes and
+    /// sprung back to one by the frame loop, which is the same split every
+    /// other animation here uses: an event records intent, the loop moves.
+    pub(crate) page_in: Cell<Motion<f32>>,
+
     // --- Selection ---------------------------------------------------------
     pub(crate) wifi: Cell<bool>,
     pub(crate) opt_a: Cell<bool>,
     pub(crate) opt_b: Cell<bool>,
     pub(crate) opt_c: Cell<bool>,
+    /// The segmented control's choice.
+    pub(crate) density: Cell<usize>,
+    /// The radio group's choice.
+    pub(crate) quality: Cell<usize>,
 
     // --- Values ------------------------------------------------------------
     pub(crate) gain: Cell<f32>,
@@ -199,6 +287,27 @@ pub(crate) struct State {
     pub(crate) level: Cell<f32>,
     pub(crate) tone: Cell<f32>,
     pub(crate) width: Cell<f32>,
+    pub(crate) takes: Cell<f32>,
+    pub(crate) bpm: Cell<f32>,
+
+    // --- Colour ------------------------------------------------------------
+    /// The colour every control on the Colour page reads and writes.
+    ///
+    /// `Hsva` rather than `Color`, which is the whole point of the type: a drag
+    /// into the bottom of the square keeps the hue it was dragged from.
+    pub(crate) tint: Cell<Hsva>,
+
+    // --- Dates -------------------------------------------------------------
+    /// The month every calendar on the Dates page is showing.
+    pub(crate) cal_month: Cell<Date>,
+    /// The chosen day, if any.
+    pub(crate) cal_day: Cell<Option<Date>>,
+    /// The open end of the range demo, and its close.
+    pub(crate) range_from: Cell<Option<Date>>,
+    pub(crate) range_to: Cell<Option<Date>>,
+    /// Whether the date popover is open, and how far it has travelled.
+    pub(crate) date_menu_open: Cell<bool>,
+    pub(crate) date_menu: Cell<Motion<f32>>,
 
     // --- Text --------------------------------------------------------------
     pub(crate) name_field: RefCell<TextEdit>,
@@ -214,6 +323,10 @@ pub(crate) struct State {
     pub(crate) download: Cell<f32>,
     /// Whether the Containers page is running its indeterminate bar.
     pub(crate) busy: Cell<bool>,
+    /// Whether the pointer is over the control the tooltip explains.
+    pub(crate) hint_hovered: Cell<bool>,
+    /// How far the tooltip has actually opened, `0..=1`.
+    pub(crate) hint: Cell<Motion<f32>>,
 
     // --- Context menu ------------------------------------------------------
     /// Where the last right-click landed, in window coordinates.
@@ -267,24 +380,59 @@ impl State {
     fn new() -> Rc<Self> {
         Rc::new(Self {
             system_theme: Cell::new(PlatformTheme::Dark),
-            page: Cell::new(Page::Buttons),
+            page: Cell::new(
+                std::env::var("SPHEREKIT_GALLERY_PAGE")
+                    .ok()
+                    .and_then(|name| Page::from_name(&name))
+                    .unwrap_or(Page::Buttons),
+            ),
+            appearance: Cell::new(Appearance::System),
+            // Settled and fully arrived, so a tree built outside the frame loop
+            // — a test, a screenshot harness — gets an opaque page rather than
+            // whatever a transition happened to be part-way through.
+            page_in: Cell::new(Motion::at(1.0, Drive::SMOOTH)),
+            sidebar_open: Cell::new(true),
+            sidebar: Cell::new(Motion::at(1.0, Drive::SMOOTH)),
+            dialog_open: Cell::new(false),
+            dialog: Cell::new(Motion::at(0.0, Drive::STIFF)),
+            popover_open: Cell::new(false),
+            popover: Cell::new(Motion::at(0.0, Drive::STIFF)),
+            popover_side: Cell::new(1),
+            pending_toast: Cell::new(None),
+            toasts: RefCell::new(Vec::new()),
+            next_toast: Cell::new(1),
             presses: Cell::new(0),
             wifi: Cell::new(true),
             opt_a: Cell::new(true),
             opt_b: Cell::new(false),
             opt_c: Cell::new(false),
+            density: Cell::new(1),
+            quality: Cell::new(1),
             gain: Cell::new(-6.0),
             scale: Cell::new(100.0),
             pan: Cell::new(0.0),
             level: Cell::new(72.0),
             tone: Cell::new(45.0),
             width: Cell::new(0.0),
+            takes: Cell::new(4.0),
+            bpm: Cell::new(120.0),
+            tint: Cell::new(Hsva::from_color(Color::hex(0x78A8E8))),
+            cal_month: Cell::new(Date::today_utc().first_of_month()),
+            cal_day: Cell::new(Some(Date::today_utc())),
+            range_from: Cell::new(None),
+            range_to: Cell::new(None),
+            date_menu_open: Cell::new(false),
+            date_menu: Cell::new(Motion::at(0.0, Drive::STIFF)),
             name_field: RefCell::new(TextEdit::from_text("Ada Lovelace")),
             secret_field: RefCell::new(TextEdit::new()),
             demo_menu_open: Cell::new(false),
             demo_menu: Cell::new(Motion::at(0.0, Drive::STIFF)),
             download: Cell::new(0.0),
             busy: Cell::new(true),
+            hint_hovered: Cell::new(false),
+            // Slower than a menu on purpose: a tooltip that snapped open under
+            // every pointer that crossed a button would be noise.
+            hint: Cell::new(Motion::at(0.0, Drive::SMOOTH)),
             menu_at: Cell::new(spherekit::core::Point::new(Px::ZERO, Px::ZERO)),
             menu_field: Cell::new(0),
             ctx_menu_open: Cell::new(false),
@@ -301,7 +449,104 @@ impl State {
     }
 
     fn theme(&self) -> Theme {
-        product_theme(self.system_theme.get())
+        product_theme(self.effective_theme())
+    }
+
+    /// Which appearance is actually in force.
+    fn effective_theme(&self) -> PlatformTheme {
+        match self.appearance.get() {
+            Appearance::System => self.system_theme.get(),
+            Appearance::Light => PlatformTheme::Light,
+            Appearance::Dark => PlatformTheme::Dark,
+        }
+    }
+
+    /// Pushes a toast, retiring the oldest if the screen is full.
+    ///
+    /// `at` is the frame's own clock reading rather than a fresh `Instant`:
+    /// every animation in this window is driven from one timeline, and a toast
+    /// that read a different clock would drift against the springs beside it.
+    pub(crate) fn push_toast(
+        &self,
+        at: f32,
+        variant: ToastVariant,
+        title: &'static str,
+        message: impl Into<String>,
+    ) {
+        let mut toasts = self.toasts.borrow_mut();
+        // Oldest first, so the ones asked to leave are the ones at the front.
+        let live = toasts.iter().filter(|t| !t.leaving).count();
+        if live >= TOAST_LIMIT {
+            if let Some(oldest) = toasts.iter_mut().find(|t| !t.leaving) {
+                oldest.leaving = true;
+            }
+        }
+        let key = self.next_toast.get();
+        self.next_toast.set(key + 1);
+        toasts.push(ToastEntry {
+            key,
+            title,
+            message: message.into(),
+            variant,
+            born: at,
+            fade: Motion::at(0.0, Drive::SMOOTH),
+            leaving: false,
+        });
+    }
+
+    /// Asks a toast to leave. It is dropped once its spring has settled.
+    pub(crate) fn dismiss_toast(&self, key: u64) {
+        if let Some(entry) = self.toasts.borrow_mut().iter_mut().find(|t| t.key == key) {
+            entry.leaving = true;
+        }
+    }
+
+    /// Opens or closes the sidebar. Returns whether anything changed.
+    pub(crate) fn set_sidebar(&self, open: bool) -> bool {
+        if self.sidebar_open.get() == open {
+            return false;
+        }
+        self.sidebar_open.set(open);
+        true
+    }
+
+    /// The range the Dates page is showing, ordered.
+    pub(crate) fn range(&self) -> Option<(Date, Date)> {
+        match (self.range_from.get(), self.range_to.get()) {
+            (Some(a), Some(b)) => Some(if a <= b { (a, b) } else { (b, a) }),
+            // A half-open range is drawn as one day, so the first click has
+            // visible consequences rather than appearing to do nothing.
+            (Some(a), None) => Some((a, a)),
+            _ => None,
+        }
+    }
+
+    /// Adds a day to the range: the first click opens it, the second closes it.
+    pub(crate) fn extend_range(&self, day: Date) {
+        match (self.range_from.get(), self.range_to.get()) {
+            (Some(from), None) if day != from => {
+                let (a, b) = if day < from { (day, from) } else { (from, day) };
+                self.range_from.set(Some(a));
+                self.range_to.set(Some(b));
+                self.say(format!("Range {} to {}.", a.iso(), b.iso()));
+            }
+            _ => {
+                self.range_from.set(Some(day));
+                self.range_to.set(None);
+                self.say(format!("Range starts {}.", day.iso()));
+            }
+        }
+    }
+
+    /// How many nights the range covers, as a string for a readout.
+    pub(crate) fn nights(&self) -> String {
+        match self.range() {
+            Some((a, b)) => {
+                let n = a.days_until(b);
+                format!("{n} night{}", if n == 1 { "" } else { "s" })
+            }
+            None => "\u{2014}".to_string(),
+        }
     }
 
     /// Opens the edit menu over `field` at a window position.
@@ -377,6 +622,14 @@ struct GalleryApp {
     frames: u64,
     frame_limit: Option<u64>,
     reported: bool,
+    /// The page the last frame drew, so a change can be noticed once.
+    shown_page: Option<Page>,
+    /// The theme the surface was last told about.
+    ///
+    /// Diffed rather than pushed every frame: `set_theme` marks the root
+    /// dirty, so pushing it unconditionally would force a full repaint sixty
+    /// times a second in a window that is meant to idle at zero.
+    applied_theme: Option<Theme>,
     /// Last input-method state pushed to the window, so it is only pushed when
     /// it changes. Re-enabling an input method can cancel a composition.
     ime_allowed: bool,
@@ -396,6 +649,8 @@ impl GalleryApp {
             state: State::new(),
             // Populated in `resumed`, against the same cache the painter uses.
             icons: Vec::new(),
+            shown_page: None,
+            applied_theme: None,
             ime_allowed: false,
             ime_caret: None,
             timeline: Timeline::new(),
@@ -434,9 +689,11 @@ impl GalleryApp {
             )
             .child(separator(false).bg(Color::TRANSPARENT))
             .child(self.status_bar(&theme))
-            // Last child of the root, so its coordinates are window
-            // coordinates and it paints over everything. A context menu that
-            // lived inside the pane it was opened from could not escape it.
+            // Last children of the root, so their coordinates are window
+            // coordinates and they paint over everything. A context menu that
+            // lived inside the pane it was opened from could not escape it, and
+            // a scrim that did would not be modal.
+            .child(self.confirm_dialog(&theme))
             .child(self.edit_menu(&theme))
             .into_element()
     }
@@ -504,6 +761,103 @@ impl GalleryApp {
             .into_element()
     }
 
+    /// The confirm dialog: a scrim with a card centred on it.
+    ///
+    /// At the root of the tree, so the scrim covers the window. An overlay
+    /// fills its *parent*, and one built inside the content pane would leave
+    /// the sidebar and the caption live — which is a dialog that only looks
+    /// modal.
+    fn confirm_dialog(&self, theme: &Theme) -> AnyElement {
+        let c = theme.colors;
+        let open = self.state.dialog.get().value();
+        let close = {
+            let state = Rc::clone(&self.state);
+            move || {
+                state.dialog_open.set(false);
+            }
+        };
+
+        overlay(open)
+            .id("modal")
+            .on_dismiss(close.clone())
+            .child(
+                div()
+                    .flex_col()
+                    .w(px(380.0))
+                    .gap(theme.spacing.md)
+                    .p(theme.spacing.lg)
+                    .rounded(theme.radii.lg)
+                    .bg(c.surface)
+                    .border(px(1.0), c.border)
+                    .shadow(theme.shadows.lg)
+                    .child(
+                        label("Delete this take?")
+                            .scale(TypeScale::Lg)
+                            .weight(theme.typography.strong),
+                    )
+                    .child(
+                        label(
+                            "The audio and every edit made to it go with it. \
+                             This is the one thing here that cannot be undone.",
+                        )
+                        .scale(TypeScale::Sm)
+                        .role(TextRole::Muted),
+                    )
+                    .child(div().h(theme.spacing.xs))
+                    .child(
+                        div()
+                            .flex_row()
+                            .justify(spherekit::layout::Distribute::End)
+                            .gap(theme.spacing.sm)
+                            .child({
+                                let close = close.clone();
+                                let state = Rc::clone(&self.state);
+                                button("Cancel")
+                                    .id("modal.cancel")
+                                    .variant(ButtonVariant::Outline)
+                                    .on_press(move || {
+                                        close.clone()();
+                                        state.say("Cancelled.");
+                                    })
+                            })
+                            .child({
+                                let close = close.clone();
+                                let state = Rc::clone(&self.state);
+                                button("Delete")
+                                    .id("modal.delete")
+                                    .variant(ButtonVariant::Danger)
+                                    .on_press(move || {
+                                        close.clone()();
+                                        state
+                                            .pending_toast
+                                            .set(Some((ToastVariant::Danger, "Take deleted")));
+                                    })
+                            }),
+                    ),
+            )
+            .into_element()
+    }
+
+    /// Everything currently being announced, stacked in the bottom-right.
+    ///
+    /// Each entry carries its own spring, so one leaving does not interrupt the
+    /// two above it — which is what a single shared animation would do.
+    fn toasts(&self, _theme: &Theme) -> AnyElement {
+        let mut layer = toast_layer(true, true);
+        for entry in self.state.toasts.borrow().iter() {
+            let state = Rc::clone(&self.state);
+            let key = entry.key;
+            layer = layer.child(
+                toast(entry.message.clone(), entry.fade.value())
+                    .id(("toast", entry.key))
+                    .title(entry.title)
+                    .variant(entry.variant)
+                    .on_dismiss(move || state.dismiss_toast(key)),
+            );
+        }
+        layer.into_element()
+    }
+
     fn header(&self, theme: &Theme) -> AnyElement {
         let c = theme.colors;
         let state = Rc::clone(&self.state);
@@ -521,8 +875,23 @@ impl GalleryApp {
             .shrink(0.0)
             // Padded on the left only: the window buttons run flush to the
             // right edge, exactly as the shell's do.
-            .pl(px(12.0))
+            .pl(px(6.0))
             .z(2)
+            .child({
+                let toggle = Rc::clone(&state);
+                let open = self.state.sidebar_open.get();
+                button("\u{E700}")
+                    .id("chrome.sidebar")
+                    .variant(ButtonVariant::Ghost)
+                    .font(ICON_FONT)
+                    .text_size(px(11.0))
+                    .width(px(28.0))
+                    .height(px(24.0))
+                    .on_press(move || {
+                        toggle.set_sidebar(!open);
+                        toggle.say(if open { "Sidebar collapsed." } else { "Sidebar expanded." });
+                    })
+            })
             .child(
                 label("SphereKit")
                     .text_size(theme.typography.sm)
@@ -566,6 +935,21 @@ impl GalleryApp {
     fn sidebar(&mut self, theme: &Theme) -> AnyElement {
         let c = theme.colors;
         let current = self.state.page.get();
+        // One spring drives the width, the label alpha and the heading. Reading
+        // all three off the same number is what keeps them in step; three
+        // separate tweens would not be, and the drift shows.
+        let open = self.state.sidebar.get().value().clamp(0.0, 1.0);
+        let width = px(SIDEBAR_COLLAPSED + (SIDEBAR_WIDTH - SIDEBAR_COLLAPSED) * open);
+        // The rows narrow with the panel. Pinned to the open width they would be
+        // clipped by the panel's edge instead, and a clipped rounded rectangle
+        // is a rounded rectangle with one flat side — which is what a selected
+        // row looked like for the whole of the collapsed state.
+        let row_width = width - px(NAV_INSET * 2.0);
+        // Faded rather than removed. A label that left the tree would take the
+        // row's width with it and the sidebar would jump instead of sliding;
+        // faded and clipped, it slides out under its own edge.
+        let text = c.text.scale_alpha(open);
+        let muted = c.text_muted.scale_alpha(open);
         let mut nav = div()
             .flex_col()
             // Clipped, and scrollable once it no longer fits. Without this the
@@ -577,15 +961,16 @@ impl GalleryApp {
             // first, and whatever is left over is the navigation's.
             .grow(1.0)
             .min_h(px(0.0))
-            .px_(theme.spacing.md)
+            .px_(px(NAV_INSET))
             .pt(theme.spacing.md)
             .gap(theme.spacing.xs)
             .child(
                 label("WIDGETS")
                     .text_size(theme.typography.xs)
                     .weight(theme.typography.strong)
-                    .text_color(c.text_muted)
-                    .px_(theme.spacing.md)
+                    .text_color(muted)
+                    .no_wrap()
+                    .px_(px(NAV_INSET))
                     .py_(theme.spacing.sm),
             );
 
@@ -603,7 +988,12 @@ impl GalleryApp {
                     .items_center()
                     .gap(theme.spacing.md)
                     .h(px(32.0))
-                    .px_(theme.spacing.md)
+                    .shrink(0.0)
+                    .w(row_width)
+                    // The label overflows this box on its way out and is cut off
+                    // by the panel, not by the row: clipping it at the row edge
+                    // would make it vanish a step early and stutter.
+                    .px_(px(NAV_INSET))
                     .rounded(theme.radii.sm)
                     .bg(if selected { c.pressed } else { Color::TRANSPARENT })
                     .hover_bg(c.hover)
@@ -620,7 +1010,7 @@ impl GalleryApp {
                             } else {
                                 theme.typography.weight
                             })
-                            .text_color(c.text)
+                            .text_color(text)
                             .no_wrap(),
                     )
                     .on_click(move |cx: &mut EventContext<'_>| {
@@ -637,10 +1027,14 @@ impl GalleryApp {
         // in that same layer can make them disappear when the adjacent opaque
         // content pane is repainted.
         div()
+            .id("chrome.sidebar-panel")
             .flex_col()
-            .w(px(220.0))
+            .w(width)
             .shrink(0.0)
             .h(relative(1.0))
+            // Clipped, which is the other half of the slide: the rows keep
+            // their full width and the panel narrows over them.
+            .overflow_hidden()
             .child(div().absolute().inset(px(0.0)).backdrop_blur(px(18.0)))
             .child(nav)
             // Last, so it paints over the navigation: the account menu opens
@@ -656,6 +1050,9 @@ impl GalleryApp {
     /// the panel lands on the row's top edge without anyone measuring the row.
     fn account_footer(&self, theme: &Theme) -> AnyElement {
         let c = theme.colors;
+        let shown = self.state.sidebar.get().value().clamp(0.0, 1.0);
+        let width = px(SIDEBAR_COLLAPSED + (SIDEBAR_WIDTH - SIDEBAR_COLLAPSED) * shown);
+        let row_width = width - px(FOOTER_INSET * 2.0);
         let open = self.state.user_menu.get().value();
         let expanded = self.state.user_menu_open.get();
         let state = Rc::clone(&self.state);
@@ -677,7 +1074,9 @@ impl GalleryApp {
             .items_center()
             .gap(theme.spacing.md)
             .h(px(44.0))
-            .px_(theme.spacing.sm)
+            .shrink(0.0)
+            .w(row_width)
+            .px_(px(FOOTER_INSET))
             .rounded(theme.radii.md)
             .bg(if expanded { c.pressed } else { Color::TRANSPARENT })
             .hover_bg(c.hover)
@@ -703,17 +1102,17 @@ impl GalleryApp {
                         label(USER_NAME)
                             .text_size(theme.typography.sm)
                             .weight(theme.typography.strong)
-                            .text_color(c.text)
+                            .text_color(c.text.scale_alpha(shown))
                             .no_wrap(),
                     )
                     .child(
                         label(USER_EMAIL)
                             .text_size(theme.typography.xs)
-                            .text_color(c.text_muted)
+                            .text_color(c.text_muted.scale_alpha(shown))
                             .no_wrap(),
                     ),
             )
-            .child(ChevronElement { tint: c.text_muted, open })
+            .child(ChevronElement { tint: c.text_muted.scale_alpha(shown), open })
             .on_click(move |cx: &mut EventContext<'_>| {
                 state.set_user_menu(!state.user_menu_open.get());
                 // A repaint, not a relayout: the panel is already in the tree
@@ -732,7 +1131,7 @@ impl GalleryApp {
         div()
             .flex_col()
             .shrink(0.0)
-            .px_(theme.spacing.sm)
+            .px_(px(FOOTER_INSET))
             .pb(theme.spacing.sm)
             .pt(theme.spacing.xs)
             // Presses bubble out through here, so this is the one place that
@@ -797,7 +1196,9 @@ impl GalleryApp {
         // be sampled here where the surface is reachable and handed down.
         let adapter = self.surface.as_ref().map(|s| s.adapter_name()).unwrap_or("").to_string();
         let stats = self.surface.as_ref().map(|s| s.stats()).unwrap_or_default();
-        let body = pages::render(self.state.page.get(), &self.state, theme, &adapter, &stats);
+        let body =
+            pages::render(self.state.page.get(), &self.state, theme, &adapter, &stats, &self.icons);
+        let reveal = self.state.page_in.get().value().clamp(0.0, 1.0);
 
         div()
             .flex_col()
@@ -812,9 +1213,14 @@ impl GalleryApp {
                 div()
                     .flex_row()
                     .items_center()
-                    .h(px(36.0))
+                    .h(px(PAGE_HEADER_HEIGHT))
                     .shrink(0.0)
                     .px_(px(12.0))
+                    // Above the pane it is heading, so its shadow lands on the
+                    // content rather than under it. Document order alone would
+                    // paint this row first and a card scrolled up against it
+                    // would cover the shadow completely.
+                    .z(1)
                     // A `no_wrap` label's minimum width is its whole string, so
                     // two of them in one row simply refuse to yield and get
                     // drawn over each other. The title takes the leftover space
@@ -837,9 +1243,25 @@ impl GalleryApp {
                             .text_size(theme.typography.xs)
                             .text_color(c.text_muted)
                             .no_wrap(),
-                    ),
+                    )
+                    .child(div().w(theme.spacing.md).shrink(0.0))
+                    .child(self.appearance_switch())
+                    // Last child, so it is recorded after everything the row
+                    // draws — though it only ever paints below the row.
+                    .child(HeaderShadow {
+                        // Straight from the theme's popover token. With a
+                        // correct Gaussian behind it there is nothing to
+                        // compensate for; the earlier version had to be
+                        // over-driven to make a broken falloff visible at all.
+                        color: theme.shadows.md.color,
+                        rise: px(PAGE_HEADER_HEIGHT),
+                    }),
             )
             .child(separator(false).bg(Color::TRANSPARENT))
+            // Inside the pane rather than at the root: pinned to the window a
+            // toast would sit over the status bar, which is chrome. This also
+            // keeps it clear of the sidebar without knowing how wide it is.
+            .child(self.toasts(theme))
             .child(
                 scroll_view().id("content-scroll").flex_1().min_h(px(0.0)).w(relative(1.0)).child(
                     div().flex_row().justify_center().w(relative(1.0)).child(
@@ -847,12 +1269,43 @@ impl GalleryApp {
                             .flex_col()
                             .w(relative(1.0))
                             .max_w(px(760.0))
-                            .p(px(32.0))
+                            .px_(px(32.0))
+                            .pb(px(32.0))
+                            // The page fades in and rises the last few pixels
+                            // as it does. Both halves are a function of one
+                            // spring, so they cannot get out of step, and both
+                            // are read at build time — the transition is state
+                            // the frame loop advances, not a timer the pane
+                            // owns.
+                            .pt(px(32.0) + px(PAGE_RISE) * (1.0 - reveal))
+                            .opacity(reveal)
                             .gap(theme.spacing.xl)
                             .child(body),
                     ),
                 ),
             )
+            .into_element()
+    }
+
+    /// The light/dark switch in the pane header.
+    ///
+    /// A [`segmented`] control rather than a toggle, because there are three
+    /// answers and the third one — follow the system — is the default a real
+    /// application ships with. A two-state switch would have to hide it.
+    fn appearance_switch(&self) -> AnyElement {
+        let state = Rc::clone(&self.state);
+        let current =
+            Appearance::ALL.iter().position(|a| *a == self.state.appearance.get()).unwrap_or(0);
+        segmented(current)
+            .id("chrome.appearance")
+            .name("Appearance")
+            .h(px(24.0))
+            .options(Appearance::ALL.iter().map(|a| a.title()))
+            .on_select(move |index| {
+                let next = Appearance::ALL[index.min(Appearance::ALL.len() - 1)];
+                state.appearance.set(next);
+                state.say(format!("Appearance: {}.", next.title()));
+            })
             .into_element()
     }
 
@@ -870,6 +1323,12 @@ impl GalleryApp {
             .shrink(0.0)
             .px_(theme.spacing.lg)
             .z(1)
+            // Only while the sync is actually running: a spinner that is on
+            // screen when nothing is happening teaches the user to ignore it.
+            .child(
+                (self.state.download.get() < 1.0)
+                    .then(|| spinner().id("chrome.sync").size(px(12.0)).thickness(px(1.5))),
+            )
             .child(label(last).text_size(theme.typography.xs).text_color(c.text_muted).no_wrap())
             .child(div().flex_1())
             .child(
@@ -936,6 +1395,31 @@ const CAPTION_HEIGHT: f32 = 32.0;
 const CAPTION_GLYPH: f32 = 10.0;
 /// How many caption buttons there are, and therefore how many hover springs.
 const CAPTION_BUTTONS: usize = 3;
+
+/// The sidebar's width with its labels showing.
+const SIDEBAR_WIDTH: f32 = 220.0;
+/// And collapsed.
+///
+/// Not a round number chosen by eye: it is what centres the icon. The row is
+/// inset by [`NAV_INSET`] on each side and pads itself by the same again, so a
+/// 16 px icon sits at `12 + 12 + 8 = 32` from the panel's left edge — which is
+/// the centre of a 64 px panel and nothing else.
+const SIDEBAR_COLLAPSED: f32 = 64.0;
+/// How far the navigation rows are inset from the panel's edges.
+const NAV_INSET: f32 = 12.0;
+/// The same for the account footer, whose avatar is wider than an icon.
+const FOOTER_INSET: f32 = 8.0;
+
+/// How far a page rises as it arrives, in logical pixels.
+///
+/// Small on purpose. A page that slides in from the edge of the window is a
+/// transition the reader has to wait out; fourteen pixels reads as the content
+/// settling, which is over before anyone has decided to be annoyed by it.
+const PAGE_RISE: f32 = 14.0;
+/// Height of the pane's own header: the page title and the appearance switch.
+const PAGE_HEADER_HEIGHT: f32 = 36.0;
+/// How far the page header's shadow reaches down the pane.
+const HEADER_SHADOW_BLUR: f32 = 10.0;
 
 /// The colour Windows uses for a hovered close button.
 const CLOSE_HOVER: Color = Color::hex(0xC4_2B1C);
@@ -1100,6 +1584,80 @@ fn spherekit_text_style(size: Px) -> spherekit::text::TextStyle {
     }
 }
 
+/// The soft edge under the pane's header, separating it from what scrolls.
+///
+/// One logical pixel tall, painting a shadow that reaches far outside its own
+/// box. Both of those are deliberate.
+///
+/// It cannot be a [`Shadow`](spherekit::core::Shadow) on the header row itself:
+/// the row has no background — it is the pane's translucent Mica tint showing
+/// through — and a drop shadow is painted *behind* the shape that casts it, so
+/// it would be visible through the row instead of under it.
+///
+/// And it cannot be a strip as tall as the falloff either. The topmost node
+/// containing a point wins the hit test outright, so an eighteen-pixel band
+/// across the pane would quietly swallow every click along the top of the
+/// content. A one-pixel element has no meaningful hit area, and painting is not
+/// clipped to an element's own box unless it asks to be.
+pub(crate) struct HeaderShadow {
+    /// The shadow's colour, from the theme's own token.
+    pub(crate) color: Color,
+    /// How tall the caption is: the shape the shadow is cast from.
+    pub(crate) rise: Px,
+}
+
+impl spherekit::ui::Element for HeaderShadow {
+    fn layout_style(&self) -> spherekit::layout::Style {
+        let mut style = spherekit::layout::Style::DEFAULT;
+        style.position = spherekit::layout::Position::Absolute;
+        // Anchored to the header's bottom edge and spanning its width, the same
+        // way a dropdown anchors to its trigger.
+        style.inset.top = spherekit::core::Length::Fraction(1.0);
+        style.inset.left = spherekit::core::Length::Px(Px::ZERO);
+        style.inset.right = spherekit::core::Length::Px(Px::ZERO);
+        style.size.height = spherekit::core::Length::Px(px(1.0));
+        style
+    }
+
+    fn paint(&mut self, cx: &mut spherekit::ui::PaintContext<'_, '_>) {
+        use spherekit::core::{Point, Rect, RoundedRect, Shadow, size};
+        let b = cx.bounds;
+        if b.width() <= Px::ZERO {
+            return;
+        }
+        let blur = px(HEADER_SHADOW_BLUR);
+        let falloff = blur * 2.0 + px(3.0);
+        // Clipped to the band below the caption, so the half of the shadow that
+        // would fall across the caption itself is never recorded.
+        let below = spherekit::core::Rect::from_corners(
+            Point::new(b.min_x(), b.min_y()),
+            Point::new(b.max_x(), b.min_y() + falloff),
+        );
+        // Offset downward by more than a popover's would be, so the first few
+        // pixels under the row sit inside the shadow's *body* rather than in
+        // its falloff. On a dark surface the falloff alone is a change of six
+        // 8-bit steps — technically a shadow, and visually nothing.
+        let shadow = Shadow {
+            offset: size(Px::ZERO, px(3.0)),
+            blur_radius: blur,
+            spread: Px::ZERO,
+            color: self.color,
+            inset: false,
+        };
+        // The caster is widened by the blur radius at both ends: a shadow cast
+        // by a shape that stops at the window edge fades out in the corners,
+        // and the caption does not stop at the window edge.
+        let caster = Rect::from_corners(
+            Point::new(b.min_x() - falloff, b.min_y() - self.rise),
+            Point::new(b.max_x() + falloff, b.min_y()),
+        );
+        cx.canvas.with_save(|canvas| {
+            canvas.clip_rect(below);
+            canvas.draw_shadow(RoundedRect::uniform(caster, Px::ZERO), &shadow);
+        });
+    }
+}
+
 /// Draws a cached SVG icon, tinted.
 ///
 /// A minimal custom element: it has no children, no layout of its own beyond a
@@ -1118,6 +1676,11 @@ impl spherekit::ui::Element for IconElement {
                 width: spherekit::core::Length::Px(self.size),
                 height: spherekit::core::Length::Px(self.size),
             },
+            // An icon is the one thing in its row that must not be squashed.
+            // A flex item shrinks by default, and in a row narrow enough to
+            // matter — a collapsed sidebar — the icon is what disappears while
+            // the label it sits beside keeps every pixel of its text.
+            flex_shrink: 0.0,
             ..spherekit::layout::Style::DEFAULT
         }
     }
@@ -1414,7 +1977,16 @@ impl AppHandler for GalleryApp {
                     // open popover is what the key most recently opened, and
                     // closing the window out from under it would be a surprise.
                     spherekit::ui::Key::Escape => {
-                        if self.state.set_user_menu(false) {
+                        // Unwound in the order a user expects: the newest thing
+                        // first, the window last. Written as a scan rather than
+                        // a chain of identical branches so that adding a fourth
+                        // overlay is one more line, not one more `else if`.
+                        // `||` short-circuits, which is the whole point: one
+                        // press closes the top thing, not all three at once.
+                        let dismissed = self.state.dialog_open.replace(false)
+                            || self.state.popover_open.replace(false)
+                            || self.state.set_user_menu(false);
+                        if dismissed {
                             needs_redraw = true;
                         } else {
                             cx.exit();
@@ -1496,7 +2068,61 @@ impl GalleryApp {
         println!("cpu this frame:    {:.3} ms", stats.cpu_ms);
     }
 
+    /// Pushes the current theme to the surface, if it has changed.
+    ///
+    /// Both halves matter: the operating system can change the theme, and so
+    /// can the switch in the pane header, and neither of them has a handle on
+    /// the surface at the moment it happens.
+    fn sync_theme(&mut self) {
+        let theme = self.state.theme();
+        if self.applied_theme.as_ref() == Some(&theme) {
+            return;
+        }
+        if let Some(surface) = self.surface.as_mut() {
+            surface.set_theme(theme.clone());
+        }
+        // The window's own material has to move with us. Everything outside the
+        // opaque content pane — the caption, the translucent sidebar — is DWM
+        // Mica showing through, and Mica has a light and a dark variant that
+        // the operating system, not the application, was choosing. Restyling
+        // only the element tree leaves dark-theme Mica behind light-theme text,
+        // which is exactly as unreadable as it sounds.
+        if let Some(window) = self.window.as_ref() {
+            // `set_preferred_theme` re-asserts the material itself, so there is
+            // nothing to re-apply here: asking for the backdrop again would
+            // read the appearance back from the platform before it had
+            // finished changing it.
+            window.set_preferred_theme(Some(self.state.effective_theme()));
+        }
+        self.applied_theme = Some(theme);
+    }
+
+    /// Notices a page change once, and starts everything that follows from it.
+    ///
+    /// Done here rather than in the sidebar's click handler because a widget
+    /// callback has no surface to scroll and no clock to restart — the same
+    /// reason the caption's window commands travel as data.
+    fn sync_page(&mut self) {
+        let page = self.state.page.get();
+        if self.shown_page == Some(page) {
+            return;
+        }
+        self.shown_page = Some(page);
+        // From zero, not from wherever the last transition had got to: a reader
+        // clicking through the sidebar should see each page arrive, not watch
+        // one that was already half-way in.
+        self.state.page_in.set(Motion::at(0.0, Drive::SMOOTH));
+        // And put the pane back at the top. Without this, switching from the
+        // bottom of a long page lands the reader half-way down one they have
+        // never seen.
+        if let Some(surface) = self.surface.as_mut() {
+            surface.tree_mut().scroll_element_to("content-scroll", size(Px::ZERO, Px::ZERO));
+        }
+    }
+
     fn draw(&mut self) {
+        self.sync_page();
+        self.sync_theme();
         let moving = self.advance_motion();
         let root = self.build();
         let clear = diag_clear();
@@ -1613,6 +2239,47 @@ impl GalleryApp {
         moving |= !demo.is_settled();
         self.state.demo_menu.set(demo);
 
+        // The sidebar, the dialog and the Overlays page's popover. Each is a
+        // flag an event writes and a spring the loop moves, which is what lets
+        // the animation outlive the click that started it.
+        for (flag, motion) in [
+            (self.state.sidebar_open.get(), &self.state.sidebar),
+            (self.state.dialog_open.get(), &self.state.dialog),
+            (self.state.popover_open.get(), &self.state.popover),
+        ] {
+            let mut m = motion.get();
+            m.retarget(if flag { 1.0 } else { 0.0 });
+            m.step(frame.delta);
+            moving |= !m.is_settled();
+            motion.set(m);
+        }
+
+        moving |= self.advance_toasts(frame.delta);
+
+        // The page transition. Retargeted to one every frame and reset to zero
+        // by `sync_page`, so a page change is the only thing that ever starts
+        // it and the loop does the rest.
+        let mut page_in = self.state.page_in.get();
+        page_in.retarget(1.0);
+        page_in.step(frame.delta);
+        moving |= !page_in.is_settled();
+        self.state.page_in.set(page_in);
+
+        // The date popover on the Dates page, and the tooltip on Containers.
+        // Each is its own spring, because two of them can be travelling at
+        // once and a shared one would make the second interrupt the first.
+        let mut picker = self.state.date_menu.get();
+        picker.retarget(if self.state.date_menu_open.get() { 1.0 } else { 0.0 });
+        picker.step(frame.delta);
+        moving |= !picker.is_settled();
+        self.state.date_menu.set(picker);
+
+        let mut hint = self.state.hint.get();
+        hint.retarget(if self.state.hint_hovered.get() { 1.0 } else { 0.0 });
+        hint.step(frame.delta);
+        moving |= !hint.is_settled();
+        self.state.hint.set(hint);
+
         let mut ctx = self.state.ctx_menu.get();
         ctx.retarget(if self.state.ctx_menu_open.get() { 1.0 } else { 0.0 });
         ctx.step(frame.delta);
@@ -1624,6 +2291,43 @@ impl GalleryApp {
         // that page pays for the continuous redraw.
         moving |= self.state.page.get() == Page::Containers && self.state.busy.get();
 
+        moving
+    }
+
+    /// Ages the toast list by one frame.
+    ///
+    /// Three jobs in one pass, because they have to happen in this order:
+    /// raise anything a callback queued, retire anything whose time is up, and
+    /// drop anything whose spring has finished leaving. Dropping before
+    /// stepping would cut the exit animation off at its first frame.
+    fn advance_toasts(&mut self, delta: std::time::Duration) -> bool {
+        let now = self.started.elapsed().as_secs_f32();
+        if let Some((variant, title)) = self.state.pending_toast.take() {
+            let message = match variant {
+                ToastVariant::Danger => "Undo is not available for this one.",
+                ToastVariant::Success => "Everything is where you left it.",
+                ToastVariant::Warning => "Two files were skipped.",
+                ToastVariant::Info => "Nothing needed doing.",
+            };
+            self.state.push_toast(now, variant, title, message);
+        }
+
+        let mut moving = false;
+        let mut toasts = self.state.toasts.borrow_mut();
+        for entry in toasts.iter_mut() {
+            if !entry.leaving && now - entry.born > TOAST_LIFETIME {
+                entry.leaving = true;
+            }
+            entry.fade.retarget(if entry.leaving { 0.0 } else { 1.0 });
+            entry.fade.step(delta);
+            moving |= !entry.fade.is_settled();
+        }
+        // A toast that has finished leaving is gone; one that has not is still
+        // on screen at whatever opacity its spring says.
+        toasts.retain(|t| !(t.leaving && t.fade.is_settled()));
+        // While any toast is on screen the lifetime clock has to keep ticking,
+        // or a settled one would sit there until the next unrelated redraw.
+        moving |= !toasts.is_empty();
         moving
     }
 
@@ -1790,6 +2494,76 @@ mod tests {
         }
         let offset = tree.scroll_offset_of("content-scroll").expect("the pane is built");
         assert!(offset.height > Px::ZERO, "a long page did not scroll: {offset:?}");
+    }
+
+    /// Builds the shell with the sidebar at a settled position.
+    ///
+    /// Seeds the icon cache the way `resumed` does, because the sidebar's icons
+    /// are the point of one of these tests and a window is the only thing that
+    /// normally loads them.
+    fn lay_out_sidebar(open: bool, text: &mut TextSystem) -> UiTree {
+        let mut app = GalleryApp::new();
+        app.icons = ICONS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            Page::ALL
+                .iter()
+                .filter_map(|s| cache.load_str(s.icon()).ok().map(|id| (*s, id)))
+                .collect()
+        });
+        app.state.sidebar_open.set(open);
+        app.state.sidebar.set(Motion::at(if open { 1.0 } else { 0.0 }, Drive::SMOOTH));
+        let mut tree = UiTree::new();
+        tree.set_theme(app.state.theme());
+        tree.build(app.build());
+        tree.compute_layout_with_text(size(px(1100.0), px(720.0)), text).unwrap();
+        tree
+    }
+
+    #[test]
+    fn a_collapsed_sidebar_keeps_its_rows_inside_it() {
+        // The rows used to be pinned to the *open* width and clipped by the
+        // panel, so a selected row's rounded rectangle lost its right-hand
+        // corners and read as a block cut in half. A row that fits cannot be
+        // clipped, which is the only version of this that stays fixed.
+        let mut text = TextSystem::with_system_fonts();
+        for open in [true, false] {
+            let tree = lay_out_sidebar(open, &mut text);
+            let panel = tree.bounds_of("chrome.sidebar-panel").expect("the panel is built");
+            for page in Page::ALL {
+                let row = tree.bounds_of(page.title()).expect("a nav row is built");
+                assert!(
+                    row.max_x() <= panel.max_x() + px(0.5),
+                    "the {} row runs {} px past a {} sidebar",
+                    page.title(),
+                    (row.max_x() - panel.max_x()).get(),
+                    if open { "open" } else { "collapsed" },
+                );
+            }
+            let account = tree.bounds_of("acct.row").expect("the account row is built");
+            assert!(account.max_x() <= panel.max_x() + px(0.5));
+        }
+    }
+
+    #[test]
+    fn a_collapsed_sidebar_still_shows_its_icons() {
+        // The other half of the same bug: once the rows narrowed, flexbox
+        // squashed the icon — the one item in the row that has no business
+        // shrinking — while the label beside it kept every pixel of its text.
+        let mut text = TextSystem::with_system_fonts();
+        let tree = lay_out_sidebar(false, &mut text);
+        let panel = tree.bounds_of("chrome.sidebar-panel").expect("the panel is built");
+        assert!(panel.width() < px(100.0), "the sidebar did not collapse: {panel:?}");
+
+        let mut scene = Scene::new(size(px(1100.0), px(720.0)), ScaleFactor::IDENTITY);
+        {
+            let mut canvas = Canvas::new(&mut scene);
+            let mut tree = tree;
+            tree.paint(&mut canvas, &mut text, size(px(1100.0), px(720.0)), 0.0);
+        }
+        // The icons are SVG: `SvgCache::render` fills and strokes paths, so a
+        // scene with no paths in it is a sidebar with no icons in it. Nothing
+        // else on this page draws one.
+        assert!(!scene.paths.is_empty(), "a collapsed sidebar painted no icons at all");
     }
 
     #[test]

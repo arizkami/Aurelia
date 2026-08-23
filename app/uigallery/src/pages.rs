@@ -15,9 +15,12 @@ use std::rc::Rc;
 
 use spherekit::core::{Color, Px, px, relative};
 use spherekit::ui::{
-    AnyElement, Cursor, EventContext, Interactive, IntoElement, ParentElement, Presence, Role,
-    Semantics, Styled, StyledInteraction, Theme, avatar, button, checkbox, div, dropdown, label,
-    progress, progress_indeterminate, scroll_area, separator, slider, text_field, toggle,
+    AnyElement, BadgeVariant, ButtonVariant, Cursor, Date, EventContext, Hsva, Interactive,
+    IntoElement, ParentElement, PopoverSide, Presence, Role, Semantics, Styled, StyledInteraction,
+    TextRole, Theme, ToastVariant, TypeScale, Weekday, alpha_slider, avatar, badge, button,
+    calendar, checkbox, color_area, color_picker, color_swatch, div, dropdown, hue_slider, label,
+    popover, progress, progress_indeterminate, radio, scroll_area, segmented, separator, slider,
+    spinner, stepper, text_field, toggle, tooltip,
 };
 
 use crate::{State, USER_EMAIL, USER_NAME};
@@ -25,25 +28,48 @@ use crate::{State, USER_EMAIL, USER_NAME};
 /// The pages the sidebar navigates between.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Page {
+    Home,
     Buttons,
     Selection,
     Values,
     Text,
+    Colour,
+    Dates,
     Identity,
     Containers,
+    Overlays,
     Palette,
 }
 
 impl Page {
-    pub(crate) const ALL: [Page; 7] = [
+    pub(crate) const ALL: [Page; 11] = [
+        Page::Home,
         Page::Buttons,
         Page::Selection,
         Page::Values,
         Page::Text,
+        Page::Colour,
+        Page::Dates,
         Page::Identity,
         Page::Containers,
+        Page::Overlays,
         Page::Palette,
     ];
+
+    /// The pages the Home page offers as cards: everything but itself.
+    pub(crate) fn tour() -> impl Iterator<Item = Page> {
+        Page::ALL.into_iter().filter(|p| *p != Page::Home)
+    }
+
+    /// Matches a page by its title, case-insensitively.
+    ///
+    /// For `SPHEREKIT_GALLERY_PAGE`, which opens the window straight onto one
+    /// page. A gallery is documentation, and documentation needs a way to take
+    /// the same screenshot twice.
+    pub(crate) fn from_name(name: &str) -> Option<Page> {
+        let name = name.trim();
+        Page::ALL.into_iter().find(|p| p.title().eq_ignore_ascii_case(name))
+    }
 
     pub(crate) fn title(self) -> &'static str {
         match self {
@@ -51,9 +77,13 @@ impl Page {
             Page::Selection => "Selection",
             Page::Values => "Values",
             Page::Text => "Text",
+            Page::Colour => "Colour",
+            Page::Dates => "Dates",
             Page::Identity => "Identity",
             Page::Containers => "Containers",
+            Page::Overlays => "Overlays",
             Page::Palette => "Palette",
+            Page::Home => "Home",
         }
     }
 
@@ -61,11 +91,15 @@ impl Page {
     pub(crate) fn blurb(self) -> &'static str {
         match self {
             Page::Buttons => "Push buttons: four weights, and what each one is for.",
-            Page::Selection => "Switches and checkboxes — the same widget, two shapes.",
+            Page::Selection => "Switches, checkboxes, radios and segments: one answer, or many.",
             Page::Values => "Sliders, faders and knobs over one continuous value.",
             Page::Text => "Editable fields and the type scale they sit in.",
+            Page::Colour => "The square, the ramps, and the panel that composes them.",
+            Page::Dates => "A month grid that owns neither the month nor the day.",
             Page::Identity => "Avatars, presence, and the menu they hang off.",
             Page::Containers => "Panels, scrolling, separators and progress.",
+            Page::Overlays => "A scrim, a popover and a toast — none of which owns a timer.",
+            Page::Home => "Every built-in widget, live, in one window.",
             Page::Palette => "Every semantic token in the active theme.",
         }
     }
@@ -101,6 +135,19 @@ impl Page {
                      stroke="black" stroke-width="1.8" stroke-linecap="round">
                      <path d="M5 6.5h14M12 6.5V19M9 19h6"/></svg>"##
             }
+            Page::Colour => {
+                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+                     stroke="black" stroke-width="1.8" stroke-linejoin="round">
+                     <path d="M4 15.5 15.2 4.3a2.1 2.1 0 0 1 3 0l1.5 1.5a2.1 2.1 0 0 1 0 3L8.5 20"/>
+                     <path d="M4 15.5 8.5 20H4z"/><path d="M12.4 7.1l4.5 4.5"/></svg>"##
+            }
+            Page::Dates => {
+                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+                     stroke="black" stroke-width="1.8" stroke-linecap="round"
+                     stroke-linejoin="round">
+                     <rect x="3.2" y="5" width="17.6" height="15.5" rx="3"/>
+                     <path d="M3.2 10h17.6M8 3v4M16 3v4"/></svg>"##
+            }
             Page::Identity => {
                 r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
                      stroke="black" stroke-width="1.8" stroke-linecap="round">
@@ -112,6 +159,19 @@ impl Page {
                      stroke="black" stroke-width="1.8" stroke-linejoin="round">
                      <rect x="3" y="4" width="18" height="16" rx="3"/>
                      <path d="M3 9h18"/></svg>"##
+            }
+            Page::Overlays => {
+                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+                     stroke="black" stroke-width="1.8" stroke-linejoin="round">
+                     <rect x="3" y="3.5" width="13" height="13" rx="3"/>
+                     <path d="M8 20.5h9.5a3 3 0 0 0 3-3V8"/></svg>"##
+            }
+            Page::Home => {
+                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+                     stroke="black" stroke-width="1.8" stroke-linecap="round"
+                     stroke-linejoin="round">
+                     <path d="M3.5 10.5 12 3.5l8.5 7"/>
+                     <path d="M5.5 12v8h13v-8"/><path d="M10 20v-5h4v5"/></svg>"##
             }
             Page::Palette => {
                 r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
@@ -133,12 +193,17 @@ pub(crate) fn render(
     theme: &Theme,
     adapter: &str,
     stats: &spherekit::SurfaceStats,
+    icons: &[(Page, spherekit::core::SvgId)],
 ) -> AnyElement {
     match page {
+        Page::Home => home(state, theme, adapter, stats, icons),
+        Page::Overlays => overlays(state, theme),
         Page::Buttons => buttons(state, theme),
         Page::Selection => selection(state, theme),
         Page::Values => values(state, theme),
         Page::Text => text(state, theme),
+        Page::Colour => colour(state, theme),
+        Page::Dates => dates(state, theme),
         Page::Identity => identity(state, theme),
         Page::Containers => containers(state, theme, adapter, stats),
         Page::Palette => palette(theme),
@@ -175,8 +240,31 @@ fn buttons(state: &Rc<State>, theme: &Theme) -> AnyElement {
             row(theme)
                 .child(one("Primary", V::Primary, "b.primary", state))
                 .child(one("Secondary", V::Secondary, "b.secondary", state))
+                .child(one("Outline", V::Outline, "b.outline", state))
                 .child(one("Ghost", V::Ghost, "b.ghost", state))
                 .child(one("Danger", V::Danger, "b.danger", state))
+                .into_element(),
+        ))
+        .child(specimen(
+            theme,
+            "Outline is never the default",
+            "An outline reads as lighter than a fill on a dark surface and heavier on a light one, so a default outline would change a screen's hierarchy the moment the theme flipped. It is here for the case that wants it: a button with no surface of its own to sit on.",
+            div()
+                .flex_row()
+                .items_center()
+                .gap(theme.spacing.md)
+                .h(px(72.0))
+                .px_(theme.spacing.md)
+                .rounded(theme.radii.lg)
+                .bg(c.accent.with_alpha(0.35))
+                .child(button("Outline").id("b.o1").variant(V::Outline))
+                .child(button("Secondary").id("b.o2").variant(V::Secondary))
+                .child(button("Ghost").id("b.o3").variant(V::Ghost))
+                .child(
+                    label("Over a tint, only the outline keeps its shape.")
+                        .text_size(theme.typography.sm)
+                        .text_color(c.text),
+                )
                 .into_element(),
         ))
         .child(specimen(
@@ -186,6 +274,7 @@ fn buttons(state: &Rc<State>, theme: &Theme) -> AnyElement {
             row(theme)
                 .child(button("Primary").id("b.dp").variant(V::Primary).disabled(true))
                 .child(button("Secondary").id("b.ds").disabled(true))
+                .child(button("Outline").id("b.do").variant(V::Outline).disabled(true))
                 .child(button("Ghost").id("b.dg").variant(V::Ghost).disabled(true))
                 .child(button("Danger").id("b.dd").variant(V::Danger).disabled(true))
                 .into_element(),
@@ -293,14 +382,54 @@ fn selection(state: &Rc<State>, theme: &Theme) -> AnyElement {
         ))
         .child(specimen(
             theme,
+            "Radio",
+            "For one answer out of a set. A radio cannot be un-chosen by clicking it again, because the set must always have an answer.",
+            div()
+                .flex_col()
+                .gap(theme.spacing.sm)
+                .child(radio_row(state, theme, 0, "Lossless", "FLAC, the whole file"))
+                .child(radio_row(state, theme, 1, "High", "256 kbps, transparent for most material"))
+                .child(radio_row(state, theme, 2, "Data saver", "96 kbps, for a metered connection"))
+                .into_element(),
+        ))
+        .child(specimen(
+            theme,
+            "Segmented",
+            "The same choice as a dropdown, with the options already on screen. Worth the space up to about five; past that, use a menu.",
+            div()
+                .flex_col()
+                .items(spherekit::layout::Align::Start)
+                .gap(theme.spacing.md)
+                .child({
+                    let s = Rc::clone(state);
+                    segmented(state.density.get())
+                        .id("s.density")
+                        .name("Density")
+                        .item("Compact")
+                        .item("Cosy")
+                        .item("Roomy")
+                        .on_select(move |i| {
+                            s.density.set(i);
+                            s.say(format!("Density: {}.", ["compact", "cosy", "roomy"][i]));
+                        })
+                })
+                .child(
+                    segmented(1).id("s.seg.dis").item("Off").item("Auto").item("On").disabled(true),
+                )
+                .into_element(),
+        ))
+        .child(specimen(
+            theme,
             "State readout",
             "Widgets own no value. What you see here is the same state the widgets above wrote.",
             label(format!(
-                "wifi={}   notes={}   list={}   tag={}",
+                "wifi={}   notes={}   list={}   tag={}   quality={}   density={}",
                 state.wifi.get(),
                 state.opt_a.get(),
                 state.opt_b.get(),
                 state.opt_c.get(),
+                state.quality.get(),
+                state.density.get(),
             ))
             .text_size(theme.typography.sm)
             .text_color(c.text_muted)
@@ -387,6 +516,33 @@ fn values(state: &Rc<State>, theme: &Theme) -> AnyElement {
                         .text_size(theme.typography.sm)
                         .text_color(c.text_muted),
                 )
+                .into_element(),
+        ))
+        .child(specimen(
+            theme,
+            "Stepper",
+            "For a small, meaningful step where a slider would offer a continuum the product cannot honour. Click the signs, drag the middle to scrub, or use the arrow keys.",
+            row(theme)
+                .child({
+                    let s = Rc::clone(state);
+                    stepper(state.takes.get())
+                        .id("v.takes")
+                        .range(1.0, 32.0)
+                        .name("Takes")
+                        .format(|v| format!("{v:.0} takes"))
+                        .on_change(move |v| s.takes.set(v))
+                })
+                .child({
+                    let s = Rc::clone(state);
+                    stepper(state.bpm.get())
+                        .id("v.bpm")
+                        .range(40.0, 240.0)
+                        .step(5.0)
+                        .name("Tempo")
+                        .format(|v| format!("{v:.0} BPM"))
+                        .on_change(move |v| s.bpm.set(v))
+                })
+                .child(stepper(4.0).id("v.step.dis").range(1.0, 8.0).disabled(true))
                 .into_element(),
         ))
         .child(specimen(
@@ -533,6 +689,650 @@ fn text(state: &Rc<State>, theme: &Theme) -> AnyElement {
                     label("สวัสดีครับ — ทดสอบการเรนเดอร์ข้อความภาษาไทย")
                         .text_size(theme.typography.md)
                         .text_color(c.text_muted),
+                )
+                .into_element(),
+        ))
+        .into_element()
+}
+
+/// The landing page: what this is, what the renderer is doing, and a way in.
+///
+/// Deliberately not a specimen page. Every other page here is a catalogue, and
+/// a catalogue is a bad first screen: it answers "what is there" before anyone
+/// has asked "what is this". So this one is a real composition — a heading, the
+/// renderer reporting on itself, and a card per page — built from the same
+/// widgets the catalogue documents.
+fn home(
+    state: &Rc<State>,
+    theme: &Theme,
+    adapter: &str,
+    stats: &spherekit::SurfaceStats,
+    icons: &[(Page, spherekit::core::SvgId)],
+) -> AnyElement {
+    let c = theme.colors;
+
+    div()
+        .flex_col()
+        .gap(theme.spacing.xl)
+        // --- the hero ------------------------------------------------------
+        .child(
+            div()
+                .flex_col()
+                .gap(theme.spacing.sm)
+                .child(
+                    div()
+                        .flex_row()
+                        .items_center()
+                        .gap(theme.spacing.md)
+                        .child(
+                            label("SphereKit UI")
+                                .text_size(px(34.0))
+                                .weight(theme.typography.strong)
+                                .text_color(c.text),
+                        )
+                        .child(badge("2026.8").variant(BadgeVariant::Accent)),
+                )
+                .child(
+                    label(
+                        "A retained element tree with an immediate-looking API, drawn by one \
+                         analytic quad pipeline. Everything on these pages is live: the toggles \
+                         toggle, the sliders drag, and the state they write is the state the \
+                         next frame reads.",
+                    )
+                    .text_size(theme.typography.md)
+                    .text_color(c.text_muted)
+                    .max_w(px(620.0)),
+                )
+                .child(div().h(theme.spacing.xs))
+                .child(
+                    row(theme)
+                        .child({
+                            let s = Rc::clone(state);
+                            button("Explore the widgets")
+                                .id("home.tour")
+                                .variant(ButtonVariant::Primary)
+                                .on_press(move || {
+                                    s.page.set(Page::Buttons);
+                                    s.say("Buttons.");
+                                })
+                        })
+                        .child({
+                            let s = Rc::clone(state);
+                            button("Raise a toast")
+                                .id("home.toast")
+                                .variant(ButtonVariant::Outline)
+                                .on_press(move || {
+                                    s.pending_toast.set(Some((ToastVariant::Success, "Welcome")));
+                                })
+                        }),
+                ),
+        )
+        // --- what the renderer is doing right now --------------------------
+        .child(
+            div()
+                .flex_row()
+                .gap(theme.spacing.md)
+                .child(stat(theme, "Adapter", adapter.split('(').next().unwrap_or(adapter).trim()))
+                .child(stat(theme, "Draw calls", &stats.frame.draw_calls.to_string()))
+                .child(stat(theme, "Elements", &stats.tree.elements.to_string()))
+                .child(stat(theme, "CPU / frame", &format!("{:.2} ms", stats.cpu_ms))),
+        )
+        // --- a card per page -----------------------------------------------
+        .child(
+            div()
+                .flex_col()
+                .gap(theme.spacing.md)
+                .child(
+                    label("PAGES")
+                        .text_size(theme.typography.xs)
+                        .weight(theme.typography.strong)
+                        .text_color(c.text_muted),
+                )
+                .child({
+                    let mut grid = wrapping_row(theme);
+                    for page in Page::tour() {
+                        grid = grid.child(page_card(state, theme, page, icons));
+                    }
+                    grid
+                }),
+        )
+        .into_element()
+}
+
+/// One number the renderer is reporting, in a card.
+fn stat(theme: &Theme, name: &str, value: &str) -> AnyElement {
+    let c = theme.colors;
+    div()
+        .flex_col()
+        .flex_1()
+        .min_w(px(0.0))
+        .gap(theme.spacing.xs)
+        .p(theme.spacing.md)
+        .rounded(theme.radii.lg)
+        .bg(c.surface)
+        .border(px(1.0), c.border)
+        .child(
+            label(name.to_string())
+                .text_size(theme.typography.xs)
+                .text_color(c.text_muted)
+                .no_wrap(),
+        )
+        .child(
+            label(value.to_string())
+                .text_size(theme.typography.md)
+                .weight(theme.typography.strong)
+                .text_color(c.text)
+                .truncate(),
+        )
+        .into_element()
+}
+
+/// A card that navigates to one page.
+fn page_card(
+    state: &Rc<State>,
+    theme: &Theme,
+    page: Page,
+    icons: &[(Page, spherekit::core::SvgId)],
+) -> AnyElement {
+    let c = theme.colors;
+    let s = Rc::clone(state);
+    let svg = icons.iter().find(|(p, _)| *p == page).map(|(_, id)| *id);
+    div()
+        .id(("home.card", page.title()))
+        .focusable()
+        .flex_col()
+        .w(px(224.0))
+        .gap(theme.spacing.xs)
+        .p(theme.spacing.md)
+        .rounded(theme.radii.lg)
+        .bg(c.surface)
+        .border(px(1.0), c.border)
+        .hover_bg(c.hover)
+        .active_bg(c.pressed)
+        .cursor(Cursor::Pointer)
+        .focus_ring(spherekit::ui::FocusRing { color: c.focus, ..Default::default() })
+        .semantics(Semantics::new(Role::Button, page.title()))
+        .child(
+            div()
+                .flex_row()
+                .items_center()
+                .gap(theme.spacing.sm)
+                .child(crate::IconElement { svg, tint: c.accent, size: px(16.0) })
+                .child(
+                    label(page.title())
+                        .text_size(theme.typography.md)
+                        .weight(theme.typography.strong)
+                        .text_color(c.text)
+                        .no_wrap(),
+                ),
+        )
+        .child(label(page.blurb()).text_size(theme.typography.sm).text_color(c.text_muted))
+        .on_click(move |cx: &mut EventContext<'_>| {
+            s.page.set(page);
+            cx.notify_layout();
+        })
+        .into_element()
+}
+
+/// A row whose children wrap onto the next line when they run out of room.
+///
+/// `Styled` has no `flex_wrap`, so this reaches for the style directly. Wrapping
+/// is the one flex property a card grid genuinely needs and the one a fixed
+/// gallery layout would otherwise have to fake with a column count.
+fn wrapping_row(theme: &Theme) -> spherekit::ui::Div {
+    let mut row = div().flex_row().gap(theme.spacing.md);
+    row.style_mut().flex_wrap = spherekit::layout::FlexWrap::Wrap;
+    row
+}
+
+fn overlays(state: &Rc<State>, theme: &Theme) -> AnyElement {
+    let c = theme.colors;
+    let open = state.popover.get().value();
+    let side = match state.popover_side.get() {
+        0 => PopoverSide::Top,
+        2 => PopoverSide::Left,
+        3 => PopoverSide::Right,
+        _ => PopoverSide::Bottom,
+    };
+
+    page(theme, Page::Overlays)
+        .child(specimen(
+            theme,
+            "Overlay",
+            "A scrim dims what is behind it and swallows every event that reaches it. The second half is the one that is easy to forget: a dialog over a page whose buttons still work is a picture of a modal, not a modal.",
+            div()
+                .flex_col()
+                .gap(theme.spacing.md)
+                .items(spherekit::layout::Align::Start)
+                .child({
+                    let s = Rc::clone(state);
+                    button("Delete take\u{2026}")
+                        .id("o.modal")
+                        .variant(ButtonVariant::Danger)
+                        .on_press(move || {
+                            s.dialog_open.set(true);
+                            s.say("Dialog open \u{2014} click away or press Escape.");
+                        })
+                })
+                .child(
+                    label("An overlay fills its *parent*, so this one is built at the root of the tree and covers the window. One built inside a card would cover the card, which is how a local \u{201c}are you sure?\u{201d} is done.")
+                        .text_size(theme.typography.sm)
+                        .text_color(c.text_muted),
+                )
+                .into_element(),
+        ))
+        .child(specimen(
+            theme,
+            "Popover",
+            "Anchored to its parent, on any of four sides, with an optional beak. There is no centre alignment: centring a box of unknown width over its anchor needs a transform the layout engine does not have, and the widget will not pretend otherwise.",
+            div()
+                .flex_col()
+                .gap(theme.spacing.lg)
+                .items(spherekit::layout::Align::Start)
+                .child({
+                    let s = Rc::clone(state);
+                    segmented(state.popover_side.get())
+                        .id("o.side")
+                        .name("Popover side")
+                        .item("Top")
+                        .item("Bottom")
+                        .item("Left")
+                        .item("Right")
+                        .on_select(move |i| s.popover_side.set(i))
+                })
+                // Room around the trigger for the panel to open into, which is
+                // the caller's job: a popover does not reserve space, it floats.
+                .child(
+                    div()
+                        .h(px(150.0))
+                        .w(relative(1.0))
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .flex_col()
+                                .child({
+                                    let s = Rc::clone(state);
+                                    button("Anchor")
+                                        .id("o.trigger")
+                                        .variant(ButtonVariant::Outline)
+                                        .on_press(move || {
+                                            s.popover_open.set(!s.popover_open.get());
+                                        })
+                                })
+                                .child(
+                                    popover(open)
+                                        .id("o.pop")
+                                        .side(side)
+                                        .arrow(true)
+                                        .align(spherekit::ui::PopoverAlign::Start)
+                                        .w(px(220.0))
+                                        .p(theme.spacing.md)
+                                        .gap(theme.spacing.xs)
+                                        .child(
+                                            label("Analytic shadows")
+                                                .scale(TypeScale::Sm)
+                                                .weight(theme.typography.strong),
+                                        )
+                                        .child(
+                                            label("This panel casts one. It is a Gaussian solved in the fragment shader, not a blur pass.")
+                                                .scale(TypeScale::Sm)
+                                                .role(TextRole::Muted),
+                                        ),
+                                ),
+                        ),
+                )
+                .into_element(),
+        ))
+        .child(specimen(
+            theme,
+            "Toast",
+            "The widget draws one toast. When it appears, how long it stays and how many are on screen are product decisions with no defensible default, so the application owns the list \u{2014} each entry with its own spring, so one leaving never interrupts the two above it.",
+            div()
+                .flex_col()
+                .gap(theme.spacing.md)
+                .items(spherekit::layout::Align::Start)
+                .child(
+                    row(theme)
+                        .child(toast_button(state, "o.t1", ToastVariant::Info, "Nothing to do"))
+                        .child(toast_button(state, "o.t2", ToastVariant::Success, "Sync complete"))
+                        .child(toast_button(state, "o.t3", ToastVariant::Warning, "Partly done"))
+                        .child(toast_button(state, "o.t4", ToastVariant::Danger, "Upload failed")),
+                )
+                .child(
+                    label(format!(
+                        "{} on screen. They stack in the bottom-right, retire after four and a half seconds, and the oldest leaves early once there are three.",
+                        state.toasts.borrow().len()
+                    ))
+                    .text_size(theme.typography.sm)
+                    .text_color(c.text_muted),
+                )
+                .into_element(),
+        ))
+        .into_element()
+}
+
+/// One button that raises a toast of a given variant.
+fn toast_button(
+    state: &Rc<State>,
+    key: &'static str,
+    variant: ToastVariant,
+    title: &'static str,
+) -> AnyElement {
+    let s = Rc::clone(state);
+    button(title)
+        .id(key)
+        .variant(match variant {
+            ToastVariant::Danger => ButtonVariant::Danger,
+            ToastVariant::Info => ButtonVariant::Outline,
+            _ => ButtonVariant::Secondary,
+        })
+        // Queued rather than pushed: a toast needs the frame's clock reading to
+        // know when it was born, and a callback has no clock.
+        .on_press(move || s.pending_toast.set(Some((variant, title))))
+        .into_element()
+}
+
+fn colour(state: &Rc<State>, theme: &Theme) -> AnyElement {
+    let c = theme.colors;
+    let tint = state.tint.get();
+    let chosen = tint.to_color();
+
+    page(theme, Page::Colour)
+        .child(specimen(
+            theme,
+            "Picker",
+            "Square, ramps, readout and presets. Every part reports the whole colour, so the page stores one value rather than four.",
+            div()
+                .flex_row()
+                .gap(theme.spacing.lg)
+                .child(
+                    div().flex_1().min_w(px(0.0)).child({
+                        let s = Rc::clone(state);
+                        color_picker(tint).id("col.picker").alpha(true).on_change(move |v| {
+                            s.tint.set(v);
+                        })
+                    }),
+                )
+                .child(
+                    card(theme)
+                        .w(px(180.0))
+                        .child(
+                            div()
+                                .h(px(64.0))
+                                .w(relative(1.0))
+                                .rounded(theme.radii.md)
+                                .bg(chosen)
+                                .border(px(1.0), c.border),
+                        )
+                        .child(readout(theme, "Hex", &tint.hex(true)))
+                        .child(readout(theme, "Hue", &format!("{:.0}\u{00B0}", tint.h * 360.0)))
+                        .child(readout(theme, "Sat", &format!("{:.0}%", tint.s * 100.0)))
+                        .child(readout(theme, "Val", &format!("{:.0}%", tint.v * 100.0)))
+                        .child(readout(theme, "Alpha", &format!("{:.0}%", tint.a * 100.0))),
+                )
+                .into_element(),
+        ))
+        .child(specimen(
+            theme,
+            "The parts, on their own",
+            "A levels panel wants the hue ramp and nothing else. The square, the ramps and the chips are separate widgets for exactly that reason.",
+            div()
+                .flex_col()
+                .gap(theme.spacing.md)
+                .child({
+                    let s = Rc::clone(state);
+                    color_area(tint)
+                        .id("col.area")
+                        .size(px(260.0), px(120.0))
+                        .on_change(move |v| s.tint.set(v))
+                })
+                .child({
+                    let s = Rc::clone(state);
+                    hue_slider(tint).id("col.hue").on_change(move |v| s.tint.set(v))
+                })
+                .child({
+                    let s = Rc::clone(state);
+                    alpha_slider(tint).id("col.alpha").on_change(move |v| s.tint.set(v))
+                })
+                .into_element(),
+        ))
+        .child(specimen(
+            theme,
+            "Swatches",
+            "A chip is a button that happens to be a colour. Transparency is drawn over a checkerboard, because a swatch on the surface colour cannot show it any other way.",
+            row(theme)
+                .child(swatch_pick(state, "col.s1", Color::hex(0x78A8E8)))
+                .child(swatch_pick(state, "col.s2", Color::hex(0x79B88A)))
+                .child(swatch_pick(state, "col.s3", Color::hex(0xD5AF68)))
+                .child(swatch_pick(state, "col.s4", Color::hex(0xD77880)))
+                .child(swatch_pick(state, "col.s5", Color::hex(0xB490E0)))
+                .child(div().w(px(12.0)))
+                .child(swatch_pick(state, "col.s6", Color::hex(0x78A8E8).with_alpha(0.35)))
+                .child(swatch_pick(state, "col.s7", Color::WHITE.with_alpha(0.12)))
+                .into_element(),
+        ))
+        .child(specimen(
+            theme,
+            "Why HSV and not the theme's HSL",
+            "Drag to the bottom of the square: the colour is black, and the hue is still whatever you were working in. A picker that stored the resulting colour would have forgotten it.",
+            div()
+                .flex_row()
+                .items_center()
+                .gap(theme.spacing.md)
+                .child(
+                    div()
+                        .size(px(40.0))
+                        .rounded(theme.radii.md)
+                        .bg(tint.pure_hue())
+                        .border(px(1.0), c.border),
+                )
+                .child(
+                    label(format!(
+                        "hue {:.0}\u{00B0} is kept whatever the square says \u{2014} the swatch on the left never goes black.",
+                        tint.h * 360.0
+                    ))
+                    .text_size(theme.typography.sm)
+                    .text_color(c.text_muted),
+                )
+                .into_element(),
+        ))
+        .into_element()
+}
+
+fn dates(state: &Rc<State>, theme: &Theme) -> AnyElement {
+    let c = theme.colors;
+    let month = state.cal_month.get();
+    let selected = state.cal_day.get();
+    let open = state.date_menu.get().value();
+
+    page(theme, Page::Dates)
+        .child(specimen(
+            theme,
+            "Calendar",
+            "Click a day, or focus the grid and use the arrow keys. PageUp and PageDown change month; hold Shift for a year.",
+            div()
+                .flex_row()
+                .gap(theme.spacing.lg)
+                .child({
+                    let pick = Rc::clone(state);
+                    let page_to = Rc::clone(state);
+                    calendar(month, selected)
+                        .id("d.main")
+                        .on_select(move |d| {
+                            pick.cal_day.set(Some(d));
+                            pick.say(format!("Selected {}.", d.long()));
+                        })
+                        .on_month(move |m| page_to.cal_month.set(m))
+                })
+                .child(
+                    div()
+                        .flex_col()
+                        .gap(theme.spacing.xs)
+                        .child(readout(
+                            theme,
+                            "Showing",
+                            &format!("{} {}", month.month_name(), month.year()),
+                        ))
+                        .child(readout(
+                            theme,
+                            "Selected",
+                            &selected.map(|d| d.iso()).unwrap_or_else(|| "none".into()),
+                        ))
+                        .child(readout(
+                            theme,
+                            "Weekday",
+                            selected.map(|d| d.weekday().name()).unwrap_or("\u{2014}"),
+                        ))
+                        .child(readout(theme, "Today", &Date::today_utc().iso()))
+                        .child(div().h(theme.spacing.sm))
+                        .items(spherekit::layout::Align::Start)
+                        .child({
+                            let s = Rc::clone(state);
+                            button("Today").id("d.today").on_press(move || {
+                                let today = Date::today_utc();
+                                s.cal_month.set(today.first_of_month());
+                                s.cal_day.set(Some(today));
+                                s.say("Jumped to today.");
+                            })
+                        })
+                        .child({
+                            let s = Rc::clone(state);
+                            button("Clear").id("d.clear").on_press(move || {
+                                s.cal_day.set(None);
+                                s.say("Selection cleared.");
+                            })
+                        }),
+                )
+                .into_element(),
+        ))
+        .child(specimen(
+            theme,
+            "Bounded, and a Sunday week",
+            "Out-of-range days stay in place and stop responding \u{2014} a grid that hid them would change height, and the controls under it would move.",
+            div()
+                .flex_row()
+                .gap(theme.spacing.lg)
+                .child(
+                    calendar(month, selected)
+                        .id("d.bounded")
+                        .week_start(Weekday::Sunday)
+                        .min(month.first_of_month().add_days(4))
+                        .max(month.last_of_month().add_days(-6))
+                        .cell_size(px(30.0))
+                        .today(None),
+                )
+                .child(
+                    label("`week_start` is a display choice; `Weekday` itself is ISO and starts on Monday, so the working week is never a wrap-around range.")
+                        .text_size(theme.typography.sm)
+                        .text_color(c.text_muted)
+                        .flex_1(),
+                )
+                .into_element(),
+        ))
+        .child(specimen(
+            theme,
+            "A range",
+            "Click twice: the first click starts a span, the second closes it. The band is painted across the whole cell, so consecutive days join into one bar.",
+            div()
+                .flex_row()
+                .gap(theme.spacing.lg)
+                .child({
+                    let s = Rc::clone(state);
+                    let page_to = Rc::clone(state);
+                    calendar(month, None)
+                        .id("d.range")
+                        .cell_size(px(30.0))
+                        .range(state.range())
+                        .on_select(move |d| s.extend_range(d))
+                        .on_month(move |m| page_to.cal_month.set(m))
+                })
+                .child(
+                    div()
+                        .flex_col()
+                        .gap(theme.spacing.xs)
+                        .child(readout(
+                            theme,
+                            "From",
+                            &state.range_from.get().map(|d| d.iso()).unwrap_or_else(|| "\u{2014}".into()),
+                        ))
+                        .child(readout(
+                            theme,
+                            "To",
+                            &state.range_to.get().map(|d| d.iso()).unwrap_or_else(|| "\u{2014}".into()),
+                        ))
+                        .child(readout(theme, "Nights", &state.nights()))
+                        .child(div().h(theme.spacing.sm))
+                        .items(spherekit::layout::Align::Start)
+                        .child({
+                            let s = Rc::clone(state);
+                            button("Reset").id("d.reset").on_press(move || {
+                                s.range_from.set(None);
+                                s.range_to.set(None);
+                                s.say("Range cleared.");
+                            })
+                        }),
+                )
+                .into_element(),
+        ))
+        .child(specimen(
+            theme,
+            "In a dropdown",
+            "Nothing about the calendar knows it is in a popover. The dropdown anchors to its parent and the grid is just a child of it.",
+            div()
+                .flex_col()
+                .w(px(260.0))
+                .child(
+                    div()
+                        .id("d.trigger")
+                        .focusable()
+                        .flex_row()
+                        .items_center()
+                        .gap(theme.spacing.md)
+                        .h(px(34.0))
+                        .px_(theme.spacing.sm)
+                        .rounded(theme.radii.md)
+                        .bg(if state.date_menu_open.get() { c.pressed } else { c.surface })
+                        .hover_bg(c.hover)
+                        .active_bg(c.pressed)
+                        .cursor(Cursor::Pointer)
+                        .focus_ring(spherekit::ui::FocusRing { color: c.focus, ..Default::default() })
+                        .semantics(Semantics::new(Role::Button, "Choose a date"))
+                        .child(
+                            label(
+                                selected
+                                    .map(|d| d.long())
+                                    .unwrap_or_else(|| "Choose a date".to_string()),
+                            )
+                            .text_size(theme.typography.sm)
+                            .text_color(if selected.is_some() { c.text } else { c.text_muted })
+                            .flex_1()
+                            .no_wrap(),
+                        )
+                        .child(crate::ChevronElement { tint: c.text_muted, open })
+                        .on_click({
+                            let s = Rc::clone(state);
+                            move |cx: &mut EventContext<'_>| {
+                                s.date_menu_open.set(!s.date_menu_open.get());
+                                cx.notify();
+                            }
+                        }),
+                )
+                .child(
+                    dropdown(open).below().offset(theme.spacing.sm).p(theme.spacing.sm).child({
+                        let s = Rc::clone(state);
+                        let page_to = Rc::clone(state);
+                        calendar(month, selected)
+                            .id("d.popover")
+                            .cell_size(px(30.0))
+                            .on_select(move |d| {
+                                s.cal_day.set(Some(d));
+                                s.date_menu_open.set(false);
+                                s.say(format!("Picked {} from the popover.", d.iso()));
+                            })
+                            .on_month(move |m| page_to.cal_month.set(m))
+                    }),
                 )
                 .into_element(),
         ))
@@ -766,6 +1566,67 @@ fn containers(
                             .text_size(theme.typography.sm)
                             .text_color(c.text_muted),
                         ),
+                )
+                .into_element(),
+        ))
+        .child(specimen(
+            theme,
+            "Spinner and badges",
+            "A spinner is a function of paint time, like the bar above it. A badge is tinted rather than filled, because it annotates content rather than competing with it.",
+            div()
+                .flex_col()
+                .gap(theme.spacing.md)
+                .child(
+                    row(theme)
+                        .child(spinner().id("k.spin"))
+                        .child(spinner().id("k.spin.lg").size(px(28.0)).thickness(px(3.0)))
+                        .child(
+                            spinner().id("k.spin.warn").size(px(16.0)).color(theme.colors.warning),
+                        )
+                        .child(
+                            label("Only spins while frames keep coming \u{2014} the Running switch above holds the loop open.")
+                                .text_size(theme.typography.sm)
+                                .text_color(c.text_muted),
+                        ),
+                )
+                .child(
+                    row(theme)
+                        .child(badge("Neutral"))
+                        .child(badge("New").variant(BadgeVariant::Accent))
+                        .child(badge("Passing").variant(BadgeVariant::Success).dot(true))
+                        .child(badge("Deprecated").variant(BadgeVariant::Warning))
+                        .child(badge("Failed").variant(BadgeVariant::Danger).dot(true))
+                        .child(badge("12")),
+                )
+                .into_element(),
+        ))
+        .child(specimen(
+            theme,
+            "Tooltip",
+            "Driven by one spring, exactly as a dropdown is. The widget owns no timer: when a hover has been earned is a product decision, and this one gives it a moment.",
+            div()
+                .flex_row()
+                .child(
+                    div()
+                        .flex_col()
+                        .child(
+                            button("Delete take").id("k.tip").variant(spherekit::ui::ButtonVariant::Danger),
+                        )
+                        .child(tooltip("Removes the take permanently", state.hint.get().value()))
+                        .on_mouse_enter({
+                            let s = Rc::clone(state);
+                            move |cx: &mut EventContext<'_>| {
+                                s.hint_hovered.set(true);
+                                cx.notify();
+                            }
+                        })
+                        .on_mouse_leave({
+                            let s = Rc::clone(state);
+                            move |cx: &mut EventContext<'_>| {
+                                s.hint_hovered.set(false);
+                                cx.notify();
+                            }
+                        }),
                 )
                 .into_element(),
         ))
@@ -1057,6 +1918,50 @@ fn check_row(
             s.say(format!("{text}: {v}"));
         }))
         .child(label(text).text_size(theme.typography.sm).text_color(theme.colors.text))
+        .into_element()
+}
+
+/// One preset chip on the Colour page, wired into the shared value.
+fn swatch_pick(state: &Rc<State>, key: &'static str, color: Color) -> AnyElement {
+    let s = Rc::clone(state);
+    let selected = state.tint.get().to_color().to_rgba8() == color.to_rgba8();
+    color_swatch(color)
+        .id(key)
+        .size(px(28.0))
+        .selected(selected)
+        .on_select(move |c| {
+            s.tint.set(Hsva::from_color(c));
+            s.say(format!("Swatch {} chosen.", spherekit::ui::hex_string(c, c.a < 1.0)));
+        })
+        .into_element()
+}
+
+/// One row of the Selection page's radio group.
+fn radio_row(
+    state: &Rc<State>,
+    theme: &Theme,
+    index: usize,
+    title: &'static str,
+    note: &'static str,
+) -> AnyElement {
+    let s = Rc::clone(state);
+    let selected = state.quality.get() == index;
+    div()
+        .flex_row()
+        .items_center()
+        .gap(theme.spacing.md)
+        .child(radio(selected).id(("q", index)).label(title).on_select(move || {
+            s.quality.set(index);
+            s.say(format!("Quality: {title}."));
+        }))
+        .child(
+            div()
+                .flex_col()
+                .child(label(title).text_size(theme.typography.sm).text_color(theme.colors.text))
+                .child(
+                    label(note).text_size(theme.typography.xs).text_color(theme.colors.text_muted),
+                ),
+        )
         .into_element()
 }
 

@@ -100,10 +100,15 @@ right place. See `docs/platform.md`.
 | Label | Done |
 | Text field, with IME | Done |
 | Custom window chrome + system menu | Done (Windows) |
-| **Menu, dropdown** | **Not started** |
-| **Tabs, tooltip, modal, popover** | **Not started** |
+| Menu, dropdown, context menu | Done |
+| Colour picker (square, ramps, swatches) | Done |
+| Calendar and `Date` | Done |
+| Segmented control, radio, badge, spinner, stepper | Done |
+| Tooltip | Done — positioning and animation; the hover delay is the application's |
+| Overlay, popover, toast | Done — the timing and the queue are the application's |
+| Outline button variant | Done |
 | **List, tree, dock container** | **Not started** |
-| **Radio, icon button, number input** | **Not started** |
+| **Icon button, editable number input** | **Not started** |
 
 The value controls are complete: vertical drag with pointer capture, Shift for fine mode,
 double-click to reset, arrow/Page/Home/End keyboard support, scroll-wheel adjustment, step

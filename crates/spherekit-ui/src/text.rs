@@ -32,6 +32,13 @@ pub struct Label {
     /// labels while preserving per-label overrides.
     inherit_theme_weight: bool,
     color: Option<Color>,
+    /// A size named against the theme, resolved at measure and paint time.
+    ///
+    /// Separate from `text_style.font_size` because a composed widget names its
+    /// size before a theme exists; an explicit [`Label::text_size`] still wins.
+    scale: Option<crate::theme::TypeScale>,
+    /// A colour named against the theme, resolved the same way.
+    role: Option<crate::theme::TextRole>,
     raster: TextRasterMode,
     /// Synthetic outline, for text over a busy backdrop such as a waveform.
     outline: Option<(Px, Color)>,
@@ -54,6 +61,8 @@ pub fn label(text: impl Into<String>) -> Label {
         text_style: TextStyle::default(),
         inherit_theme_weight: true,
         color: None,
+        scale: None,
+        role: None,
         raster: TextRasterMode::Auto,
         outline: None,
         coverage_contrast: None,
@@ -64,6 +73,24 @@ impl Label {
     /// Gives the label a stable identity.
     pub fn id(mut self, id: impl core::hash::Hash) -> Self {
         self.id = Some(ElementId::from_key(id));
+        self
+    }
+
+    /// Sizes the text by naming a step of the theme's type scale.
+    ///
+    /// Use this wherever the theme is not in hand — inside a widget's
+    /// `take_children`, for instance. An explicit [`Label::text_size`] set
+    /// afterwards overrides it.
+    pub fn scale(mut self, scale: crate::theme::TypeScale) -> Self {
+        self.scale = Some(scale);
+        self
+    }
+
+    /// Colours the text by naming a role in the theme's palette.
+    ///
+    /// An explicit [`Label::text_color`] set afterwards overrides it.
+    pub fn role(mut self, role: crate::theme::TextRole) -> Self {
+        self.role = Some(role);
         self
     }
 
@@ -170,7 +197,21 @@ impl Label {
         if self.inherit_theme_weight {
             style.font.weight = theme.typography.weight;
         }
+        // The named step only applies where no explicit size was given, so the
+        // two can be set in either order without one silently winning.
+        if let Some(scale) = self.scale
+            && self.text_style.font_size == TextStyle::default().font_size
+        {
+            style.font_size = theme.text_size(scale);
+        }
         style
+    }
+
+    /// The colour this label paints with, once the theme is known.
+    fn resolved_color(&self, theme: &crate::theme::Theme) -> Color {
+        self.color
+            .or_else(|| self.role.map(|role| theme.text_color(role)))
+            .unwrap_or(theme.colors.text)
     }
 
     /// The text this label displays.
@@ -227,7 +268,7 @@ impl Element for Label {
             return;
         }
 
-        let color = self.color.unwrap_or(cx.theme.colors.text);
+        let color = self.resolved_color(cx.theme);
         let style = self.resolved_text_style(cx.theme);
         let layout = cx.text.layout(&self.text, &style, Some(cx.bounds.width()));
         let origin = cx.bounds.origin;

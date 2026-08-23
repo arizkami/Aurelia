@@ -858,6 +858,41 @@ impl Window {
         self.inner.theme().map(theme_from_winit)
     }
 
+    /// Asks the platform to dress this window in a specific appearance.
+    ///
+    /// `None` hands the window back to the system setting, which is where it
+    /// starts. On Windows this drives the DWM frame and picks the light or dark
+    /// variant of the system backdrop, so an application with its own
+    /// light/dark switch has to call this as well as restyling itself —
+    /// otherwise its Mica stays the colour the operating system chose and the
+    /// two disagree down the middle of the window.
+    ///
+    /// Re-apply the backdrop afterwards: [`Window::set_backdrop`] reads the
+    /// window's appearance at the moment it is called.
+    pub fn set_preferred_theme(&self, theme: Option<Theme>) {
+        self.inner.set_theme(theme.map(theme_to_winit));
+        #[cfg(windows)]
+        {
+            let Some(hwnd) = self.hwnd() else { return };
+            // Taken from the argument rather than read back from
+            // `self.theme()`: winit resolves the preference on its own
+            // schedule, and reading it here one line after setting it returns
+            // the *old* answer often enough to be a bug that only reproduces
+            // on someone else's machine.
+            let dark = matches!(theme.or_else(|| self.theme()), Some(Theme::Dark));
+            let _ = super::ffi::set_immersive_dark_mode(hwnd, dark);
+            // Re-assert the material so DWM re-evaluates which variant of it to
+            // draw. The chrome state remembers what was asked for, so this
+            // cannot disagree with the last `set_backdrop`.
+            if let Some(state) = self.chrome.as_ref() {
+                let backdrop = state.backdrop();
+                if backdrop != WindowBackdrop::None {
+                    let _ = super::ffi::set_backdrop(hwnd, backdrop);
+                }
+            }
+        }
+    }
+
     /// The display this window is mostly on.
     pub fn current_monitor(&self) -> Option<MonitorInfo> {
         let primary = self.inner.primary_monitor();

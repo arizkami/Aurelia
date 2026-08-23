@@ -42,6 +42,7 @@ macro_rules! shader_table {
 shader_table! {
     "common/math.wgsl",
     "common/frame.wgsl",
+    "common/shadow.wgsl",
     "quad.wgsl",
     "text.wgsl",
     "text_subpixel.wgsl",

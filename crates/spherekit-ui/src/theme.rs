@@ -80,6 +80,50 @@ pub struct Typography {
     pub strong: spherekit_text::FontWeight,
 }
 
+/// A step of the type scale, by name.
+///
+/// A composed widget is built before it has a theme — the tree hands one over
+/// at measure and paint time, not at build time — so a toast that wants "the
+/// small size" cannot look the number up when it is constructing its children.
+/// Naming the step defers the lookup to the moment the theme exists.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum TypeScale {
+    /// [`Typography::xs`].
+    Xs,
+    /// [`Typography::sm`].
+    Sm,
+    /// [`Typography::md`], the body size.
+    #[default]
+    Md,
+    /// [`Typography::lg`].
+    Lg,
+    /// [`Typography::xl`].
+    Xl,
+}
+
+/// A text colour by meaning rather than by value.
+///
+/// Exists for the same reason [`TypeScale`] does: it is what a widget can name
+/// before it has been given a palette.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum TextRole {
+    /// [`Palette::text`].
+    #[default]
+    Default,
+    /// [`Palette::text_muted`]: labels, units, hints.
+    Muted,
+    /// [`Palette::text_on_accent`].
+    OnAccent,
+    /// [`Palette::accent`].
+    Accent,
+    /// [`Palette::success`].
+    Success,
+    /// [`Palette::warning`].
+    Warning,
+    /// [`Palette::danger`].
+    Danger,
+}
+
 /// Spacing tokens, in logical pixels.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Spacing {
@@ -262,6 +306,32 @@ impl Theme {
     #[inline]
     pub fn is_dark(&self) -> bool {
         self.colors.background.luminance() < self.colors.text.luminance()
+    }
+
+    /// The size a named step of the type scale resolves to.
+    #[inline]
+    pub fn text_size(&self, scale: TypeScale) -> Px {
+        match scale {
+            TypeScale::Xs => self.typography.xs,
+            TypeScale::Sm => self.typography.sm,
+            TypeScale::Md => self.typography.md,
+            TypeScale::Lg => self.typography.lg,
+            TypeScale::Xl => self.typography.xl,
+        }
+    }
+
+    /// The colour a named text role resolves to.
+    #[inline]
+    pub fn text_color(&self, role: TextRole) -> Color {
+        match role {
+            TextRole::Default => self.colors.text,
+            TextRole::Muted => self.colors.text_muted,
+            TextRole::OnAccent => self.colors.text_on_accent,
+            TextRole::Accent => self.colors.accent,
+            TextRole::Success => self.colors.success,
+            TextRole::Warning => self.colors.warning,
+            TextRole::Danger => self.colors.danger,
+        }
     }
 
     /// Text colour with adequate contrast against `background`.
