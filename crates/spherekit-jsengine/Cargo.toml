@@ -7,6 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+keywords = ["v8", "javascript", "embedding", "engine", "ffi"]
+categories = ["api-bindings", "development-tools::ffi"]
 build = "build.rs"
 
 [dependencies]

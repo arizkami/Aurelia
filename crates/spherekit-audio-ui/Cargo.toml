@@ -7,6 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+keywords = ["audio", "meter", "waveform", "spectrum", "dsp"]
+categories = ["gui", "multimedia::audio"]
 
 [dependencies]
 spherekit-core.workspace = true

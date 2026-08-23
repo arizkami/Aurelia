@@ -359,8 +359,7 @@ mod tests {
     #[test]
     fn the_prelude_timer_queue_is_driven_by_tick() {
         let mut js = bridge();
-        js.install_prelude(spherekit_react::PRELUDE)
-            .expect("prelude installs");
+        js.install_prelude(spherekit_react::PRELUDE).expect("prelude installs");
         eval(
             &mut js,
             "globalThis.ran = 0; setTimeout(() => { ran += 1; console.log('timer'); }, 0);",

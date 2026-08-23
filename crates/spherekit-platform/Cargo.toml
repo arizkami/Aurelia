@@ -7,6 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+keywords = ["window", "input", "winit", "desktop", "ime"]
+categories = ["gui", "os::windows-apis"]
 
 [features]
 # The winit backend and the standalone application runner. On by default; a

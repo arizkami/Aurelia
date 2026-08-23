@@ -475,10 +475,7 @@ const TEMPLATE_FILES: &[Template] = &[
     ("README.md", include_bytes!("../template/spherekit-app-react/README.md")),
     ("spherekit.toml", include_bytes!("../template/spherekit-app-react/spherekit.toml")),
     ("tsconfig.json", include_bytes!("../template/spherekit-app-react/tsconfig.json")),
-    (
-        "tsconfig.build.json",
-        include_bytes!("../template/spherekit-app-react/tsconfig.build.json"),
-    ),
+    ("tsconfig.build.json", include_bytes!("../template/spherekit-app-react/tsconfig.build.json")),
     (
         "src/renderer/App.tsx",
         include_bytes!("../template/spherekit-app-react/src/renderer/App.tsx"),
@@ -501,14 +498,8 @@ const TEMPLATE_FILES: &[Template] = &[
         "src/app/Cargo.toml",
         include_bytes!("../template/spherekit-app-react/src/app/Cargo.toml.tmpl"),
     ),
-    (
-        "src/app/src/main.rs",
-        include_bytes!("../template/spherekit-app-react/src/app/src/main.rs"),
-    ),
-    (
-        "src/app/src/lib.rs",
-        include_bytes!("../template/spherekit-app-react/src/app/src/lib.rs"),
-    ),
+    ("src/app/src/main.rs", include_bytes!("../template/spherekit-app-react/src/app/src/main.rs")),
+    ("src/app/src/lib.rs", include_bytes!("../template/spherekit-app-react/src/app/src/lib.rs")),
     (".gitignore", include_bytes!("../template/spherekit-app-react/.gitignore")),
 ];
 
@@ -574,8 +565,7 @@ mod tests {
         // to actually parse. A template that is merely *absent* from Cargo's
         // walk is not the same as one that works.
         let source = String::from_utf8(
-            include_bytes!("../template/spherekit-app-react/src/app/Cargo.toml.tmpl")
-                .to_vec(),
+            include_bytes!("../template/spherekit-app-react/src/app/Cargo.toml.tmpl").to_vec(),
         )
         .expect("template is UTF-8");
         assert!(source.contains("{{"), "the template stopped being a template");

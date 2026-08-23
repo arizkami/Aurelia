@@ -7,6 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+keywords = ["graphics", "geometry", "color", "ui", "gpu"]
+categories = ["graphics", "gui", "data-structures"]
 
 [dependencies]
 bitflags.workspace = true

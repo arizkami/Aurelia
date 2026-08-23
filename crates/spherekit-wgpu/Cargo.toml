@@ -7,6 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+keywords = ["wgpu", "rendering", "gpu", "graphics", "backend"]
+categories = ["graphics", "rendering::graphics-api"]
 
 [dependencies]
 spherekit-core.workspace = true

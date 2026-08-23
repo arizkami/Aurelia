@@ -7,6 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+keywords = ["text", "font", "shaping", "mtsdf", "glyph"]
+categories = ["graphics", "text-processing"]
 
 [dependencies]
 spherekit-core.workspace = true

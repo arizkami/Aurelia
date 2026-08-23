@@ -7,6 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+keywords = ["react", "reconciler", "ui", "jsx", "native"]
+categories = ["gui", "api-bindings"]
 
 # This directory holds two packages: this crate, and the `@spherekit/react` npm
 # package that shares the name and the `src/` folder. Without this, `cargo

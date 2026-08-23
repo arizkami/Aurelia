@@ -26,41 +26,90 @@ impl Drop for BuildLock {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SPHEREKIT_V8_URL");
+    println!("cargo:rerun-if-env-changed=SPHEREKIT_V8_OFFLINE");
+    // Declared so `unexpected_cfgs` keeps working on the gate below rather than
+    // treating every use of it as a typo.
+    println!("cargo::rustc-check-cfg=cfg(v8_backend)");
 
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os != "windows" {
-        println!(
-            "cargo:warning=spherekit-jsengine V8 prebuilt is currently available for Windows only"
-        );
-        return;
+    // When this is `None` no `v8_backend` cfg is emitted, so the crate compiles
+    // its unsupported-platform stub: every method still exists, and every one
+    // returns `Error::UnsupportedPlatform`.
+    if let Some(backend_dir) = locate_backend() {
+        link_v8(&backend_dir);
     }
+}
 
+/// Finds the V8 prebuilt, downloading it if that is possible and permitted.
+///
+/// Returns `None` rather than panicking when V8 cannot be had. A build script
+/// that reaches the network is a liability for exactly the environments that
+/// cannot tell you why they failed: docs.rs builds with networking off and
+/// would show this crate as permanently broken, an offline or air-gapped build
+/// would abort, and a CI runner behind a proxy would fail on a dependency it
+/// never asked for. Degrading to the stub keeps `cargo build` working
+/// everywhere and confines the loss to the one crate that needs V8.
+fn locate_backend() -> Option<PathBuf> {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    if target_arch != "x86_64" {
-        panic!("spherekit-jsengine currently supports only the Windows x86_64 V8 prebuilt");
+    if target_os != "windows" || target_arch != "x86_64" {
+        println!(
+            "cargo:warning=spherekit-jsengine: the V8 prebuilt is Windows x86_64 only; \
+             building the unsupported-platform stub for {target_os}-{target_arch}"
+        );
+        return None;
     }
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let backend_dir = manifest_dir.join("v8backend");
+    if has_complete_backend(&backend_dir) {
+        return Some(backend_dir);
+    }
 
-    if !has_complete_backend(&backend_dir) {
-        let lock = acquire_lock(&manifest_dir.join(".v8backend.lock"))
-            .unwrap_or_else(|error| panic!("cannot lock V8 backend setup: {error}"));
+    if env::var_os("SPHEREKIT_V8_OFFLINE").is_some() {
+        println!(
+            "cargo:warning=spherekit-jsengine: SPHEREKIT_V8_OFFLINE is set and no prebuilt is \
+             present; building the unsupported-platform stub"
+        );
+        return None;
+    }
 
-        // Another Cargo process may have finished the setup while this build
-        // waited for the lock.
-        if !has_complete_backend(&backend_dir) {
-            let url = env::var("SPHEREKIT_V8_URL").unwrap_or_else(|_| DEFAULT_V8_URL.into());
-            download_and_extract(&url, &backend_dir);
+    let lock = match acquire_lock(&manifest_dir.join(".v8backend.lock")) {
+        Ok(lock) => lock,
+        Err(error) => {
+            println!("cargo:warning=spherekit-jsengine: cannot lock V8 setup: {error}");
+            return None;
         }
+    };
 
-        drop(lock);
-    }
-
+    // Another Cargo process may have finished the setup while this build waited
+    // for the lock.
     if !has_complete_backend(&backend_dir) {
-        panic!("V8 backend setup finished without the required files in {}", backend_dir.display());
+        let url = env::var("SPHEREKIT_V8_URL").unwrap_or_else(|_| DEFAULT_V8_URL.into());
+        if let Err(error) = download_and_extract(&url, &backend_dir) {
+            println!("cargo:warning=spherekit-jsengine: {error}");
+        }
+    }
+    drop(lock);
+
+    if has_complete_backend(&backend_dir) {
+        return Some(backend_dir);
     }
 
+    // Loud, because on Windows this is the difference between a working
+    // JavaScript runtime and one whose every call returns
+    // `Error::UnsupportedPlatform` — and the code still compiles either way.
+    println!(
+        "cargo:warning=spherekit-jsengine: V8 IS UNAVAILABLE. Every Engine method will return \
+         Error::UnsupportedPlatform. Extract the prebuilt to {} or set SPHEREKIT_V8_URL, then \
+         rebuild.",
+        backend_dir.display()
+    );
+    None
+}
+
+/// Compiles the shim against the prebuilt and emits the link contract.
+fn link_v8(backend_dir: &Path) {
+    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let lib_dir = backend_dir.join("lib");
     let include_dir = backend_dir.join("include");
     let shim = manifest_dir.join("src").join("v8_shim.cc");
@@ -97,6 +146,10 @@ fn main() {
     ] {
         println!("cargo:rustc-link-lib={library}");
     }
+
+    // Only now, once the shim has compiled and V8 is actually linked, does the
+    // real implementation get switched on.
+    println!("cargo::rustc-cfg=v8_backend");
 }
 
 fn has_complete_backend(backend_dir: &Path) -> bool {
@@ -122,7 +175,7 @@ fn acquire_lock(path: &Path) -> io::Result<BuildLock> {
     }
 }
 
-fn download_and_extract(url: &str, backend_dir: &Path) {
+fn download_and_extract(url: &str, backend_dir: &Path) -> Result<(), String> {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
     let archive = out_dir.join("v8-windows_x64.zip");
     let stage = out_dir.join("v8backend-stage");
@@ -172,16 +225,17 @@ Remove-Item -LiteralPath $archive -Force
         .env("SPHEREKIT_V8_STAGE", &stage)
         .env("SPHEREKIT_V8_TARGET", backend_dir)
         .output()
-        .unwrap_or_else(|error| panic!("failed to start PowerShell for V8 setup: {error}"));
+        .map_err(|error| format!("could not start PowerShell for V8 setup: {error}"))?;
 
     if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        panic!(
-            "V8 download/extract failed with {}\nstdout:\n{}\nstderr:\n{}",
-            output.status, stdout, stderr
-        );
+        // Reduced to one line on purpose: this travels as a `cargo:warning`,
+        // and every Cargo frontend renders a multi-line one as an unreadable
+        // block with `warning:` glued to the front of each line.
+        let detail = stderr.lines().find(|line| !line.trim().is_empty()).unwrap_or("no detail");
+        return Err(format!("V8 download failed ({}): {}", output.status, detail.trim()));
     }
 
     println!("cargo:warning=V8 prebuilt extracted to {}", backend_dir.display());
+    Ok(())
 }

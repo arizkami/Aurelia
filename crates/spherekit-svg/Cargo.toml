@@ -7,6 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+keywords = ["svg", "vector", "graphics", "icons", "tessellation"]
+categories = ["graphics", "parser-implementations"]
 
 [dependencies]
 spherekit-core.workspace = true

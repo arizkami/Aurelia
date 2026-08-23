@@ -101,7 +101,7 @@ impl StdError for Error {}
 
 /// Status codes shared with `v8_shim.cc`. They must stay in step with the
 /// `k*` constants there; nothing else in the crate depends on their values.
-#[cfg(windows)]
+#[cfg(v8_backend)]
 mod status {
     /// The call succeeded.
     pub const OK: i32 = 0;
@@ -111,7 +111,7 @@ mod status {
     pub const INVALID_BINDING: i32 = 5;
 }
 
-#[cfg(windows)]
+#[cfg(v8_backend)]
 mod ffi {
     use std::ffi::{c_char, c_void};
 
@@ -230,7 +230,7 @@ mod ffi {
 /// Boxed twice on purpose: the outer box gives the record an address that stays
 /// put once V8 has captured it in a `v8::External`, and the inner box erases the
 /// closure's type so one `extern "C"` thunk serves every binding.
-#[cfg(windows)]
+#[cfg(v8_backend)]
 struct HostFunction {
     handler: Box<dyn FnMut(&str) -> std::result::Result<String, String>>,
 }
@@ -240,7 +240,7 @@ struct HostFunction {
 /// # Safety
 ///
 /// `out` and `out_length` must be valid for writes.
-#[cfg(windows)]
+#[cfg(v8_backend)]
 unsafe fn emit(bytes: &[u8], out: *mut *mut u8, out_length: *mut usize) -> bool {
     let buffer = unsafe { ffi::spherekit_v8_alloc(bytes.len()) };
     if buffer.is_null() {
@@ -261,7 +261,7 @@ unsafe fn emit(bytes: &[u8], out: *mut *mut u8, out_length: *mut usize) -> bool 
 /// thrown error instead. Under `panic = "abort"` that is dead weight; under the
 /// test profile it is the difference between a failing assert and undefined
 /// behaviour.
-#[cfg(windows)]
+#[cfg(v8_backend)]
 unsafe extern "C" fn host_thunk(
     user_data: *mut std::ffi::c_void,
     argument: *const u8,
@@ -310,7 +310,7 @@ unsafe extern "C" fn host_thunk(
 /// that script can only reach as `globalThis["delete"](x)`, which is a strange
 /// thing to want but not a broken one, and the alternative is carrying a copy of
 /// the reserved-word table around for a mistake nobody has made yet.
-#[cfg(windows)]
+#[cfg(v8_backend)]
 fn is_binding_name(name: &str) -> bool {
     let mut characters = name.chars();
     let Some(first) = characters.next() else { return false };
@@ -329,7 +329,7 @@ fn is_binding_name(name: &str) -> bool {
 /// # Safety
 ///
 /// `pointer` must be null or a live buffer of `length` bytes from the shim.
-#[cfg(windows)]
+#[cfg(v8_backend)]
 unsafe fn take_string(pointer: &mut *mut u8, length: &mut usize) -> String {
     if pointer.is_null() {
         return String::new();
@@ -342,7 +342,7 @@ unsafe fn take_string(pointer: &mut *mut u8, length: &mut usize) -> String {
 }
 
 /// Converts a failed shim call into an [`Error`], releasing the native buffers.
-#[cfg(windows)]
+#[cfg(v8_backend)]
 fn take_error(status: i32, raw: &mut ffi::RawError) -> Error {
     let message = unsafe { take_string(&mut raw.message, &mut raw.message_length) };
     let stack = unsafe { take_string(&mut raw.stack, &mut raw.stack_length) };
@@ -357,7 +357,7 @@ fn take_error(status: i32, raw: &mut ffi::RawError) -> Error {
 }
 
 /// Takes ownership of a shim-allocated result buffer as a `String`.
-#[cfg(windows)]
+#[cfg(v8_backend)]
 fn take_result(pointer: *mut u8, length: usize) -> Result<String> {
     if pointer.is_null() {
         return Ok(String::new());
@@ -375,7 +375,7 @@ fn take_result(pointer: *mut u8, length: usize) -> Result<String> {
 /// An engine is intentionally used through `&mut self`: V8 isolates are
 /// entered by one thread at a time, and this prevents accidental concurrent
 /// calls from safe Rust without pretending the isolate is `Sync`.
-#[cfg(windows)]
+#[cfg(v8_backend)]
 pub struct Engine {
     raw: std::ptr::NonNull<ffi::Engine>,
     /// Boxed handlers whose addresses V8 holds. Owned here, not by the shim, so
@@ -383,7 +383,7 @@ pub struct Engine {
     bindings: Vec<*mut HostFunction>,
 }
 
-#[cfg(windows)]
+#[cfg(v8_backend)]
 impl Engine {
     /// Creates an engine using the ICU data path emitted by the build script.
     pub fn new() -> Result<Self> {
@@ -572,7 +572,7 @@ impl Engine {
     }
 }
 
-#[cfg(windows)]
+#[cfg(v8_backend)]
 impl Drop for Engine {
     fn drop(&mut self) {
         // The isolate goes first. Once it is disposed no script can be running,
@@ -585,7 +585,7 @@ impl Drop for Engine {
 }
 
 /// Returns the V8 version without creating an isolate.
-#[cfg(windows)]
+#[cfg(v8_backend)]
 pub fn v8_version() -> String {
     Engine::version()
 }
@@ -595,10 +595,10 @@ pub fn v8_version() -> String {
 /// The whole API is mirrored rather than compiled out so that a host crate can
 /// be written once and fail at runtime on an unsupported target instead of
 /// failing to build there.
-#[cfg(not(windows))]
+#[cfg(not(v8_backend))]
 pub struct Engine;
 
-#[cfg(not(windows))]
+#[cfg(not(v8_backend))]
 impl Engine {
     /// Always fails: no V8 prebuilt exists for this target.
     pub fn new() -> Result<Self> {
@@ -656,12 +656,12 @@ impl Engine {
 }
 
 /// Returns the V8 version without creating an isolate.
-#[cfg(not(windows))]
+#[cfg(not(v8_backend))]
 pub fn v8_version() -> String {
     String::new()
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, v8_backend))]
 mod tests {
     use super::*;
     use std::cell::RefCell;
