@@ -108,6 +108,37 @@ pub enum TouchPhase {
     Cancelled,
 }
 
+/// Identifies one finger for the whole life of its contact.
+///
+/// Stable from [`TouchPhase::Started`] to [`TouchPhase::Ended`] and reused
+/// afterwards, which is exactly why a consumer must key on it rather than on
+/// the order touches arrive in: the second finger down is not reliably the
+/// second finger up.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct TouchId(pub u64);
+
+/// A single contact point, in logical pixels.
+///
+/// Delivered one per finger per platform event. A three-finger gesture is three
+/// [`WindowEvent::Touch`] events, not one event carrying three points —
+/// coalescing them is the consumer's job, because the platform does not
+/// guarantee the fingers move in the same tick.
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub struct TouchContact {
+    /// Which finger.
+    pub id: TouchId,
+    /// What this finger just did.
+    pub phase: TouchPhase,
+    /// Where it is, in logical pixels relative to the window's top-left.
+    pub position: Point<Px>,
+    /// Pressure normalised to `0.0..=1.0`, when the digitiser reports it.
+    ///
+    /// `None` on capacitive screens that report contact but not force, which is
+    /// most of them. A consumer that treats `None` as zero pressure gets a
+    /// stylus app that ignores every finger.
+    pub force: Option<f32>,
+}
+
 /// Input-method composition events.
 ///
 /// A text field must render [`ImeEvent::Preedit`] text as provisional (usually
@@ -187,6 +218,26 @@ pub enum WindowEvent {
         /// How far.
         delta: ScrollDelta,
         /// Gesture phase; discrete wheels report [`TouchPhase::Moved`].
+        phase: TouchPhase,
+    },
+    /// A finger touched, moved on, or left the screen.
+    ///
+    /// Raw contacts, not gestures. Turning a stream of these into a tap, a pan
+    /// or a pinch is [`spherekit-ui`](https://docs.rs/spherekit-ui)'s job: the
+    /// thresholds that decide whether a movement was a scroll or a slop-tolerant
+    /// tap are interface policy, and a platform layer that baked them in would
+    /// be the wrong place to change them.
+    Touch(TouchContact),
+    /// A trackpad pinch, where the platform recognises the gesture itself.
+    ///
+    /// macOS reports pinches this way and never reports the underlying touches,
+    /// so an application that only handled [`WindowEvent::Touch`] would have no
+    /// zoom on the one platform where pinch-to-zoom is universal.
+    PinchGesture {
+        /// Change in scale since the last event, as a fraction: `0.1` means ten
+        /// percent larger.
+        delta: f32,
+        /// Gesture phase.
         phase: TouchPhase,
     },
     /// A key changed state.

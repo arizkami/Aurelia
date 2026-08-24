@@ -390,14 +390,30 @@ pub(crate) fn translate_window_event(
             state: element_state_from_winit(state),
             modifiers,
         }),
+        W::Touch(touch) => out.push(WindowEvent::Touch(crate::event::TouchContact {
+            id: crate::event::TouchId(touch.id),
+            phase: touch_phase_from_winit(touch.phase),
+            position: point(
+                px(touch.location.x as f32 / scale.get()),
+                px(touch.location.y as f32 / scale.get()),
+            ),
+            // `normalized` divides by the digitiser's own maximum, so a stylus
+            // that reports 0..4096 and one that reports 0..1 arrive the same
+            // way. Screens that report contact but no force stay `None`.
+            force: touch.force.map(|f| f.normalized() as f32),
+        })),
+        W::PinchGesture { delta, phase, .. } => out.push(WindowEvent::PinchGesture {
+            delta: delta as f32,
+            phase: touch_phase_from_winit(phase),
+        }),
         W::ScaleFactorChanged { scale_factor, .. } => {
             out.push(WindowEvent::ScaleFactorChanged(ScaleFactor::new(scale_factor as f32)))
         }
         W::ThemeChanged(t) => out.push(WindowEvent::ThemeChanged(theme_from_winit(t))),
         W::Occluded(o) => out.push(WindowEvent::Occluded(o)),
         W::RedrawRequested => out.push(WindowEvent::RedrawRequested),
-        // Touch, pen pressure, pinch/pan/rotate gestures and raw axis motion
-        // have no SphereKit equivalent yet. Dropping them is deliberate: a
+        // Pen pressure, pan/rotate gestures and raw axis motion have no
+        // SphereKit equivalent yet. Dropping them is deliberate: a
         // half-translated gesture is worse than none.
         _ => {}
     }

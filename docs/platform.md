@@ -316,6 +316,30 @@ Losing focus clears all held modifier and button state: the key-up for a modifie
 alt-tab is delivered to whoever has focus next, so keeping it would leave a phantom Shift held
 forever. There is a test for that.
 
+## Touch
+
+Contacts arrive raw, one event per finger per tick:
+
+```rust
+WindowEvent::Touch(TouchContact { id, phase, position, force })
+```
+
+`id` is stable for the life of the contact and reused afterwards, so a consumer keys on it rather
+than on arrival order — the second finger down is not reliably the second finger up. `force` is
+`None` on the capacitive screens that report contact but not pressure, which is most of them;
+treating that as zero pressure is how a stylus application ends up ignoring every finger.
+
+The platform layer stops there. It does not decide what a contact *meant*: the thresholds that
+separate a tap from a scroll are interface policy, they belong where an application can replace
+them, and that is `spherekit_ui::InputTranslator`.
+
+macOS never reports the touches behind a trackpad pinch, only the recognised gesture, so
+`WindowEvent::PinchGesture` is passed through as well. An application that handled only `Touch`
+would have no zoom on the one platform where pinch-to-zoom is universal.
+
+See [`docs/touch.md`](touch.md) for gesture recognition, drag-to-scroll, flings and the on-screen
+keyboard.
+
 ## IME
 
 Input-method composition works end to end, and the path is worth spelling out because every layer

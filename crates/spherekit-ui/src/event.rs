@@ -185,6 +185,36 @@ impl Key {
     }
 }
 
+/// What produced a pointer event.
+///
+/// A touchscreen drives the same `MouseDown`/`MouseMove`/`MouseUp` path a mouse
+/// does — that is what makes every existing widget work under a finger without
+/// being rewritten — so the *only* way to tell the two apart is this field.
+/// Widgets that must differ (no hover state under a finger, a larger hit slop,
+/// no tooltip on a long press that is already a gesture) read it; everything
+/// else ignores it and behaves identically.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub enum PointerSource {
+    /// A real mouse or trackpad.
+    #[default]
+    Mouse,
+    /// A finger on a touchscreen, emulating a pointer.
+    Touch,
+    /// A stylus.
+    Pen,
+}
+
+impl PointerSource {
+    /// True when the event came from a finger or a stylus rather than a mouse.
+    ///
+    /// The question almost every caller actually has: whether a hover state is
+    /// meaningful, and whether the input has a resting position at all.
+    #[inline]
+    pub fn is_direct(self) -> bool {
+        matches!(self, PointerSource::Touch | PointerSource::Pen)
+    }
+}
+
 /// A pointer moved.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MouseMoveEvent {
@@ -196,6 +226,8 @@ pub struct MouseMoveEvent {
     pub buttons: SmallVec<[MouseButton; 3]>,
     /// Modifiers held.
     pub modifiers: Modifiers,
+    /// Whether a mouse, a finger or a stylus produced this.
+    pub source: PointerSource,
 }
 
 impl MouseMoveEvent {
@@ -220,6 +252,28 @@ pub struct MouseButtonEvent {
     pub click_count: u8,
     /// Modifiers held.
     pub modifiers: Modifiers,
+    /// Whether a mouse, a finger or a stylus produced this.
+    pub source: PointerSource,
+}
+
+/// Where a scroll gesture is in its life.
+///
+/// The distinction is not cosmetic: a wheel notch has a destination and is
+/// eased toward it, while a finger has no destination at all and must track
+/// one-to-one. Easing a finger makes the content lag behind it, which reads as
+/// a dropped frame rather than as smoothing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub enum ScrollPhase {
+    /// A discrete wheel notch or a trackpad delta with no gesture around it.
+    #[default]
+    Wheel,
+    /// A continuous gesture began. No movement is implied by this alone.
+    Began,
+    /// A continuous gesture moved.
+    Changed,
+    /// A continuous gesture ended. [`ScrollEvent::velocity`] carries whatever
+    /// speed it ended at, which is what a fling is thrown with.
+    Ended,
 }
 
 /// A scroll gesture.
@@ -231,8 +285,171 @@ pub struct ScrollEvent {
     pub delta: ScrollDelta,
     /// Modifiers held. `command()` plus scroll is conventionally zoom.
     pub modifiers: Modifiers,
-    /// True while a trackpad gesture is still in progress.
-    pub momentum: bool,
+    /// Where in a continuous gesture this is.
+    pub phase: ScrollPhase,
+    /// Speed in logical pixels per second, meaningful at [`ScrollPhase::Ended`].
+    pub velocity: Size<Px>,
+    /// Whether a mouse, a finger or a stylus produced this.
+    pub source: PointerSource,
+}
+
+impl ScrollEvent {
+    /// A plain wheel scroll at a position, with no gesture around it.
+    ///
+    /// The shape almost every caller and test wants; the gesture fields are
+    /// only interesting to a touch pipeline.
+    pub fn wheel(position: Point<Px>, delta: ScrollDelta, modifiers: Modifiers) -> Self {
+        Self {
+            position,
+            delta,
+            modifiers,
+            phase: ScrollPhase::Wheel,
+            velocity: Size::new(Px::ZERO, Px::ZERO),
+            source: PointerSource::Mouse,
+        }
+    }
+
+    /// True while a continuous gesture is still in flight.
+    #[inline]
+    pub fn momentum(&self) -> bool {
+        matches!(self.phase, ScrollPhase::Began | ScrollPhase::Changed)
+    }
+}
+
+/// One finger, as the UI layer sees it.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct TouchPoint {
+    /// Which finger, stable for the life of the contact.
+    pub id: spherekit_platform::TouchId,
+    /// Where it is now, in window-logical coordinates.
+    pub position: Point<Px>,
+    /// Where it first went down.
+    ///
+    /// Kept per touch rather than recomputed, because every gesture threshold
+    /// in the engine is measured from it and a widget that tracked it itself
+    /// would have to survive its own rebuild to do so.
+    pub start: Point<Px>,
+    /// Movement since the previous event for this finger.
+    pub delta: Size<Px>,
+    /// Speed in logical pixels per second, smoothed.
+    pub velocity: Size<Px>,
+    /// Pressure in `0.0..=1.0`, when the digitiser reports it.
+    pub force: Option<f32>,
+}
+
+impl TouchPoint {
+    /// How far this finger has travelled from where it went down.
+    #[inline]
+    pub fn travel(&self) -> Px {
+        self.position.distance_to(self.start)
+    }
+}
+
+/// A touch contact changed.
+///
+/// Carries every finger currently down, not only the one that moved: a
+/// two-finger gesture is decided by where *both* fingers are, and a handler
+/// that only saw the moving one would have to accumulate the other itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TouchEvent {
+    /// The finger this event is about.
+    pub touch: TouchPoint,
+    /// Every finger currently down, including this one.
+    pub touches: SmallVec<[TouchPoint; 4]>,
+    /// Modifiers held. A touchscreen on a laptop still has a keyboard.
+    pub modifiers: Modifiers,
+}
+
+/// Where a multi-touch gesture is in its life.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum GestureState {
+    /// Enough fingers arrived and the gesture is now recognised.
+    Began,
+    /// The gesture moved.
+    Changed,
+    /// A finger left and the gesture is over.
+    Ended,
+    /// The system took the gesture away. Roll back rather than commit.
+    Cancelled,
+}
+
+/// A two-finger pinch, and the rotation that came with it.
+///
+/// Scale and rotation are reported together because the fingers produce them
+/// together: separating them into two events would make a handler that wants
+/// both apply them a frame apart.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct PinchEvent {
+    /// The midpoint between the fingers, in window-logical coordinates.
+    pub position: Point<Px>,
+    /// Total scale since the gesture began: `1.0` is unchanged.
+    pub scale: f32,
+    /// Scale change since the previous event.
+    pub scale_delta: f32,
+    /// Total rotation since the gesture began, in radians, clockwise-positive.
+    pub rotation: f32,
+    /// Rotation change since the previous event, in radians.
+    pub rotation_delta: f32,
+    /// Where in the gesture this is.
+    pub state: GestureState,
+}
+
+/// Which way a swipe went.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SwipeDirection {
+    /// Toward negative x.
+    Left,
+    /// Toward positive x.
+    Right,
+    /// Toward negative y.
+    Up,
+    /// Toward positive y.
+    Down,
+}
+
+/// A fast directional flick, reported when the finger leaves.
+///
+/// Distinct from a scroll: a scroll is the content following a finger, a swipe
+/// is a decision — dismiss this card, go to the next page. A handler that
+/// wanted "the scroll ended fast" can read [`ScrollEvent::velocity`] instead.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct SwipeEvent {
+    /// Where the finger left, in window-logical coordinates.
+    pub position: Point<Px>,
+    /// Where the finger went down.
+    pub start: Point<Px>,
+    /// The dominant axis and sign of the movement.
+    pub direction: SwipeDirection,
+    /// Speed in logical pixels per second at the moment of release.
+    pub velocity: Size<Px>,
+}
+
+/// A finger stayed still long enough to mean something.
+///
+/// The touch equivalent of a right-click, and the reason a context menu is
+/// reachable at all without a second button.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct LongPressEvent {
+    /// Where the finger is, in window-logical coordinates.
+    pub position: Point<Px>,
+    /// How long it has been down, in milliseconds.
+    pub duration_ms: u64,
+    /// Whether a finger or a stylus produced this.
+    pub source: PointerSource,
+}
+
+/// An in-progress pointer interaction was taken away.
+///
+/// Not a release: nothing was committed. A press that turns into a scroll
+/// sends this so the button under the finger un-highlights instead of firing,
+/// and a widget that treated it as a `MouseUp` would activate on every scroll
+/// that happened to start on it. This is W3C `pointercancel` by another name.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct PointerCancelEvent {
+    /// Where the pointer was when the interaction was taken away.
+    pub position: Point<Px>,
+    /// Whether a mouse, a finger or a stylus produced this.
+    pub source: PointerSource,
 }
 
 /// A key changed state.
@@ -291,6 +508,22 @@ pub enum UiEvent {
     MouseLeave(MouseMoveEvent),
     /// A scroll gesture.
     Scroll(ScrollEvent),
+    /// A finger went down.
+    TouchStart(TouchEvent),
+    /// A finger moved.
+    TouchMove(TouchEvent),
+    /// A finger lifted.
+    TouchEnd(TouchEvent),
+    /// The system took a contact away; roll back rather than commit.
+    TouchCancel(TouchEvent),
+    /// Two fingers changed their separation or their angle.
+    Pinch(PinchEvent),
+    /// A fast directional flick ended.
+    Swipe(SwipeEvent),
+    /// A contact stayed still long enough to be a long press.
+    LongPress(LongPressEvent),
+    /// An in-progress pointer interaction was taken away without committing.
+    PointerCancel(PointerCancelEvent),
     /// A key changed state.
     Key(KeyEvent),
     /// Text was committed.
@@ -313,8 +546,52 @@ impl UiEvent {
             }
             UiEvent::MouseDown(e) | UiEvent::MouseUp(e) => Some(e.position),
             UiEvent::Scroll(e) => Some(e.position),
+            UiEvent::TouchStart(e)
+            | UiEvent::TouchMove(e)
+            | UiEvent::TouchEnd(e)
+            | UiEvent::TouchCancel(e) => Some(e.touch.position),
+            UiEvent::Pinch(e) => Some(e.position),
+            UiEvent::Swipe(e) => Some(e.position),
+            UiEvent::LongPress(e) => Some(e.position),
+            UiEvent::PointerCancel(e) => Some(e.position),
             _ => None,
         }
+    }
+
+    /// What produced this event, for the ones that come from a pointer.
+    ///
+    /// Touch events are always [`PointerSource::Touch`] and need no field of
+    /// their own to say so.
+    #[inline]
+    pub fn source(&self) -> Option<PointerSource> {
+        match self {
+            UiEvent::MouseMove(e) | UiEvent::MouseEnter(e) | UiEvent::MouseLeave(e) => {
+                Some(e.source)
+            }
+            UiEvent::MouseDown(e) | UiEvent::MouseUp(e) => Some(e.source),
+            UiEvent::Scroll(e) => Some(e.source),
+            UiEvent::LongPress(e) => Some(e.source),
+            UiEvent::PointerCancel(e) => Some(e.source),
+            UiEvent::TouchStart(_)
+            | UiEvent::TouchMove(_)
+            | UiEvent::TouchEnd(_)
+            | UiEvent::TouchCancel(_)
+            | UiEvent::Pinch(_)
+            | UiEvent::Swipe(_) => Some(PointerSource::Touch),
+            _ => None,
+        }
+    }
+
+    /// True when this is a raw contact event rather than an emulated pointer.
+    #[inline]
+    pub fn is_touch(&self) -> bool {
+        matches!(
+            self,
+            UiEvent::TouchStart(_)
+                | UiEvent::TouchMove(_)
+                | UiEvent::TouchEnd(_)
+                | UiEvent::TouchCancel(_)
+        )
     }
 
     /// True when the event is delivered by position rather than by focus.
@@ -487,6 +764,7 @@ mod tests {
             delta: Size::default(),
             buttons: SmallVec::new(),
             modifiers: Modifiers::NONE,
+            source: PointerSource::Mouse,
         });
         let key_ev = UiEvent::Key(KeyEvent {
             key: Key::Enter,
@@ -512,6 +790,7 @@ mod tests {
             delta: Size::default(),
             buttons: SmallVec::new(),
             modifiers: Modifiers::NONE,
+            source: PointerSource::Mouse,
         };
         let mut drag = hover.clone();
         drag.buttons.push(MouseButton::Primary);

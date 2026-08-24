@@ -2479,12 +2479,11 @@ mod tests {
         // overflowing, and the wheel has nothing to move.
         let mut text = TextSystem::with_system_fonts();
         let (mut tree, _) = lay_out(Page::Palette, &mut text);
-        tree.dispatch(&spherekit::ui::UiEvent::Scroll(spherekit::ui::ScrollEvent {
-            position: spherekit::core::Point::new(px(700.0), px(300.0)),
-            delta: spherekit::ui::ScrollDelta::Lines(spherekit::core::Size::new(0.0, -3.0)),
-            modifiers: spherekit::ui::Modifiers::NONE,
-            momentum: false,
-        }));
+        tree.dispatch(&spherekit::ui::UiEvent::Scroll(spherekit::ui::ScrollEvent::wheel(
+            spherekit::core::Point::new(px(700.0), px(300.0)),
+            spherekit::ui::ScrollDelta::Lines(spherekit::core::Size::new(0.0, -3.0)),
+            spherekit::ui::Modifiers::NONE,
+        )));
         // The wheel now sets a destination and the tree glides there, so the
         // frames a window would draw have to be drawn here too.
         for _ in 0..120 {

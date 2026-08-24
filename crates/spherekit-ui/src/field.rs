@@ -725,6 +725,7 @@ mod tests {
             state: ElementState::Pressed,
             click_count: count,
             modifiers: Modifiers::NONE,
+            source: crate::event::PointerSource::Mouse,
         })
     }
 
@@ -1011,6 +1012,7 @@ mod tests {
                 delta: Size::new(px(371.0), Px::ZERO),
                 buttons: smallvec::smallvec![MouseButton::Primary],
                 modifiers: Modifiers::NONE,
+                source: crate::event::PointerSource::Mouse,
             }),
             &mut text,
         );

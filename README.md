@@ -347,6 +347,7 @@ measured, which makes them usable as smoke tests.
 | [`docs/layout.md`](docs/layout.md)               | The retained tree, dirty propagation, hit testing                       |
 | [`docs/audio-ui.md`](docs/audio-ui.md)           | The audio-thread boundary and realtime primitives                       |
 | [`docs/platform.md`](docs/platform.md)           | Windowing, HiDPI, plug-in embedding, frame scheduling                   |
+| [`docs/touch.md`](docs/touch.md)                 | Contacts, gestures, drag-to-scroll and flings, the on-screen keyboard   |
 | [`docs/performance.md`](docs/performance.md)     | Targets, what is measured, and how                                      |
 | [`docs/api-bridge.md`](docs/api-bridge.md)       | React/native JSON Lines API and event bridge                            |
 | [`docs/spherekit-css.md`](docs/spherekit-css.md) | The stylesheet runtime and its v1 property boundary                     |

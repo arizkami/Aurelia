@@ -270,6 +270,7 @@ mod tests {
             state,
             click_count: 1,
             modifiers: Modifiers::NONE,
+            source: spherekit_ui::PointerSource::Mouse,
         };
         match state {
             ElementState::Pressed => UiEvent::MouseDown(event),

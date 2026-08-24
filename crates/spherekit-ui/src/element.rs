@@ -1120,6 +1120,7 @@ mod tests {
             state: ElementState::Released,
             click_count: 1,
             modifiers: Modifiers::NONE,
+            source: crate::event::PointerSource::Mouse,
         })
     }
 

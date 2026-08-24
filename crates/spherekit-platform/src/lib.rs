@@ -93,7 +93,10 @@ pub const WHEEL_SCROLL_PAGE: u32 = u32::MAX;
 
 pub use clipboard::{Clipboard, ClipboardProvider};
 pub use cursor::Cursor;
-pub use event::{ElementState, ImeEvent, MouseButton, ScrollDelta, Theme, TouchPhase, WindowEvent};
+pub use event::{
+    ElementState, ImeEvent, MouseButton, ScrollDelta, Theme, TouchContact, TouchId, TouchPhase,
+    WindowEvent,
+};
 pub use keyboard::{
     Key, KeyCode, KeyLocation, KeyText, Modifiers, NamedKey, PhysicalKey, Scancode,
 };
@@ -123,7 +126,10 @@ pub use spherekit_core::WindowId;
 /// Everything a typical consumer needs, in one import.
 pub mod prelude {
     pub use crate::cursor::Cursor;
-    pub use crate::event::{ElementState, MouseButton, ScrollDelta, Theme, WindowEvent};
+    pub use crate::event::{
+        ElementState, MouseButton, ScrollDelta, Theme, TouchContact, TouchId, TouchPhase,
+        WindowEvent,
+    };
     pub use crate::keyboard::{Key, Modifiers, NamedKey, PhysicalKey};
     pub use crate::monitor::{MonitorInfo, RefreshRate};
     pub use crate::registry::WindowState;

@@ -68,6 +68,7 @@ pub mod event;
 pub mod field;
 pub mod focus;
 pub mod input;
+pub mod keyboard;
 pub mod overlay;
 pub mod semantics;
 pub mod style;
@@ -88,13 +89,17 @@ pub use element::{
     div,
 };
 pub use event::{
-    ClickTracker, ElementState, EventFlow, HitChain, HitTarget, ImeEvent, Key, KeyEvent, Modifiers,
-    MouseButton, MouseButtonEvent, MouseMoveEvent, Phase, ScrollDelta, ScrollEvent, TextInputEvent,
-    UiEvent,
+    ClickTracker, ElementState, EventFlow, GestureState, HitChain, HitTarget, ImeEvent, Key,
+    KeyEvent, LongPressEvent, Modifiers, MouseButton, MouseButtonEvent, MouseMoveEvent, Phase,
+    PinchEvent, PointerCancelEvent, PointerSource, ScrollDelta, ScrollEvent, ScrollPhase,
+    SwipeDirection, SwipeEvent, TextInputEvent, TouchEvent, TouchPoint, UiEvent,
 };
 pub use field::{TextField, text_field};
 pub use focus::{FocusDirection, FocusHandle, FocusRegistry, Focusable, Scope, ScopeId};
-pub use input::InputTranslator;
+pub use input::{InputTranslator, TouchConfig};
+pub use keyboard::{
+    KeyPress, KeyboardLayer, VirtualKey, VirtualKeyboard, numeric_keyboard, virtual_keyboard,
+};
 pub use overlay::{
     OVERLAY_Z, Overlay, Popover, PopoverAlign, PopoverSide, TOAST_Z, Toast, ToastVariant, overlay,
     popover, toast, toast_layer,
@@ -119,9 +124,12 @@ pub mod prelude {
     pub use crate::element::{
         Element, EventContext, Interactive, IntoElement, PaintContext, ParentElement, Styled, div,
     };
-    pub use crate::event::{EventFlow, Key, Modifiers, MouseButton, UiEvent};
+    pub use crate::event::{
+        EventFlow, Key, Modifiers, MouseButton, PointerSource, SwipeDirection, UiEvent,
+    };
     pub use crate::focus::FocusDirection;
-    pub use crate::input::InputTranslator;
+    pub use crate::input::{InputTranslator, TouchConfig};
+    pub use crate::keyboard::{KeyPress, virtual_keyboard};
     pub use crate::overlay::{overlay, popover, toast, toast_layer};
     pub use crate::semantics::{Role, Semantics};
     pub use crate::style::{Cursor, PaintStyle, StyledInteraction};

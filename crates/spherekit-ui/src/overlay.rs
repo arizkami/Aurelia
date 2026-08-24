@@ -964,6 +964,7 @@ mod tests {
             state: ElementState::Pressed,
             click_count: 1,
             modifiers: Modifiers::NONE,
+            source: crate::event::PointerSource::Mouse,
         })
     }
 

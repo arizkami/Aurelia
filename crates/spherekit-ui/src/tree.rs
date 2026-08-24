@@ -112,6 +112,82 @@ fn wheel_notch_distance(setting: Option<u32>, line: Px, viewport_extent: Px) -> 
 /// movement instead of a stack of jumps.
 const SCROLL_GLIDE: f32 = 0.13;
 
+/// How far a finger may travel before a press becomes a scroll.
+///
+/// The same ten logical pixels the translator uses to tell a tap from a drag,
+/// and deliberately the same number: a gesture that was a tap as far as one
+/// layer was concerned and a scroll as far as the other was would fire a button
+/// and move the list under it.
+const TOUCH_PAN_SLOP: f32 = 10.0;
+
+/// Clamps a fling to a speed a real finger could have produced.
+fn clamp_fling_velocity(velocity: Size<Px>) -> Size<Px> {
+    Size::new(
+        Px(velocity.width.get().clamp(-FLING_MAXIMUM_SPEED, FLING_MAXIMUM_SPEED)),
+        Px(velocity.height.get().clamp(-FLING_MAXIMUM_SPEED, FLING_MAXIMUM_SPEED)),
+    )
+}
+
+/// How much of a fling's speed survives one millisecond.
+///
+/// The figure every mobile toolkit converged on, and it is a per-*millisecond*
+/// factor rather than a per-frame one on purpose: decaying once a frame would
+/// make a list coast further on a 60 Hz display than on a 120 Hz one, which is
+/// the classic way a scroll feels different on two devices running the same
+/// code.
+const FLING_FRICTION: f32 = 0.998;
+
+/// Below this speed, in logical pixels per second, a fling has stopped.
+///
+/// An exponential decay never reaches zero, so something has to say when the
+/// motion is over. Fifty pixels a second is under three pixels per frame:
+/// slower than that and the content is visibly crawling rather than coasting.
+const FLING_MINIMUM_SPEED: f32 = 50.0;
+
+/// The fastest a fling may be thrown, in logical pixels per second.
+///
+/// A digitiser that reports two samples a millisecond apart can compute an
+/// enormous velocity from a two-pixel movement. Without a ceiling one unlucky
+/// sample pair sends a list to its end.
+const FLING_MAXIMUM_SPEED: f32 = 6_000.0;
+
+/// A scroll offset coasting after a finger let go.
+///
+/// Velocity is the finger's, so the content keeps moving the way it was being
+/// dragged. It is stored rather than re-derived because the finger is gone: by
+/// definition there are no more events to derive anything from.
+#[derive(Copy, Clone, Debug)]
+struct ScrollFling {
+    /// Finger speed in logical pixels per second.
+    velocity: Size<Px>,
+}
+
+/// A one-finger drag that is, or may become, a scroll.
+///
+/// Held by the tree rather than the translator because the decision needs two
+/// things only the tree has: what is under the finger, and whether a widget has
+/// already captured the pointer. A slider dragged with a finger must win over
+/// the list it sits in, and capture is how it says so.
+#[derive(Clone, Debug)]
+struct TouchPan {
+    /// Which finger, so a second one arriving cannot be mistaken for this one.
+    touch: spherekit_platform::TouchId,
+    /// Where the finger was at the previous event.
+    last: Point<Px>,
+    /// Whether the finger has passed the slop and is now scrolling.
+    ///
+    /// Until it does, the press belongs to whatever is under it and the content
+    /// must not move: a list whose rows scrolled a pixel on every tap would be
+    /// unusable.
+    scrolling: bool,
+    /// The node being scrolled, once one has been chosen.
+    node: Option<NodeId>,
+    /// The hit chain the finger went down on, innermost last.
+    chain: SmallVec<[usize; 12]>,
+    /// The finger's smoothed speed, kept for the fling it may end in.
+    velocity: Size<Px>,
+}
+
 /// A scroll offset on its way somewhere.
 ///
 /// A tween rather than a spring: a wheel notch has a definite destination and
@@ -255,6 +331,18 @@ pub struct UiTree {
     /// deliberately does not appear here — a dragged thumb must track the
     /// pointer exactly, and easing it would feel like lag.
     scroll_glide: FxHashMap<NodeId, ScrollGlide>,
+    /// Scroll offsets still coasting after a finger let go.
+    scroll_fling: FxHashMap<NodeId, ScrollFling>,
+    /// How far a finger may travel before a press becomes a scroll.
+    touch_slop: Px,
+    /// The one-finger drag that is, or may become, a scroll.
+    pan: Option<TouchPan>,
+    /// Whether an emulated pointer release is still owed a swallowing.
+    ///
+    /// A finger that turned into a scroll has already had its press cancelled,
+    /// but the translator still reports the lift as a `MouseUp`. Delivering it
+    /// would activate whatever the scroll started on.
+    swallow_touch_pointer: bool,
 }
 
 impl Default for UiTree {
@@ -285,6 +373,10 @@ impl UiTree {
             stats: TreeStats::default(),
             hit_scratch: Vec::new(),
             scroll_glide: FxHashMap::default(),
+            scroll_fling: FxHashMap::default(),
+            touch_slop: Px(TOUCH_PAN_SLOP),
+            pan: None,
+            swallow_touch_pointer: false,
             wheel_lines: spherekit_platform::wheel_scroll_lines(),
         }
     }
@@ -735,8 +827,17 @@ impl UiTree {
     /// direction is skipped rather than consuming the gesture — that is what
     /// makes a wheel inside a fully-scrolled list keep moving the page.
     ///
-    /// Returns whether anything actually moved.
-    fn scroll_chain(&mut self, indices: &[usize], delta: Size<Px>) -> Option<usize> {
+    /// `glide` eases the offset to its destination over the next few frames,
+    /// which is right for a wheel notch and wrong for a finger: a dragged
+    /// surface has to stay under the fingertip, and easing it reads as lag.
+    ///
+    /// Returns where in the chain the mover was, and which node it is.
+    fn scroll_chain(
+        &mut self,
+        indices: &[usize],
+        delta: Size<Px>,
+        glide: bool,
+    ) -> Option<(usize, NodeId)> {
         for (position, index) in indices.iter().enumerate().rev() {
             let Some(built) = self.built.get(*index) else { continue };
             let node = built.node;
@@ -780,14 +881,163 @@ impl UiTree {
                 // Already at the end in this direction; let an ancestor try.
                 continue;
             }
-            // Glide rather than jump. The offset itself is not touched here —
-            // `advance` walks it there over the next few frames.
-            let from = self.layout.scroll_offset(node);
-            self.scroll_glide.insert(node, ScrollGlide { from, to: clamped, elapsed: 0.0 });
+            if glide {
+                // Glide rather than jump. The offset itself is not touched
+                // here — `advance` walks it there over the next few frames.
+                let from = self.layout.scroll_offset(node);
+                self.scroll_glide.insert(node, ScrollGlide { from, to: clamped, elapsed: 0.0 });
+            } else {
+                // A glide left running would fight the finger for the same
+                // offset, and the finger must win.
+                self.scroll_glide.remove(&node);
+                let _ = self.layout.set_scroll_offset(node, clamped);
+            }
             self.layout.mark_dirty(node, DirtyFlags::PAINT);
-            return Some(position);
+            return Some((position, node));
         }
         None
+    }
+
+    // ------------------------------------------------------------- touch pan
+
+    /// Starts tracking a finger that may turn into a scroll.
+    ///
+    /// Nothing scrolls yet. A finger that goes down on a list and lifts without
+    /// moving is a tap on a row, and a container that scrolled on contact would
+    /// make every row press drag the list a pixel first.
+    fn begin_pan(&mut self, touch: &crate::event::TouchEvent, indices: &[usize]) {
+        // A second finger is a pinch, not a pan. Whatever the first one was
+        // doing stops rather than continuing under half a gesture.
+        if touch.touches.len() != 1 {
+            self.pan = None;
+            return;
+        }
+        // Touching a coasting list catches it, exactly as a hand on a spinning
+        // record does. Doing this before the capture check matters: even a
+        // finger that lands on a button inside the list must stop it.
+        for index in indices {
+            if let Some(built) = self.built.get(*index) {
+                self.scroll_fling.remove(&built.node);
+                self.scroll_glide.remove(&built.node);
+            }
+        }
+        // A widget that has captured the pointer owns the gesture outright — a
+        // fader being dragged with a finger must not also scroll the panel it
+        // sits in.
+        if self.captured.is_some() {
+            self.pan = None;
+            return;
+        }
+        self.pan = Some(TouchPan {
+            touch: touch.touch.id,
+            last: touch.touch.position,
+            scrolling: false,
+            node: None,
+            chain: SmallVec::from_slice(indices),
+            velocity: Size::new(Px::ZERO, Px::ZERO),
+        });
+    }
+
+    /// Moves the content with the finger. Returns whether anything scrolled.
+    fn update_pan(
+        &mut self,
+        touch: &crate::event::TouchEvent,
+        text: Option<&mut spherekit_text::TextSystem>,
+    ) -> bool {
+        let Some((id, last, was_scrolling, chain)) =
+            self.pan.as_ref().map(|pan| (pan.touch, pan.last, pan.scrolling, pan.chain.clone()))
+        else {
+            return false;
+        };
+        if id != touch.touch.id || touch.touches.len() != 1 {
+            self.pan = None;
+            return false;
+        }
+        // Capture can be taken *during* the gesture — a slider grabs it on the
+        // press that started this very pan — so it is rechecked every move
+        // rather than only at the start.
+        if self.captured.is_some() {
+            self.pan = None;
+            return false;
+        }
+
+        let delta = Size::new(touch.touch.position.x - last.x, touch.touch.position.y - last.y);
+        let crossed = !was_scrolling && touch.touch.travel() > self.touch_slop;
+        if let Some(pan) = self.pan.as_mut() {
+            pan.last = touch.touch.position;
+            pan.velocity = touch.touch.velocity;
+            pan.scrolling |= crossed;
+        }
+        if !was_scrolling && !crossed {
+            return false;
+        }
+
+        if crossed {
+            // The press under the finger never becomes a click. Told rather
+            // than inferred, so a button un-highlights on the frame the scroll
+            // starts instead of staying lit for the length of the gesture.
+            self.swallow_touch_pointer = true;
+            let cancel = UiEvent::PointerCancel(crate::event::PointerCancelEvent {
+                position: touch.touch.position,
+                source: crate::event::PointerSource::Touch,
+            });
+            self.dispatch_inner(&cancel, text);
+            self.clear_active();
+        }
+
+        // Direct, not glided: the content is under the fingertip and has to
+        // stay there.
+        match self.scroll_chain(&chain, delta, false) {
+            Some((_, node)) => {
+                if let Some(pan) = self.pan.as_mut() {
+                    pan.node = Some(node);
+                }
+                true
+            }
+            // Nothing had room to move. The gesture is still a scroll — an
+            // over-scrolled list must not hand the finger back to the row
+            // underneath halfway through — it simply moves nothing.
+            None => crossed,
+        }
+    }
+
+    /// Ends a pan, throwing a fling when the finger was still moving.
+    fn end_pan(&mut self, touch: &crate::event::TouchEvent, cancelled: bool) {
+        let Some(pan) = self.pan.take() else { return };
+        if pan.touch != touch.touch.id {
+            // Some other finger; put the pan back rather than dropping it.
+            self.pan = Some(pan);
+            return;
+        }
+        if !pan.scrolling {
+            self.swallow_touch_pointer = false;
+            return;
+        }
+        // Left set: the emulated release still has to be swallowed, or the row
+        // the scroll began on activates when the finger lifts.
+        if cancelled {
+            return;
+        }
+        let Some(node) = pan.node else { return };
+        // The finger's own final velocity, not the pan's accumulated delta: a
+        // gesture that slowed to a stop before lifting must not fling at the
+        // speed it was travelling in the middle.
+        let velocity = clamp_fling_velocity(touch.touch.velocity);
+        let speed = (velocity.width.get().powi(2) + velocity.height.get().powi(2)).sqrt();
+        if speed < FLING_MINIMUM_SPEED {
+            return;
+        }
+        self.scroll_fling.insert(node, ScrollFling { velocity });
+    }
+
+    /// Clears the pressed state of every element that has one.
+    ///
+    /// After a cancel: `MouseUp` is what normally clears it and by definition
+    /// one is not coming.
+    fn clear_active(&mut self) {
+        for state in self.node_state.values_mut() {
+            state.active = false;
+        }
     }
 
     /// Steps time-based animation the tree owns. Returns whether more is owed.
@@ -799,12 +1049,15 @@ impl UiTree {
     /// [`SphereKitSurface::render`](https://docs.rs/spherekit) does this for
     /// you — an application driving a `UiTree` directly does not.
     pub fn advance(&mut self, dt: std::time::Duration) -> bool {
-        if self.scroll_glide.is_empty() {
+        if self.scroll_glide.is_empty() && self.scroll_fling.is_empty() {
             return false;
+        }
+        let mut running = self.advance_flings(dt);
+        if self.scroll_glide.is_empty() {
+            return running;
         }
         let dt = dt.as_secs_f32();
         let mut finished: SmallVec<[NodeId; 4]> = SmallVec::new();
-        let mut running = false;
 
         for (node, glide) in self.scroll_glide.iter_mut() {
             glide.elapsed += dt;
@@ -819,6 +1072,71 @@ impl UiTree {
         }
         for node in finished {
             self.scroll_glide.remove(&node);
+        }
+        running
+    }
+
+    /// Coasts every list a finger threw, and returns whether any still moves.
+    ///
+    /// Exponential friction rather than a fixed deceleration: a hard flick has
+    /// to travel much further than a gentle one, and a constant deceleration
+    /// makes the two feel like the same gesture at different speeds.
+    fn advance_flings(&mut self, dt: std::time::Duration) -> bool {
+        if self.scroll_fling.is_empty() {
+            return false;
+        }
+        let seconds = dt.as_secs_f32();
+        // Guard the degenerate first frame: a zero `dt` would apply friction
+        // without moving anything, and a negative one cannot happen but would
+        // reverse the decay if it did.
+        if seconds <= 0.0 {
+            return true;
+        }
+        let decay = FLING_FRICTION.powf(seconds * 1000.0);
+
+        let mut finished: SmallVec<[NodeId; 4]> = SmallVec::new();
+        let mut running = false;
+        for (node, fling) in self.scroll_fling.iter_mut() {
+            let at = self.layout.scroll_offset(*node);
+            let max = self.layout.max_scroll_offset(*node);
+            // The content follows the finger, so it moves *against* the offset:
+            // a finger travelling down reveals what is above it.
+            let wants = spherekit_core::size(
+                at.width - Px(fling.velocity.width.get() * seconds),
+                at.height - Px(fling.velocity.height.get() * seconds),
+            );
+            let clamped = spherekit_core::size(
+                wants.width.clamp(Px::ZERO, max.width),
+                wants.height.clamp(Px::ZERO, max.height),
+            );
+            // An axis that hit its end has nowhere left to coast; keeping its
+            // velocity would leave the fling running against a wall until
+            // friction alone stopped it.
+            if clamped.width == at.width && wants.width != at.width {
+                fling.velocity.width = Px::ZERO;
+            }
+            if clamped.height == at.height && wants.height != at.height {
+                fling.velocity.height = Px::ZERO;
+            }
+            if clamped != at {
+                let _ = self.layout.set_scroll_offset(*node, clamped);
+                self.layout.mark_dirty(*node, DirtyFlags::PAINT);
+            }
+
+            fling.velocity = spherekit_core::size(
+                Px(fling.velocity.width.get() * decay),
+                Px(fling.velocity.height.get() * decay),
+            );
+            let speed =
+                (fling.velocity.width.get().powi(2) + fling.velocity.height.get().powi(2)).sqrt();
+            if speed < FLING_MINIMUM_SPEED {
+                finished.push(*node);
+            } else {
+                running = true;
+            }
+        }
+        for node in finished {
+            self.scroll_fling.remove(&node);
         }
         running
     }
@@ -942,8 +1260,40 @@ impl UiTree {
             self.hit_scratch.iter().filter_map(|n| self.index_for_node.get(n).copied()).collect()
         };
 
+        // A finger that has become a scroll has already had its press
+        // cancelled; the emulated move and release that follow belong to the
+        // gesture, not to whatever the gesture started on.
+        if self.swallow_touch_pointer
+            && event.source() == Some(crate::event::PointerSource::Touch)
+            && matches!(event, UiEvent::MouseMove(_) | UiEvent::MouseDown(_) | UiEvent::MouseUp(_))
+        {
+            if matches!(event, UiEvent::MouseUp(_)) {
+                self.swallow_touch_pointer = false;
+            }
+            result.consumed = true;
+            return result;
+        }
+
+        match event {
+            UiEvent::TouchStart(touch) => self.begin_pan(touch, &indices),
+            // The guard is what does the panning: it runs once, and its answer
+            // is whether anything actually moved.
+            UiEvent::TouchMove(touch) if self.update_pan(touch, text.as_deref_mut()) => {
+                result.repaint = true;
+                result.consumed = true;
+            }
+            UiEvent::TouchEnd(touch) => self.end_pan(touch, false),
+            UiEvent::TouchCancel(touch) => self.end_pan(touch, true),
+            _ => {}
+        }
+
         if matches!(event, UiEvent::MouseMove(_)) {
-            result.merge(self.update_hover(&indices, position, &clipboard));
+            result.merge(self.update_hover(
+                &indices,
+                position,
+                event.source().unwrap_or_default(),
+                &clipboard,
+            ));
         }
         self.update_active(event, &indices);
 
@@ -972,7 +1322,11 @@ impl UiTree {
                 .unwrap_or(line);
             let notch = wheel_notch_distance(self.wheel_lines, line, viewport);
             let delta = wheel.delta.to_pixels(notch);
-            if let Some(position) = self.scroll_chain(&indices, delta) {
+            // A trackpad gesture reports where the fingers actually are, so it
+            // tracks directly; a wheel notch has a destination and is eased to
+            // it.
+            let glide = wheel.phase == crate::event::ScrollPhase::Wheel;
+            if let Some((position, _)) = self.scroll_chain(&indices, delta, glide) {
                 result.repaint = true;
                 result.consumed = true;
                 // The container that moved has consumed the gesture, so the
@@ -1187,6 +1541,7 @@ impl UiTree {
         &mut self,
         indices: &[usize],
         position: Point<Px>,
+        source: crate::event::PointerSource,
         clipboard: &spherekit_platform::Clipboard,
     ) -> DispatchResult {
         let mut result = DispatchResult::default();
@@ -1207,6 +1562,7 @@ impl UiTree {
                 delta: Size::default(),
                 buttons: SmallVec::new(),
                 modifiers: Modifiers::NONE,
+                source,
             })
         };
 
@@ -1302,6 +1658,7 @@ mod tests {
             delta: Size::default(),
             buttons: SmallVec::new(),
             modifiers: Modifiers::NONE,
+            source: crate::event::PointerSource::Mouse,
         })
     }
 
@@ -1312,6 +1669,7 @@ mod tests {
             state: ElementState::Released,
             click_count: 1,
             modifiers: Modifiers::NONE,
+            source: crate::event::PointerSource::Mouse,
         })
     }
 
@@ -1661,6 +2019,7 @@ mod tests {
             state: ElementState::Pressed,
             click_count: 1,
             modifiers: Modifiers::NONE,
+            source: crate::event::PointerSource::Mouse,
         }));
         tree.dispatch(&move_to(350.0, 250.0));
         assert_eq!(moves.get(), 1, "a captured element stopped receiving moves");
@@ -1683,6 +2042,7 @@ mod tests {
             state: ElementState::Pressed,
             click_count: 1,
             modifiers: Modifiers::NONE,
+            source: crate::event::PointerSource::Mouse,
         }));
         assert!(tree.captured.is_some());
         tree.dispatch(&click_up_at(350.0, 250.0));

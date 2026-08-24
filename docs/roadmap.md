@@ -85,6 +85,11 @@ IME is complete end to end as of the text field: platform event, translated even
 composition, caret rectangle and the two `Window` calls that make a candidate window appear in the
 right place. See `docs/platform.md`.
 
+Touch is in as of the contact pipeline: raw contacts from the platform, gesture recognition in the
+translator (tap, long press, swipe, pinch, with replaceable thresholds), pointer emulation so every
+existing widget works under a finger, and drag-to-scroll with flings in the tree. Overscroll
+rubber-banding, two-finger pan and stylus reporting are not done. See `docs/touch.md`.
+
 ### Phase 5 — Widgets · **PARTIAL**
 
 | Widget | Status |
@@ -108,6 +113,7 @@ right place. See `docs/platform.md`.
 | Overlay, popover, toast | Done — the timing and the queue are the application's |
 | Outline button variant | Done |
 | **List, tree, dock container** | **Not started** |
+| Virtual keyboard (letters, symbols, numeric) | Done |
 | **Icon button, editable number input** | **Not started** |
 
 The value controls are complete: vertical drag with pointer capture, Shift for fine mode,

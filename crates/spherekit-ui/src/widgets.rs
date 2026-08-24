@@ -4130,6 +4130,7 @@ mod tests {
             state: ElementState::Pressed,
             click_count: count,
             modifiers: Modifiers::NONE,
+            source: crate::event::PointerSource::Mouse,
         })
     }
 
@@ -4140,6 +4141,7 @@ mod tests {
             state: ElementState::Released,
             click_count: 1,
             modifiers: Modifiers::NONE,
+            source: crate::event::PointerSource::Mouse,
         })
     }
 
@@ -4149,6 +4151,7 @@ mod tests {
             delta: Size::default(),
             buttons: SmallVec::from_slice(&[MouseButton::Primary]),
             modifiers: Modifiers { shift, ..Modifiers::NONE },
+            source: crate::event::PointerSource::Mouse,
         })
     }
 
@@ -4619,12 +4622,11 @@ mod tests {
 
     /// A wheel gesture at a point, `down` lines' worth.
     fn wheel_at(x: f32, y: f32, down: f32) -> UiEvent {
-        UiEvent::Scroll(crate::event::ScrollEvent {
-            position: Point::new(px(x), px(y)),
-            delta: crate::event::ScrollDelta::Lines(Size::new(0.0, -down)),
-            modifiers: Modifiers::NONE,
-            momentum: false,
-        })
+        UiEvent::Scroll(crate::event::ScrollEvent::wheel(
+            Point::new(px(x), px(y)),
+            crate::event::ScrollDelta::Lines(Size::new(0.0, -down)),
+            Modifiers::NONE,
+        ))
     }
 
     /// A scroll view over content that genuinely overflows it.
@@ -4981,5 +4983,203 @@ mod tests {
     fn a_dropdown_lays_its_children_out_as_a_column_by_default() {
         let style = dropdown(1.0).layout_style();
         assert_eq!(style.flex_direction, spherekit_layout::FlexDirection::Column);
+    }
+
+    // ------------------------------------------------------- touch scrolling
+
+    /// Feeds one contact through the real translator and into the tree.
+    ///
+    /// Driven end to end rather than by hand-built UI events, because half the
+    /// behaviour under test lives in the translator — the emulated press, the
+    /// velocity estimate — and a test that skipped it would pass with the
+    /// pipeline broken.
+    fn finger(
+        tree: &mut UiTree,
+        input: &mut crate::input::InputTranslator,
+        phase: spherekit_platform::TouchPhase,
+        x: f32,
+        y: f32,
+        at_ms: u64,
+    ) {
+        input.set_time(at_ms);
+        let event = spherekit_platform::WindowEvent::Touch(spherekit_platform::TouchContact {
+            id: spherekit_platform::TouchId(1),
+            phase,
+            position: Point::new(px(x), px(y)),
+            force: None,
+        });
+        for ui in input.translate(&event) {
+            tree.dispatch(&ui);
+        }
+    }
+
+    /// A tree holding one scroll view with far more content than room.
+    fn touch_scroll_tree() -> UiTree {
+        let mut tree = UiTree::new();
+        tree.build(
+            div().w(relative(1.0)).h(relative(1.0)).child(overflowing_scroll_view()).into_element(),
+        );
+        tree.compute_layout(viewport()).unwrap();
+        tree
+    }
+
+    #[test]
+    fn dragging_a_finger_scrolls_the_content_under_it() {
+        let mut tree = touch_scroll_tree();
+        let mut input = crate::input::InputTranslator::new();
+
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Started, 50.0, 80.0, 0);
+        // Past the slop, upward: the content follows the finger, so the offset
+        // grows and later content comes into view.
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Moved, 50.0, 40.0, 16);
+
+        let at = tree.scroll_offset_of("inner").expect("the view has a node");
+        // No `advance`: a dragged surface has to be under the fingertip on the
+        // very frame the finger moved, not eased toward it.
+        assert!(at.height > Px::ZERO, "the finger did not move the content: {at:?}");
+    }
+
+    #[test]
+    fn a_finger_that_stays_within_the_slop_scrolls_nothing() {
+        // Otherwise every tap drags the list a pixel first.
+        let mut tree = touch_scroll_tree();
+        let mut input = crate::input::InputTranslator::new();
+
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Started, 50.0, 80.0, 0);
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Moved, 52.0, 76.0, 16);
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Ended, 52.0, 76.0, 32);
+
+        assert_eq!(tree.scroll_offset_of("inner").unwrap().height, Px::ZERO);
+    }
+
+    #[test]
+    fn releasing_a_moving_finger_keeps_the_content_coasting() {
+        let mut tree = touch_scroll_tree();
+        let mut input = crate::input::InputTranslator::new();
+
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Started, 50.0, 90.0, 0);
+        for step in 1..=4 {
+            let y = 90.0 - step as f32 * 20.0;
+            finger(
+                &mut tree,
+                &mut input,
+                spherekit_platform::TouchPhase::Moved,
+                50.0,
+                y,
+                step * 16,
+            );
+        }
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Ended, 50.0, 10.0, 80);
+
+        let at_release = tree.scroll_offset_of("inner").unwrap().height;
+        assert!(tree.advance(std::time::Duration::from_millis(16)), "the fling must keep running");
+        let mut frames = 0;
+        while tree.advance(std::time::Duration::from_millis(16)) {
+            frames += 1;
+            assert!(frames < 600, "a fling never came to rest");
+        }
+        let at_rest = tree.scroll_offset_of("inner").unwrap().height;
+        assert!(at_rest > at_release, "the fling did not travel: {at_release:?} to {at_rest:?}");
+    }
+
+    #[test]
+    fn a_fling_stops_at_the_end_of_the_content() {
+        let mut tree = touch_scroll_tree();
+        let mut input = crate::input::InputTranslator::new();
+
+        // As hard a flick as a finger can produce, into 900 pixels of travel.
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Started, 50.0, 99.0, 0);
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Moved, 50.0, 1.0, 8);
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Ended, 50.0, 1.0, 16);
+
+        let mut frames = 0;
+        while tree.advance(std::time::Duration::from_millis(16)) {
+            frames += 1;
+            assert!(frames < 600, "a fling never came to rest");
+        }
+        let at = tree.scroll_offset_of("inner").unwrap().height;
+        assert!(at <= px(900.0), "ran past the end of the content: {at:?}");
+    }
+
+    #[test]
+    fn touching_a_coasting_list_catches_it() {
+        // A hand on a spinning record. Without this the content keeps sliding
+        // under the finger that is trying to stop it.
+        let mut tree = touch_scroll_tree();
+        let mut input = crate::input::InputTranslator::new();
+
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Started, 50.0, 90.0, 0);
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Moved, 50.0, 20.0, 16);
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Ended, 50.0, 20.0, 32);
+        assert!(tree.advance(std::time::Duration::from_millis(16)), "expected a fling");
+
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Started, 50.0, 50.0, 48);
+        let caught = tree.scroll_offset_of("inner").unwrap().height;
+        assert!(!tree.advance(std::time::Duration::from_millis(16)), "the fling was not caught");
+        assert_eq!(tree.scroll_offset_of("inner").unwrap().height, caught);
+    }
+
+    /// A scroll view whose first hundred pixels are a button.
+    fn button_in_a_scroll_view(pressed: Rc<Cell<u32>>) -> AnyElement {
+        scroll_view()
+            .id("inner")
+            .w(relative(1.0))
+            .h(px(100.0))
+            .child(
+                button("press me")
+                    .id("target")
+                    .height(px(100.0))
+                    .width(relative(1.0))
+                    .shrink(0.0)
+                    .on_press(move || pressed.set(pressed.get() + 1)),
+            )
+            .child(div().h(px(1000.0)).shrink(0.0))
+            .into_element()
+    }
+
+    #[test]
+    fn tapping_a_button_inside_a_scroll_view_presses_it() {
+        let hits = Rc::new(Cell::new(0));
+        let mut tree = UiTree::new();
+        tree.build(
+            div()
+                .w(relative(1.0))
+                .h(relative(1.0))
+                .child(button_in_a_scroll_view(hits.clone()))
+                .into_element(),
+        );
+        tree.compute_layout(viewport()).unwrap();
+        let mut input = crate::input::InputTranslator::new();
+
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Started, 50.0, 50.0, 0);
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Ended, 50.0, 51.0, 60);
+        assert_eq!(hits.get(), 1, "a tap on a button must press it");
+    }
+
+    #[test]
+    fn a_scroll_that_began_on_a_button_never_presses_it() {
+        // The case that makes a touch list feel broken: every flick through it
+        // fires whatever row it started on.
+        let hits = Rc::new(Cell::new(0));
+        let mut tree = UiTree::new();
+        tree.build(
+            div()
+                .w(relative(1.0))
+                .h(relative(1.0))
+                .child(button_in_a_scroll_view(hits.clone()))
+                .into_element(),
+        );
+        tree.compute_layout(viewport()).unwrap();
+        let mut input = crate::input::InputTranslator::new();
+
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Started, 50.0, 60.0, 0);
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Moved, 50.0, 20.0, 16);
+        finger(&mut tree, &mut input, spherekit_platform::TouchPhase::Ended, 50.0, 18.0, 32);
+
+        assert_eq!(hits.get(), 0, "the scroll activated the button it started on");
+        assert!(
+            tree.scroll_offset_of("inner").unwrap().height > Px::ZERO,
+            "and it did not scroll either"
+        );
     }
 }
