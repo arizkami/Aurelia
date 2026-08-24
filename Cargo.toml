@@ -17,6 +17,7 @@ members = [
     "crates/spherekit-css",
     "crates/spherekit-bridge",
     "crates/spherekit-cli",
+    "crates/spherekit-python",
     "app/uigallery",
     "app/reactdemo",
     "app/musicplayer",
@@ -44,6 +45,7 @@ spherekit-ui       = { path = "crates/spherekit-ui",       version = "2026.8.0" 
 spherekit-audio-ui = { path = "crates/spherekit-audio-ui", version = "2026.8.0" }
 spherekit-jsengine = { path = "crates/spherekit-jsengine", version = "2026.8.0" }
 spherekit-react    = { path = "crates/spherekit-react",    version = "2026.8.0" }
+spherekit-python   = { path = "crates/spherekit-python",   version = "2026.8.0" }
 spherekit-css      = { path = "crates/spherekit-css",      version = "2026.8.0" }
 spherekit-bridge   = { path = "crates/spherekit-bridge",   version = "2026.8.0" }
 spherekit          = { path = "crates/spherekit",          version = "2026.8.0" }

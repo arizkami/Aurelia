@@ -1,0 +1,34 @@
+[package]
+name = "spherekit-python"
+description = "SphereKit for Python: a native extension module that runs a SphereKit window from a Python tree."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["python", "gui", "pyo3", "bindings", "ui"]
+categories = ["gui", "api-bindings"]
+
+[lib]
+# `cdylib` is the importable extension module; `rlib` is what the crate's own
+# tests link against. Both, because a Python-only crate that cannot be unit
+# tested from Rust would have its tree handling tested nowhere.
+name = "spherekit_python"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+spherekit.workspace = true
+spherekit-react.workspace = true
+spherekit-ui.workspace = true
+spherekit-core.workspace = true
+spherekit-platform.workspace = true
+spherekit-css.workspace = true
+serde_json.workspace = true
+pollster.workspace = true
+
+# `abi3-py39` builds against the stable ABI, so one binary loads into every
+# CPython from 3.9 up. Without it the extension is bound to the exact minor
+# version it was compiled against, and a machine with two Pythons on it — which
+# is most machines — silently loads the wrong one and fails at import.
+pyo3 = { version = "0.28", features = ["abi3-py39"] }

@@ -685,6 +685,26 @@ pub trait Styled: Sized {
         self.style_mut().inset = spherekit_layout::edges_all(Length::Px(v));
         self
     }
+    /// Absolute inset from the left edge of the containing block.
+    fn left(mut self, v: impl Into<Length>) -> Self {
+        self.style_mut().inset.left = v.into();
+        self
+    }
+    /// Absolute inset from the right edge of the containing block.
+    fn right(mut self, v: impl Into<Length>) -> Self {
+        self.style_mut().inset.right = v.into();
+        self
+    }
+    /// Absolute inset from the top edge of the containing block.
+    fn top(mut self, v: impl Into<Length>) -> Self {
+        self.style_mut().inset.top = v.into();
+        self
+    }
+    /// Absolute inset from the bottom edge of the containing block.
+    fn bottom(mut self, v: impl Into<Length>) -> Self {
+        self.style_mut().inset.bottom = v.into();
+        self
+    }
     /// Order among siblings. Higher paints later.
     fn z(mut self, index: i32) -> Self {
         self.style_mut().z_index = index;

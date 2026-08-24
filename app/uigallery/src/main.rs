@@ -367,6 +367,14 @@ pub(crate) struct State {
     /// once dispatch is over. That is how "click anywhere else to dismiss" is
     /// answered without the runner knowing where the panel ended up.
     press_inside_account: Cell<bool>,
+    /// Where the account row is on screen, in window coordinates.
+    ///
+    /// The menu is built at the root of the tree rather than inside the footer,
+    /// so it needs the anchor as a *number* — see [`GalleryApp::account_menu`].
+    /// Written by the row's own handlers, which are handed their absolute
+    /// bounds, and refreshed every frame so a sidebar that slides while the
+    /// menu is open does not leave the panel behind.
+    account_anchor: Cell<spherekit::core::Rect<Px>>,
     /// A window command the caption asked for, drained by the runner.
     ///
     /// Queued rather than executed inline because a widget callback has no
@@ -443,6 +451,7 @@ impl State {
             user_menu_open: Cell::new(false),
             user_menu: Cell::new(Motion::at(0.0, Drive::STIFF)),
             press_inside_account: Cell::new(false),
+            account_anchor: Cell::new(spherekit::core::Rect::ZERO),
             pending: Cell::new(None),
             log: RefCell::new(vec!["Ready.".into()]),
         })
@@ -667,6 +676,15 @@ impl GalleryApp {
 
     fn build(&mut self) -> AnyElement {
         let theme = self.state.theme();
+        // Where the account row ended up last frame. The row records its own
+        // bounds when it is activated, which covers the first open; this keeps
+        // the anchor honest afterwards, so a sidebar that slides while the menu
+        // is open takes the panel with it instead of leaving it behind.
+        if let Some(surface) = self.surface.as_ref()
+            && let Some(row) = surface.tree().bounds_of("acct.row")
+        {
+            self.state.account_anchor.set(row);
+        }
 
         div()
             .flex_col()
@@ -694,6 +712,7 @@ impl GalleryApp {
             // lived inside the pane it was opened from could not escape it, and
             // a scrim that did would not be modal.
             .child(self.confirm_dialog(&theme))
+            .child(self.account_menu(&theme))
             .child(self.edit_menu(&theme))
             .into_element()
     }
@@ -1045,9 +1064,12 @@ impl GalleryApp {
 
     /// The signed-in account, pinned to the bottom of the sidebar.
     ///
-    /// The row and the menu share one container, and that container is what the
-    /// [`dropdown`] anchors against — every node is a containing block here, so
-    /// the panel lands on the row's top edge without anyone measuring the row.
+    /// The row lives here; the *menu* does not. The sidebar panel clips its
+    /// overflow — that is what makes the labels slide out under its edge as it
+    /// collapses — and a panel that clips clips everything inside it, so a menu
+    /// built here was cut off at the sidebar edge and lost the right-hand half
+    /// of every label the moment the sidebar was collapsed. It is built at the
+    /// root of the tree instead: see [`GalleryApp::account_menu`].
     fn account_footer(&self, theme: &Theme) -> AnyElement {
         let c = theme.colors;
         let shown = self.state.sidebar.get().value().clamp(0.0, 1.0);
@@ -1056,16 +1078,6 @@ impl GalleryApp {
         let open = self.state.user_menu.get().value();
         let expanded = self.state.user_menu_open.get();
         let state = Rc::clone(&self.state);
-
-        let menu = dropdown(open)
-            .above()
-            .offset(theme.spacing.sm)
-            .p(theme.spacing.xs)
-            .gap(theme.spacing.xs)
-            .child(self.account_menu_item(theme, "acct.profile", "Profile", false))
-            .child(self.account_menu_item(theme, "acct.keys", "Account keys", false))
-            .child(separator(false).bg(c.border).m(theme.spacing.xs))
-            .child(self.account_menu_item(theme, "acct.signout", "Sign out", true));
 
         let row = div()
             .id("acct.row")
@@ -1114,6 +1126,12 @@ impl GalleryApp {
             )
             .child(ChevronElement { tint: c.text_muted.scale_alpha(shown), open })
             .on_click(move |cx: &mut EventContext<'_>| {
+                // The menu is built from this rectangle, and this is the one
+                // place it is known for free: a handler is handed its own
+                // absolute bounds. Recording it here is what lets the panel be
+                // placed on the first frame it opens, before any layout pass
+                // has reported where the row ended up.
+                state.account_anchor.set(cx.bounds);
                 state.set_user_menu(!state.user_menu_open.get());
                 // A repaint, not a relayout: the panel is already in the tree
                 // and only its open amount changes. The spring in
@@ -1122,10 +1140,23 @@ impl GalleryApp {
             })
             // `on_click` is a mouse contract — it only ever fires on MouseUp —
             // so a row that calls itself a button has to answer the keyboard
-            // itself, or Tab would reach it and nothing would happen.
-            .on_key(keyboard_activate(Rc::clone(&self.state), |state| {
-                state.set_user_menu(!state.user_menu_open.get());
-            }));
+            // itself, or Tab would reach it and nothing would happen. Written
+            // out rather than using `keyboard_activate`, because this one also
+            // has to record the anchor, and that needs the context.
+            .on_key({
+                let state = Rc::clone(&self.state);
+                move |cx: &mut EventContext<'_>| {
+                    use spherekit::ui::{EventFlow, Key, UiEvent};
+                    let UiEvent::Key(key) = cx.event else { return EventFlow::Continue };
+                    if key.state.is_pressed() && matches!(key.key, Key::Space | Key::Enter) {
+                        state.account_anchor.set(cx.bounds);
+                        state.set_user_menu(!state.user_menu_open.get());
+                        cx.notify();
+                        return EventFlow::Stop;
+                    }
+                    EventFlow::Continue
+                }
+            });
 
         let claim = Rc::clone(&self.state);
         div()
@@ -1141,11 +1172,75 @@ impl GalleryApp {
             .on_mouse_down(move |_| claim.press_inside_account.set(true))
             .child(separator(false).bg(c.border))
             .child(div().h(theme.spacing.xs))
-            // Row first, panel second. The panel is absolutely positioned, so
-            // order costs it nothing in layout, but it buys two things: Tab
-            // walks from the row *into* the menu it just opened, and the
-            // popover paints last, over anything it ever overlaps.
-            .child(div().flex_col().child(row).child(menu))
+            .child(row)
+            .into_element()
+    }
+
+    /// The account menu, built at the root of the tree.
+    ///
+    /// Two separate things force it out of the sidebar. The panel clips, so a
+    /// menu inside it is cut off at its edge for painting *and* for hit
+    /// testing, which is unusable at 64 px wide. And `z-index` orders siblings
+    /// only, so even an unclipped menu inside the sidebar would paint under the
+    /// content pane next to it. A root-level child is the one position that is
+    /// above both.
+    ///
+    /// The cost is the tab order: the menu no longer follows the row in the
+    /// tree, so Tab leaves the sidebar rather than walking into the open panel.
+    /// Escape and a press elsewhere still dismiss it.
+    fn account_menu(&self, theme: &Theme) -> AnyElement {
+        let c = theme.colors;
+        let open = self.state.user_menu.get().value();
+        let anchor = self.state.account_anchor.get();
+        // Nothing has opened it yet, so there is no rectangle to hang it off.
+        if anchor.is_empty() {
+            return div().into_element();
+        }
+        let claim = Rc::clone(&self.state);
+
+        // A stand-in for the row, at the row position in window coordinates.
+        // The dropdown anchors against its parent exactly as it did in the
+        // footer; only the parent has moved.
+        //
+        // Zero height, and that is load-bearing. Sized to the row it would sit
+        // *over* the row at a higher z, and hit testing takes the topmost node
+        // — so the row would stop hovering and stop opening the menu, which is
+        // a worse bug than the clipping this moved to fix. Empty, it can be hit
+        // by nothing, while the panel hanging off it is hit normally: a child
+        // is tested against its own box, not its parent's.
+        //
+        // `above` measures from this line, so the panel lands exactly where it
+        // did when it hung off the full-height row.
+        div()
+            .id("acct.anchor")
+            .absolute()
+            .left(anchor.min_x())
+            .top(anchor.min_y())
+            .w(anchor.width())
+            .h(px(0.0))
+            // Over the content pane, which raises itself to 1.
+            .z(2)
+            // The press still has to be claimed, or the "click anywhere else"
+            // rule in the runner would shut the menu on the way to its own
+            // rows. An ancestor is on the hit chain even when the point is
+            // outside its box, so this fires for a press on the panel above.
+            .on_mouse_down(move |_| claim.press_inside_account.set(true))
+            .child(
+                dropdown(open)
+                    .id("acct.menu")
+                    .above()
+                    .offset(theme.spacing.sm)
+                    // Given rather than inherited: an unsized dropdown spans its
+                    // anchor, and the anchor is 48 px wide once the sidebar is
+                    // collapsed.
+                    .w(px(ACCOUNT_MENU_WIDTH))
+                    .p(theme.spacing.xs)
+                    .gap(theme.spacing.xs)
+                    .child(self.account_menu_item(theme, "acct.profile", "Profile", false))
+                    .child(self.account_menu_item(theme, "acct.keys", "Account keys", false))
+                    .child(separator(false).bg(c.border).m(theme.spacing.xs))
+                    .child(self.account_menu_item(theme, "acct.signout", "Sign out", true)),
+            )
             .into_element()
     }
 
@@ -1409,6 +1504,13 @@ const SIDEBAR_COLLAPSED: f32 = 64.0;
 const NAV_INSET: f32 = 12.0;
 /// The same for the account footer, whose avatar is wider than an icon.
 const FOOTER_INSET: f32 = 8.0;
+
+/// How wide the account menu is, whatever the sidebar is doing.
+///
+/// Wider than a collapsed sidebar and wider than the row it hangs off, because
+/// the job of a menu is to be readable and "Account keys" does not fit in the
+/// 48 px a collapsed row has.
+const ACCOUNT_MENU_WIDTH: f32 = 200.0;
 
 /// How far a page rises as it arrives, in logical pixels.
 ///
@@ -2541,6 +2643,260 @@ mod tests {
             let account = tree.bounds_of("acct.row").expect("the account row is built");
             assert!(account.max_x() <= panel.max_x() + px(0.5));
         }
+    }
+
+    /// A primary-button press at a window point.
+    fn press_at(x: f32, y: f32) -> spherekit::ui::UiEvent {
+        spherekit::ui::UiEvent::MouseDown(spherekit::ui::MouseButtonEvent {
+            position: spherekit::core::Point::new(px(x), px(y)),
+            button: spherekit::ui::MouseButton::Primary,
+            state: spherekit::ui::ElementState::Pressed,
+            click_count: 1,
+            modifiers: spherekit::ui::Modifiers::NONE,
+            source: spherekit::ui::PointerSource::Mouse,
+        })
+    }
+
+    /// The release that completes it.
+    fn release_at(x: f32, y: f32) -> spherekit::ui::UiEvent {
+        spherekit::ui::UiEvent::MouseUp(spherekit::ui::MouseButtonEvent {
+            position: spherekit::core::Point::new(px(x), px(y)),
+            button: spherekit::ui::MouseButton::Primary,
+            state: spherekit::ui::ElementState::Released,
+            click_count: 1,
+            modifiers: spherekit::ui::Modifiers::NONE,
+            source: spherekit::ui::PointerSource::Mouse,
+        })
+    }
+
+    /// Builds the shell with the sidebar collapsed and the account menu open.
+    ///
+    /// Two passes, because that is what the application itself does: the menu
+    /// is placed from the account row rectangle, and the first pass is what
+    /// produces it.
+    fn lay_out_account_menu(open_sidebar: bool, text: &mut TextSystem) -> (UiTree, Rc<State>) {
+        let viewport = size(px(1100.0), px(720.0));
+        let mut app = GalleryApp::new();
+        app.state.sidebar_open.set(open_sidebar);
+        app.state.sidebar.set(Motion::at(if open_sidebar { 1.0 } else { 0.0 }, Drive::SMOOTH));
+
+        let mut tree = UiTree::new();
+        tree.set_theme(app.state.theme());
+        tree.build(app.build());
+        tree.compute_layout_with_text(viewport, text).unwrap();
+
+        let row = tree.bounds_of("acct.row").expect("the account row is built");
+        app.state.account_anchor.set(row);
+        app.state.user_menu_open.set(true);
+        app.state.user_menu.set(Motion::at(1.0, Drive::STIFF));
+
+        tree.build(app.build());
+        tree.compute_layout_with_text(viewport, text).unwrap();
+        (tree, app.state)
+    }
+
+    #[test]
+    fn clicking_the_collapsed_account_row_opens_the_menu() {
+        let viewport = size(px(1100.0), px(720.0));
+        let mut text = TextSystem::with_system_fonts();
+        let mut app = GalleryApp::new();
+        app.state.sidebar_open.set(false);
+        app.state.sidebar.set(Motion::at(0.0, Drive::SMOOTH));
+
+        let mut tree = UiTree::new();
+        tree.set_theme(app.state.theme());
+        tree.build(app.build());
+        tree.compute_layout_with_text(viewport, &mut text).unwrap();
+
+        let row = tree.bounds_of("acct.row").expect("the account row is built");
+        eprintln!("row = {row:?}");
+        let at = spherekit::core::Point::new(
+            row.min_x() + row.width() * 0.5,
+            row.min_y() + row.height() * 0.5,
+        );
+        // The runner's own sequence, not a bare dispatch: it clears the claim
+        // before every press and shuts the menu afterwards if nothing claimed
+        // it. A row that opens the menu on release but fails to claim the press
+        // would pass a bare dispatch and do nothing in the window.
+        app.state.press_inside_account.set(false);
+        tree.dispatch(&press_at(at.x.get(), at.y.get()));
+        assert!(
+            app.state.press_inside_account.get(),
+            "the press on the account row was not claimed, so the runner shuts the menu",
+        );
+        if !app.state.press_inside_account.get() {
+            app.state.set_user_menu(false);
+        }
+        tree.dispatch(&release_at(at.x.get(), at.y.get()));
+        assert!(app.state.user_menu_open.get(), "the press did not open the menu");
+        assert!(!app.state.account_anchor.get().is_empty(), "the row did not record where it is",);
+
+        app.state.user_menu.set(Motion::at(1.0, Drive::STIFF));
+        tree.build(app.build());
+        tree.compute_layout_with_text(viewport, &mut text).unwrap();
+        let menu = tree.bounds_of("acct.menu").expect("the menu is built after the click");
+        eprintln!("menu = {menu:?}");
+    }
+
+    #[test]
+    fn the_account_row_still_takes_a_press_once_the_menu_exists() {
+        // The regression the first fix introduced. Moving the menu to the root
+        // of the tree needs an anchor element at the row position, and an
+        // anchor the size of the row sits *over* it at a higher z — so the row
+        // stopped hovering and stopped opening its own menu, on every frame
+        // after the first. The anchor has no height for exactly this reason.
+        //
+        // The press is dispatched through the whole tree, so if anything at all
+        // covers the row this fails.
+        let viewport = size(px(1100.0), px(720.0));
+        let mut text = TextSystem::with_system_fonts();
+        let mut app = GalleryApp::new();
+        app.state.sidebar_open.set(false);
+        app.state.sidebar.set(Motion::at(0.0, Drive::SMOOTH));
+
+        let mut tree = UiTree::new();
+        tree.set_theme(app.state.theme());
+        tree.build(app.build());
+        tree.compute_layout_with_text(viewport, &mut text).unwrap();
+
+        // What the application does every frame from the second one on: the
+        // anchor is known, so the menu — and its anchor element — are in the
+        // tree even with the panel shut.
+        let row = tree.bounds_of("acct.row").expect("the account row is built");
+        app.state.account_anchor.set(row);
+        tree.build(app.build());
+        tree.compute_layout_with_text(viewport, &mut text).unwrap();
+        assert!(tree.bounds_of("acct.anchor").is_some(), "the anchor is in the tree");
+
+        let at = spherekit::core::Point::new(
+            row.min_x() + row.width() * 0.5,
+            row.min_y() + row.height() * 0.5,
+        );
+        app.state.press_inside_account.set(false);
+        tree.dispatch(&press_at(at.x.get(), at.y.get()));
+        tree.dispatch(&release_at(at.x.get(), at.y.get()));
+        assert!(
+            app.state.user_menu_open.get(),
+            "something is covering the account row: the press never reached it",
+        );
+
+        // And it still closes, which is the same path in reverse.
+        tree.dispatch(&press_at(at.x.get(), at.y.get()));
+        tree.dispatch(&release_at(at.x.get(), at.y.get()));
+        assert!(!app.state.user_menu_open.get(), "the second press did not close it");
+    }
+
+    #[test]
+    fn the_account_menu_anchor_covers_nothing() {
+        // The property behind the test above, asserted directly so a future
+        // change that gives the anchor a height fails here with the reason
+        // rather than three tests away with a symptom.
+        let viewport = size(px(1100.0), px(720.0));
+        let mut text = TextSystem::with_system_fonts();
+        let mut app = GalleryApp::new();
+        let mut tree = UiTree::new();
+        tree.set_theme(app.state.theme());
+        tree.build(app.build());
+        tree.compute_layout_with_text(viewport, &mut text).unwrap();
+
+        let row = tree.bounds_of("acct.row").expect("the account row is built");
+        app.state.account_anchor.set(row);
+        tree.build(app.build());
+        tree.compute_layout_with_text(viewport, &mut text).unwrap();
+
+        let anchor = tree.bounds_of("acct.anchor").expect("the anchor is built");
+        assert!(anchor.is_empty(), "the anchor has area and will eat the row: {anchor:?}");
+        assert_eq!(anchor.min_y(), row.min_y(), "the panel would open from the wrong line");
+    }
+
+    #[test]
+    fn the_account_menu_stays_on_screen_in_a_short_window() {
+        // It opens upward from a row pinned to the bottom, so the only way it
+        // leaves the window is a window too short to hold it — the smallest one
+        // the application allows itself to be.
+        let viewport = size(px(480.0), px(360.0));
+        let mut text = TextSystem::with_system_fonts();
+        let mut app = GalleryApp::new();
+        app.state.sidebar_open.set(false);
+        app.state.sidebar.set(Motion::at(0.0, Drive::SMOOTH));
+
+        let mut tree = UiTree::new();
+        tree.set_theme(app.state.theme());
+        tree.build(app.build());
+        tree.compute_layout_with_text(viewport, &mut text).unwrap();
+
+        let row = tree.bounds_of("acct.row").expect("the account row is built");
+        app.state.account_anchor.set(row);
+        app.state.user_menu_open.set(true);
+        app.state.user_menu.set(Motion::at(1.0, Drive::STIFF));
+        tree.build(app.build());
+        tree.compute_layout_with_text(viewport, &mut text).unwrap();
+
+        let menu = tree.bounds_of("acct.menu").expect("the menu is built");
+        assert!(menu.min_y() >= px(0.0), "the menu opened off the top: {menu:?}");
+        assert!(menu.max_x() <= px(480.0), "the menu ran off the right: {menu:?}");
+    }
+
+    #[test]
+    fn the_account_menu_escapes_a_collapsed_sidebar() {
+        // The bug: the menu was built inside the sidebar panel, which clips its
+        // overflow so the labels can slide out under its edge as it collapses.
+        // A clipping panel clips everything in it, so at 64 px wide the menu
+        // lost the right-hand half of every row — "Account keys" read as
+        // "Account k" — and the part that was cut off could not be clicked
+        // either, because hit testing honours the same clip.
+        let mut text = TextSystem::with_system_fonts();
+        let (tree, _state) = lay_out_account_menu(false, &mut text);
+
+        let panel = tree.bounds_of("chrome.sidebar-panel").expect("the panel is built");
+        let menu = tree.bounds_of("acct.menu").expect("the account menu is built");
+
+        assert!(panel.width() < px(100.0), "the sidebar did not collapse: {panel:?}");
+        assert_eq!(
+            menu.width(),
+            px(ACCOUNT_MENU_WIDTH),
+            "the menu took its width from the collapsed row instead of its own",
+        );
+        assert!(
+            menu.max_x() > panel.max_x(),
+            "the menu is still inside the panel that clips it: {menu:?} in {panel:?}",
+        );
+        // And it opens upward, clear of the row it hangs off.
+        let row = tree.bounds_of("acct.row").expect("the account row is built");
+        assert!(menu.max_y() <= row.min_y(), "the menu covers its own row: {menu:?}");
+    }
+
+    #[test]
+    fn every_account_menu_row_is_clickable_when_the_sidebar_is_collapsed() {
+        // The other half of the same bug, and the half a screenshot does not
+        // show: the clip pruned the hit test too, so the rows that were drawn
+        // past the sidebar edge did nothing when pressed.
+        let mut text = TextSystem::with_system_fonts();
+        let (mut tree, state) = lay_out_account_menu(false, &mut text);
+
+        for row in ["acct.profile", "acct.keys", "acct.signout"] {
+            state.user_menu_open.set(true);
+            let bounds = tree.bounds_of(row).unwrap_or_else(|| panic!("{row} is built"));
+            let at = spherekit::core::Point::new(
+                bounds.min_x() + bounds.width() * 0.5,
+                bounds.min_y() + bounds.height() * 0.5,
+            );
+            tree.dispatch(&press_at(at.x.get(), at.y.get()));
+            tree.dispatch(&release_at(at.x.get(), at.y.get()));
+            // Every row closes the menu, so the flag is the honest answer to
+            // "did the press reach it" without a callback of the test's own.
+            assert!(!state.user_menu_open.get(), "{row} is drawn where nothing can be pressed",);
+        }
+    }
+
+    #[test]
+    fn the_account_menu_keeps_its_width_with_the_sidebar_open() {
+        // The fixed width must not make the menu *narrower* than it used to be
+        // when there was room for it.
+        let mut text = TextSystem::with_system_fonts();
+        let (tree, _state) = lay_out_account_menu(true, &mut text);
+        let menu = tree.bounds_of("acct.menu").expect("the account menu is built");
+        assert_eq!(menu.width(), px(ACCOUNT_MENU_WIDTH));
     }
 
     #[test]
