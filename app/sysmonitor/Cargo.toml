@@ -1,0 +1,35 @@
+[package]
+name = "sysmonitor"
+description = "SphereKit Task Manager: a live system monitor over the Win32 API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "sysmonitor"
+path = "src/main.rs"
+
+[dependencies]
+spherekit.workspace = true
+pollster.workspace = true
+
+# The sampling layer is Win32 and nothing else: no crate stands between the
+# window and `GetSystemTimes`. Everything here is a direct link to a system
+# DLL, which is why the whole of `sys.rs` is one `unsafe` boundary and the
+# rest of the application never sees a raw pointer.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+] }

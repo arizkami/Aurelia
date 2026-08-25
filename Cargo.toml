@@ -21,6 +21,7 @@ members = [
     "app/uigallery",
     "app/reactdemo",
     "app/musicplayer",
+    "app/sysmonitor",
 ]
 
 [workspace.package]

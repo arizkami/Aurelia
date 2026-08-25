@@ -2824,6 +2824,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sysmonitor"
+version = "2026.8.0"
+dependencies = [
+ "pollster",
+ "spherekit",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "taffy"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
